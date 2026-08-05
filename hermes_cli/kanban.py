@@ -627,6 +627,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Permanently delete already-archived task ids from the board",
     )
+    p_archive.add_argument(
+        "--force",
+        action="store_true",
+        help="With --rm: delete even if the card has no card_record (CD-004 guard override)",
+    )
 
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
@@ -2080,8 +2085,18 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         if purge_ids:
+            # CD-004: force flag overrides the card_record guard in
+            #         delete_archived_task; catch its refusal per-id so one
+            #         guarded card does not abort the batch.
+            force = getattr(args, "force", False)
             for tid in purge_ids:
-                if not kb.delete_archived_task(conn, tid):
+                try:
+                    deleted = kb.delete_archived_task(conn, tid, force=force)
+                except kb.TrajectoryUnprotectedError as e:
+                    failed.append(tid)
+                    print(str(e), file=sys.stderr)
+                    continue
+                if not deleted:
                     failed.append(tid)
                     print(f"cannot delete {tid} (must already be archived)", file=sys.stderr)
                 else:
