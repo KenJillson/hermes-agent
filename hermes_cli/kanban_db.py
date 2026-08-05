@@ -3957,6 +3957,364 @@ def _scan_prose_for_phantom_ids(
     return [m for m in unique if m not in existing]
 
 
+# =============================================================================
+# CD-003 — card_record durable trajectory emit (Phase 2 / D2.1)
+#   Design: docs/card_record-design-20260729.md (schema v1.0).
+#   Wired into the two card-terminal paths: complete_task (before
+#   _cleanup_workspace) and archive_task (after its write_txn). Both callers
+#   wrap the call try/except so a failing record can never block a terminal
+#   transition. Write-once + atomic (os.link refuses to clobber) => one
+#   immutable record per card, capturing its FIRST terminal transition;
+#   idempotent under re-run/double-fire.
+#   Decisions (2026-07-31): model_calls[] deferred to reconcile
+#   (source gated:reconcile, NO network on the hot path); null-source encoding
+#   is sibling-scalar (foo + foo_source); path resolved via kanban_home()
+#   (never hardcoded, plan Section 0.5). All imports are local so this block
+#   adds no module-level import dependency.
+# =============================================================================
+
+_CARD_RECORD_SCHEMA_VERSION = "1.1"
+_CARD_RECORD_EMITTER = "card_record@0.1"
+
+
+def _cr_rows(conn, sql, params=()):
+    """Query -> list[dict], independent of conn.row_factory."""
+    cur = conn.execute(sql, params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def _cr_json_load(blob):
+    """Parse a TEXT JSON column to an object, never raising."""
+    if not blob:
+        return None
+    import json
+    try:
+        return json.loads(blob)
+    except Exception:
+        return None
+
+
+def _cr_now_iso():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _cr_epoch_iso(epoch):
+    if epoch is None:
+        return None
+    from datetime import datetime, timezone
+    try:
+        return datetime.fromtimestamp(int(epoch), timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+    except Exception:
+        return None
+
+
+def _cr_evidence_rows(task_id, profile):
+    """Verification evidence rows for this card from the PROFILE evidence db.
+
+    Opened read-only (mode=ro) so emit never writes/locks it. Association is
+    by command-substring match on task_id (the evidence db has no task_id
+    column). Returns (rows_or_None, source_tag_or_None).
+    """
+    if not profile:
+        return None, "null:no-profile"
+    db = kanban_home() / "profiles" / profile / "verification_evidence.db"
+    if not db.exists():
+        return None, "null:no-evidence-db"
+    import sqlite3
+    try:
+        ec = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            cur = ec.execute(
+                "SELECT id, created_at, command, kind, status, exit_code "
+                "FROM verification_events WHERE command LIKE ? ORDER BY id",
+                (f"%{task_id}%",),
+            )
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        finally:
+            ec.close()
+        return rows, None
+    except Exception:
+        return None, "null:evidence-read-failed"
+
+
+def _cr_parse_ac(conn, task_id, comments):
+    """Parse a ``## AC`` checklist (decision C) from a scope-pin comment or the
+    card body. Returns (ac_count, ac_passed, source).
+
+    ac_passed here is the checklist's own ticked-count (``- [x]``); evidence-db
+    cross-referencing is a later D2.x refinement, so the source tag names the
+    derivation (``derived:checklist-marks``) rather than claiming verification.
+    """
+    import re
+    texts = [c.get("body") for c in comments if c.get("body")]
+    brows = _cr_rows(conn, "SELECT body FROM tasks WHERE id = ?", (task_id,))
+    if brows and brows[0].get("body"):
+        texts.append(brows[0]["body"])
+
+    block = None
+    for t in texts:
+        lines = t.splitlines()
+        for i, ln in enumerate(lines):
+            if ln.strip().lower() == "## ac":
+                block = []
+                for sub in lines[i + 1:]:
+                    if sub.strip().startswith("## "):
+                        break
+                    block.append(sub)
+                break
+        if block is not None:
+            break
+
+    if block is None:
+        return None, None, "null:no-convention"
+
+    checked = unchecked = 0
+    for ln in block:
+        s = ln.strip()
+        if re.match(r"^- \[[ xX]\]", s):
+            if re.match(r"^- \[[xX]\]", s):
+                checked += 1
+            else:
+                unchecked += 1
+    total = checked + unchecked
+    if total == 0:
+        return None, None, "null:empty-ac-block"
+    return total, checked, "derived:checklist-marks"
+
+
+def _emit_card_record(conn, task_id, *, final_status):
+    """Write docs/card-records/<task_id>.json at a terminal transition.
+
+    Best-effort and write-once. Never raises. Populates every NOW field from
+    LOCAL db/fs only; every GATED/TBD field is emitted null with a sibling
+    ``*_source`` tag so each record self-describes which instrumentation
+    existed when it was written.
+    """
+    import json
+    import os
+
+    out_dir = kanban_home() / "docs" / "card-records"
+    out_path = out_dir / f"{task_id}.json"
+    if out_path.exists():
+        return  # immutable, one record per card (first terminal wins)
+
+    # --- source tables (column names verified against live schema 2026-07-31) ---
+    trows = _cr_rows(
+        conn, "SELECT id, created_by, status FROM tasks WHERE id = ?", (task_id,)
+    )
+    task = trows[0] if trows else {}
+
+    run_rows = _cr_rows(
+        conn,
+        "SELECT id, profile, status, outcome, started_at, ended_at, metadata "
+        "FROM task_runs WHERE task_id = ? ORDER BY id",
+        (task_id,),
+    )
+    events = _cr_rows(
+        conn,
+        "SELECT id, run_id, kind, payload, created_at "
+        "FROM task_events WHERE task_id = ? ORDER BY id",
+        (task_id,),
+    )
+    comments = _cr_rows(
+        conn,
+        "SELECT author, body, created_at "
+        "FROM task_comments WHERE task_id = ? ORDER BY id",
+        (task_id,),
+    )
+
+    event_kinds = [e["kind"] for e in events]
+
+    # profile: from the last run carrying one (runs share a profile).
+    profile = None
+    for r in reversed(run_rows):
+        if r.get("profile"):
+            profile = r["profile"]
+            break
+
+    # budget (iterations_*) from any event payload that carries it; gave_up
+    # events record {budget_used, budget_max} (CD-001 / env-divergences).
+    budget_by_run = {}
+    for e in events:
+        pl = _cr_json_load(e["payload"]) or {}
+        if "budget_used" in pl or "budget_max" in pl:
+            budget_by_run[e["run_id"]] = (pl.get("budget_used"), pl.get("budget_max"))
+
+    # --- runs[] ---
+    runs_out = []
+    for r in run_rows:
+        md = _cr_json_load(r.get("metadata")) or {}
+        trigger = md.get("trigger_outcome")  # gave_up overwrites row outcome
+        bu, bm = budget_by_run.get(r["id"], (None, None))
+        st, en = r.get("started_at"), r.get("ended_at")
+        dur = (en - st) if (st is not None and en is not None) else None
+
+        # exit_stage (CD-006 / D2.2 Inc-1): finalizer turn_exit_reason, threaded
+        # onto failure-path run metadata by _record_task_failure. Healthy runs
+        # carry no reason -> stays gated:D2.2.
+        exit_reason = md.get("turn_exit_reason")
+        if exit_reason is not None:
+            exit_stage, exit_stage_src = exit_reason, None
+        else:
+            exit_stage, exit_stage_src = None, "gated:D2.2"
+
+        # iterations: prefer the gave_up event budget (NOW, exhaustion); else the
+        # run-metadata count threaded on the failure path (CD-006 — covers the
+        # below-threshold timed_out close whose event drops budget); else gated.
+        md_used, md_bud = md.get("iterations_used"), md.get("iterations_budget")
+        if bu is not None or bm is not None:
+            it_used, it_used_src = bu, None
+            it_bud, it_bud_src = bm, None
+        elif md_used is not None or md_bud is not None:
+            it_used, it_used_src = md_used, None
+            it_bud, it_bud_src = md_bud, None
+        else:
+            it_used, it_used_src = None, "gated:D2.2"
+            it_bud, it_bud_src = None, "gated:D2.2"
+
+        runs_out.append({
+            "run_id": r["id"],
+            "outcome": r.get("outcome"),
+            "trigger_outcome": trigger,
+            "trigger_outcome_source": None if trigger is not None
+                else "n/a:no-trigger-in-metadata",
+            "exit_stage": exit_stage, "exit_stage_source": exit_stage_src,
+            "iterations_used": it_used, "iterations_used_source": it_used_src,
+            "iterations_budget": it_bud, "iterations_budget_source": it_bud_src,
+            "duration_row": dur,  # includes dispatcher reap latency
+            "duration_work": None, "duration_work_source": "gated:D2.2",
+            "tool_call_sequence": None, "tool_call_sequence_source": "gated:D2.2",
+            "repeated_call_count": None, "repeated_call_count_source": "gated:D2.2",
+            "started_at": _cr_epoch_iso(st),
+            "ended_at": _cr_epoch_iso(en),
+        })
+
+    # --- human_touches[] (full ledger; outcome_class decides which BEAR) ---
+    # task_events has NO author column -> event authors come from payload only.
+    HUMAN_EVENT_KINDS = {
+        "unblocked", "specified", "reclaimed", "completed", "archived",
+        "assigned", "block_loop_detected",
+    }
+    touches = []
+    for c in comments:
+        touches.append({
+            "type": "comment",
+            "author": c.get("author"),
+            "author_source": None,
+            "timestamp": _cr_epoch_iso(c.get("created_at")),
+        })
+    for e in events:
+        if e["kind"] not in HUMAN_EVENT_KINDS:
+            continue
+        pl = _cr_json_load(e["payload"]) or {}
+        author = pl.get("author") or pl.get("by") or pl.get("actor")
+        touches.append({
+            "type": e["kind"],
+            "author": author,
+            "author_source": None if author is not None
+                else "null:no-author-on-event",
+            "timestamp": _cr_epoch_iso(e.get("created_at")),
+        })
+    touches.sort(key=lambda t: t["timestamp"] or "")
+
+    # --- outcome_class (collapsed v1.0; precedence worst-case-wins) ---
+    # Worker runs exclude the 0-second manual-complete synth run (outcome
+    # 'completed'), so a clean first-pass card (worker 'blocked' + Ken
+    # 'completed') is NOT miscounted as retried.
+    worker_runs = [r for r in run_rows if (r.get("outcome") or "") != "completed"]
+    has_completed = "completed" in event_kinds
+    has_human = any(k in event_kinds for k in ("unblocked", "specified", "reclaimed"))
+    has_loop_block = "block_loop_detected" in event_kinds
+
+    if final_status == "archived" and not has_completed:
+        outcome_class = "abandoned"
+    elif has_loop_block and not has_completed:
+        outcome_class = "abandoned"
+    elif has_human:
+        outcome_class = "human_involved"
+    elif len(worker_runs) > 1:
+        outcome_class = "retried"
+    else:
+        outcome_class = "first_pass"
+
+    # --- verification ---
+    ac_count, ac_passed, ac_source = _cr_parse_ac(conn, task_id, comments)
+    evidence_rows, evidence_src = _cr_evidence_rows(task_id, profile)
+
+    # --- lessons[] (NOW: LESSON: comment text; structure GATED:D2.6) ---
+    lessons = []
+    for c in comments:
+        for line in (c.get("body") or "").splitlines():
+            s = line.strip()
+            if s.startswith("LESSON:"):
+                lessons.append({
+                    "text": s[len("LESSON:"):].strip(),
+                    "scope": None, "confidence": None, "evidence_ref": None,
+                    "detail_source": "gated:D2.6",
+                })
+
+    # --- artifact_harvest_ref: pointer to docs/harvest/<id>/ if present ---
+    harvest_dir = kanban_home() / "docs" / "harvest" / task_id
+    harvest_ref = f"docs/harvest/{task_id}/" if harvest_dir.is_dir() else None
+
+    record = {
+        "schema_version": _CARD_RECORD_SCHEMA_VERSION,
+        "harness": _CARD_RECORD_EMITTER,
+        "profile": profile,
+        "profile_source": None if profile is not None else "null:no-run-profile",
+        "card_id": task_id,
+        "task_class": None, "task_class_source": "gated:D2.4",
+        "final_status": final_status,
+        "outcome_class": outcome_class,
+        "runs": runs_out,
+        "model_calls": None, "model_calls_source": "gated:reconcile",
+        "human_touches": touches,
+        "verification": {
+            "ac_count": ac_count,
+            "ac_passed": ac_passed,
+            "ac_source": ac_source,
+            "ac_results": None, "ac_results_source": "gated:D2.x",
+            "evidence_rows": evidence_rows,
+            "evidence_rows_source": evidence_src,
+        },
+        "lessons": lessons,
+        "meta": {
+            "emitted_at": _cr_now_iso(),
+            "emitter_version": _CARD_RECORD_EMITTER,
+            "artifact_harvest_ref": harvest_ref,
+            "artifact_repo_ref": None,
+        },
+    }
+
+    # --- atomic + write-once persist (os.link refuses to clobber) ---
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        tmp = out_dir / f".{task_id}.json.tmp.{os.getpid()}"
+        try:
+            with open(tmp, "w") as fh:
+                json.dump(record, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            try:
+                os.link(str(tmp), str(out_path))  # EEXIST if record already there
+            except FileExistsError:
+                pass
+        finally:
+            try:
+                os.unlink(str(tmp))
+            except Exception:
+                pass
+    except Exception:
+        # Best-effort: a failed record must never affect the caller.
+        return
+
+
 class HallucinatedCardsError(ValueError):
     """Raised by ``complete_task`` when ``created_cards`` contains ids
     that don't exist or weren't created by the completing worker.
@@ -4156,6 +4514,12 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
+    # CD-003: emit durable card_record BEFORE workspace GC (best-effort;
+    #         must never block the terminal transition).
+    try:
+        _emit_card_record(conn, task_id, final_status="done")
+    except Exception:
+        pass
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -5223,6 +5587,13 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
+    # CD-003: emit on archive -- archive does NOT GC, but a later --rm
+    #         (delete_archived_task) hard-deletes the trajectory, so record
+    #         now. Best-effort; never blocks the transition.
+    try:
+        _emit_card_record(conn, task_id, final_status="archived")
+    except Exception:
+        pass
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
