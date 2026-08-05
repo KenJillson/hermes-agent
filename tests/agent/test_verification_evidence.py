@@ -306,6 +306,9 @@ def test_recording_prunes_old_events_but_keeps_latest_state(tmp_path, monkeypatc
     monkeypatch.setenv("HERMES_HOME", str(home))
     _node_project(tmp_path)
 
+    # CD-007: pin the per-(session,root) cap so this test validates the prune
+    # MECHANISM at a known value, independent of the production constant (now 2000).
+    monkeypatch.setattr("agent.verification_evidence._MAX_EVENTS_PER_SESSION_ROOT", 100)
     for index in range(120):
         record_terminal_result(
             command="pnpm test",
