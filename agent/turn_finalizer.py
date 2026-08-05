@@ -50,10 +50,12 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
-    if final_response is None and (
+    _budget_exhausted = (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
-    ):
+    )
+
+    if final_response is None and _budget_exhausted:
         # Budget exhausted — ask the model for a summary via one extra
         # API call with tools stripped.  _handle_max_iterations injects a
         # user message and makes a single toolless request.
@@ -69,6 +71,7 @@ def finalize_turn(
             )
         final_response = agent._handle_max_iterations(messages, api_call_count)
 
+    if _budget_exhausted:
         # If running as a kanban worker, signal the dispatcher that the
         # worker could not complete (rather than treating it as a
         # protocol violation).  The agent loop strips tools before calling
