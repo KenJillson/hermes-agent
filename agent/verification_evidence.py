@@ -25,7 +25,12 @@ from hermes_constants import get_hermes_home
 _DB_LOCK = threading.Lock()
 _MAX_OUTPUT_SUMMARY_CHARS = 2000
 _MAX_EVIDENCE_AGE_DAYS = 30
-_MAX_EVENTS_PER_SESSION_ROOT = 100
+_MAX_EVENTS_PER_SESSION_ROOT = 2000  # CD-007 (D2.3): was 100. Per-(session,root)
+# is effectively per-card-run; 100 could self-evict a verification-heavy card's
+# EARLY evidence before its terminal emit snapshots it into card_record. 2000 gives
+# ~30x the max_turns budget of headroom so a single run cannot evict its own rows.
+# The global _MAX_TOTAL_UNREFERENCED_EVENTS=10_000 cap remains the DB-size backstop
+# (evicts oldest-first = already-emitted, snapshotted cards).
 _MAX_TOTAL_UNREFERENCED_EVENTS = 10_000
 _AD_HOC_SCRIPT_NAME_PREFIXES = ("hermes-verify-", "hermes-ad-hoc-")
 _VERIFY_SCHEMA_VERSION = 1
