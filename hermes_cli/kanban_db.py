@@ -9059,6 +9059,35 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> Optional[Run]:
     return Run.from_row(row) if row else None
 
 
+def _merge_run_metadata(conn, run_id, extra):
+    """CD-008 (D2.2 Inc-2): merge ``extra`` into an already-closed run's
+    ``metadata`` JSON by ``run_id``, without clobbering existing keys.
+
+    Used to stamp the finalizer's exit_stage / iterations onto a healthy
+    ``review-required`` handoff whose run ``block_task`` has already closed
+    (so ``_end_run``'s ``ended_at IS NULL`` UPDATE can no longer reach it).
+    Best-effort — the sole caller guards and swallows exceptions.
+    """
+    if not extra:
+        return
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()
+        if row is None:
+            return
+        existing = {}
+        if row["metadata"]:
+            try:
+                existing = json.loads(row["metadata"]) or {}
+            except Exception:
+                existing = {}
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps({**existing, **extra}, ensure_ascii=False), run_id),
+        )
+
+
 def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
     """Return the most recent run regardless of outcome (active or closed)."""
     row = conn.execute(
