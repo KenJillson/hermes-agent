@@ -173,6 +173,17 @@ def finalize_turn(
                             "budget_used": api_call_count,
                             "budget_max": agent.max_iterations,
                         },
+                        # CD-006 (D2.2 Inc-1): thread the finalizer's exit
+                        # reason + iteration count onto the run-row metadata so
+                        # _emit_card_record can populate exit_stage /
+                        # iterations_used / iterations_budget. _turn_exit_reason
+                        # was set to max_iterations_reached(N/M) above; these are
+                        # locals in this block.
+                        run_metadata_extra={
+                            "turn_exit_reason": _turn_exit_reason,
+                            "iterations_used": api_call_count,
+                            "iterations_budget": agent.max_iterations,
+                        },
                     )
                     logger.info(
                         "recorded budget-exhausted failure for task %s (%d/%d)",

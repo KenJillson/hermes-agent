@@ -8195,6 +8195,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    run_metadata_extra: Optional[dict] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -8296,6 +8297,7 @@ def _record_task_failure(
                         "trigger_outcome": outcome,
                         "effective_limit": effective_limit,
                         "limit_source": limit_source,
+                        **(run_metadata_extra or {}),  # CD-006 (D2.2 Inc-1)
                     },
                 )
             payload = {
@@ -8336,7 +8338,10 @@ def _record_task_failure(
                     conn, task_id,
                     outcome=outcome, status=outcome,
                     error=error[:500],
-                    metadata={"failures": failures},
+                    metadata={
+                        "failures": failures,
+                        **(run_metadata_extra or {}),  # CD-006 (D2.2 Inc-1)
+                    },
                 )
                 _append_event(
                     conn, task_id, outcome,
