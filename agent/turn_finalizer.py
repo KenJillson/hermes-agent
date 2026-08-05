@@ -201,6 +201,55 @@ def finalize_turn(
                     exc_info=True,
                 )
 
+    # CD-008 (D2.2 Inc-2): healthy review-required handoff. When the worker
+    # called kanban_block mid-loop, block_task has ALREADY closed the run as
+    # ``blocked`` (metadata NULL) before this finalizer runs — so this is NOT a
+    # CD-006 write-at-close; we merge the exit reason + iteration count onto the
+    # already-closed run by run_id. Guarded on outcome=="blocked" + ended so the
+    # exhausted timed_out/gave_up path (CD-006, above) is excluded and a normal
+    # still-working turn whose run is still open is skipped. Best-effort: a DB
+    # failure here must never break the worker's terminal return.
+    # (No budget-exhaustion guard needed: on the exhaustion path the run closes
+    # as timed_out/gave_up, never "blocked", so the outcome check below excludes
+    # it — and CD-006 has already stamped that run. This keeps CD-001's grep
+    # signature isolated from CD-008.)
+    _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+    if _kanban_task:
+        try:
+            from hermes_cli import kanban_db as _kb
+            _conn = _kb.connect()
+            try:
+                _run = _kb.latest_run(_conn, _kanban_task)
+                if (
+                    _run is not None
+                    and _run.ended_at is not None
+                    and _run.outcome == "blocked"
+                ):
+                    _kb._merge_run_metadata(
+                        _conn, _run.id,
+                        {
+                            "turn_exit_reason": _turn_exit_reason,
+                            "iterations_used": api_call_count,
+                            "iterations_budget": agent.max_iterations,
+                        },
+                    )
+                    logger.info(
+                        "CD-008: stamped healthy-block exit for task %s run %s "
+                        "(%s, %d/%d)",
+                        _kanban_task, _run.id, _turn_exit_reason,
+                        api_call_count, agent.max_iterations,
+                    )
+            finally:
+                try:
+                    _conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            logger.warning(
+                "CD-008: failed to stamp healthy-block exit for task %s",
+                _kanban_task, exc_info=True,
+            )
+
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
     completed = (
