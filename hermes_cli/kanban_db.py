@@ -6685,7 +6685,27 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
-def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
+class TrajectoryUnprotectedError(ValueError):
+    """Raised by ``delete_archived_task`` when a hard delete (``--rm``) is
+    attempted on a card that has no durable ``card_record`` (CD-004).
+
+    Deleting the card's rows (runs/events/comments/links) destroys the
+    trajectory with no net; refusing unless a record exists — or ``force=True``
+    is passed — keeps the G4 corpus complete. The card id is attached as
+    ``.task_id``. Kept a ``ValueError`` subclass so existing tool-error handlers
+    treat it as a recoverable user error, mirroring ``HallucinatedCardsError``.
+    """
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(
+            f"refused --rm {task_id}: no card_record exists "
+            f"(docs/card-records/{task_id}.json) \u2014 the trajectory would be "
+            f"destroyed with no net. Backfill a record or re-run with --force."
+        )
+
+
+def delete_archived_task(conn: sqlite3.Connection, task_id: str, *, force: bool = False) -> bool:
     """Permanently remove an already-archived task and its related rows.
 
     Safety guard: only archived tasks can be deleted. Active / blocked / done
@@ -6699,6 +6719,14 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
+        # CD-004: refuse to hard-delete a trajectory that was never recorded.
+        #         Existence of docs/card-records/<id>.json (resolved via
+        #         kanban_home(), same as the CD-003 emit) is the gate; --force
+        #         (force=True) is the explicit, deliberate override.
+        if not force:
+            _rec = kanban_home() / "docs" / "card-records" / f"{task_id}.json"
+            if not _rec.exists():
+                raise TrajectoryUnprotectedError(task_id)
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
