@@ -4097,6 +4097,10 @@ def _emit_card_record(conn, task_id, *, final_status):
     """
     import json
     import os
+    try:
+        from hermes_cli import card_record_enrich as _enrich
+    except Exception:
+        _enrich = None
 
     out_dir = kanban_home() / "docs" / "card-records"
     out_path = out_dir / f"{task_id}.json"
@@ -4105,7 +4109,7 @@ def _emit_card_record(conn, task_id, *, final_status):
 
     # --- source tables (column names verified against live schema 2026-07-31) ---
     trows = _cr_rows(
-        conn, "SELECT id, created_by, status FROM tasks WHERE id = ?", (task_id,)
+        conn, "SELECT id, created_by, status, title, body FROM tasks WHERE id = ?", (task_id,)
     )
     task = trows[0] if trows else {}
 
@@ -4252,15 +4256,20 @@ def _emit_card_record(conn, task_id, *, final_status):
         for line in (c.get("body") or "").splitlines():
             s = line.strip()
             if s.startswith("LESSON:"):
-                lessons.append({
-                    "text": s[len("LESSON:"):].strip(),
-                    "scope": None, "confidence": None, "evidence_ref": None,
-                    "detail_source": "gated:D2.6",
-                })
+                _raw = s[len("LESSON:"):].strip()
+                lessons.append(
+                    _enrich.structure_lesson_at_emit(_raw) if _enrich is not None
+                    else {"text": _raw, "scope": None, "confidence": None,
+                          "supersedes": None, "evidence_ref": None,
+                          "detail_source": "gated:D2.6"})
 
     # --- artifact_harvest_ref: pointer to docs/harvest/<id>/ if present ---
     harvest_dir = kanban_home() / "docs" / "harvest" / task_id
     harvest_ref = f"docs/harvest/{task_id}/" if harvest_dir.is_dir() else None
+
+    _tc, _tc_src, _tc_by = (
+        _enrich.classify_at_emit(task.get("title"), task.get("body"))
+        if _enrich is not None else (None, "gated:D2.4", None))
 
     record = {
         "schema_version": _CARD_RECORD_SCHEMA_VERSION,
@@ -4268,7 +4277,7 @@ def _emit_card_record(conn, task_id, *, final_status):
         "profile": profile,
         "profile_source": None if profile is not None else "null:no-run-profile",
         "card_id": task_id,
-        "task_class": None, "task_class_source": "gated:D2.4",
+        "task_class": _tc, "task_class_source": _tc_src,
         "final_status": final_status,
         "outcome_class": outcome_class,
         "runs": runs_out,
@@ -4288,6 +4297,8 @@ def _emit_card_record(conn, task_id, *, final_status):
             "emitter_version": _CARD_RECORD_EMITTER,
             "artifact_harvest_ref": harvest_ref,
             "artifact_repo_ref": None,
+            "classified_at": _cr_now_iso() if _tc_by else None,
+            "classified_by": _tc_by,
         },
     }
 
