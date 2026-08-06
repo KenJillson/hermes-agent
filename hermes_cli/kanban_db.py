@@ -4164,6 +4164,13 @@ def _emit_card_record(conn, task_id, *, final_status):
         exit_reason = md.get("turn_exit_reason")
         if exit_reason is not None:
             exit_stage, exit_stage_src = exit_reason, None
+        elif (r.get("outcome") or "") == "crashed":
+            # CD-010: the crash/protocol-violation path carries no
+            # turn_exit_reason (the crash-detector writes pid/claimer/exit_code,
+            # not _record_task_failure). Surface the crash outcome so the run is
+            # legible in the record instead of gated. Recovery re-block +
+            # Part 2 remain deferred to post-0.20.0 (rewritten loop surface).
+            exit_stage, exit_stage_src = "crashed", None
         else:
             exit_stage, exit_stage_src = None, "gated:D2.2"
 
