@@ -142,51 +142,45 @@ def finalize_turn(
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
-        # If running as a kanban worker, signal the dispatcher that the
-        # worker could not complete (rather than treating it as a
-        # protocol violation). This applies whether the user-facing fallback
-        # came from the summary call or an explicitly pending continuation;
-        # both exhausted the task budget and must advance the failure circuit.
-        #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the dispatcher's
-        # consecutive-failure circuit breaker (#29747 gap 2).
+        # D3.4: iteration-budget exhaustion is NOT a worker failure — it is a
+        # review event. Rather than routing through
+        # ``_record_task_failure(outcome="timed_out")`` (which advances the
+        # consecutive-failure circuit breaker and lets the dispatcher re-dispatch
+        # the card with the SAME budget until it trips to ``gave_up``), post the
+        # worker's summary as a handoff comment and issue a review-required
+        # ``kanban_block`` (kind=needs_input). The card lands in the human review
+        # queue with partial results; the breaker is untouched. ``final_response``
+        # holds the summary from ``_handle_max_iterations`` (or the preserved
+        # continuation) set above. The iteration metadata is stamped onto the now-
+        # ``blocked`` run by the CD-008 block below (outcome=="blocked").
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb
                 _conn = _kb.connect()
                 try:
-                    _kb._record_task_failure(
+                    _run = _kb.latest_run(_conn, _kanban_task)
+                    _summary = (final_response or "").strip()
+                    if _summary:
+                        _kb.add_comment(
+                            _conn, _kanban_task, "builder",
+                            f"review-required: iteration budget exhausted "
+                            f"({api_call_count}/{agent.max_iterations}) — partial "
+                            f"results, handed off for review.\n\n{_summary}",
+                        )
+                    _kb.block_task(
                         _conn,
                         _kanban_task,
-                        error=(
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
+                        reason=(
+                            f"review-required: iteration budget exhausted "
+                            f"({api_call_count}/{agent.max_iterations}) — partial "
+                            "handoff, needs human review"
                         ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        event_payload_extra={
-                            "budget_used": api_call_count,
-                            "budget_max": agent.max_iterations,
-                        },
-                        # CD-006 (D2.2 Inc-1): thread the finalizer's exit
-                        # reason + iteration count onto the run-row metadata so
-                        # _emit_card_record can populate exit_stage /
-                        # iterations_used / iterations_budget. _turn_exit_reason
-                        # was set to max_iterations_reached(N/M) above; these are
-                        # locals in this block.
-                        run_metadata_extra={
-                            "turn_exit_reason": _turn_exit_reason,
-                            "iterations_used": api_call_count,
-                            "iterations_budget": agent.max_iterations,
-                        },
+                        kind="needs_input",
+                        expected_run_id=_run.id if _run is not None else None,
                     )
                     logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
+                        "D3.4: blocked budget-exhausted task %s review-required (%d/%d)",
                         _kanban_task, api_call_count, agent.max_iterations,
                     )
                 finally:
@@ -196,7 +190,7 @@ def finalize_turn(
                         pass
             except Exception:
                 logger.warning(
-                    "Failed to record budget-exhausted failure for task %s",
+                    "D3.4: failed to block budget-exhausted task %s review-required",
                     _kanban_task,
                     exc_info=True,
                 )
@@ -205,14 +199,12 @@ def finalize_turn(
     # called kanban_block mid-loop, block_task has ALREADY closed the run as
     # ``blocked`` (metadata NULL) before this finalizer runs — so this is NOT a
     # CD-006 write-at-close; we merge the exit reason + iteration count onto the
-    # already-closed run by run_id. Guarded on outcome=="blocked" + ended so the
-    # exhausted timed_out/gave_up path (CD-006, above) is excluded and a normal
-    # still-working turn whose run is still open is skipped. Best-effort: a DB
-    # failure here must never break the worker's terminal return.
-    # (No budget-exhaustion guard needed: on the exhaustion path the run closes
-    # as timed_out/gave_up, never "blocked", so the outcome check below excludes
-    # it — and CD-006 has already stamped that run. This keeps CD-001's grep
-    # signature isolated from CD-008.)
+    # already-closed run by run_id. Guarded on outcome=="blocked" + ended so a
+    # normal still-working turn whose run is still open is skipped. Best-effort:
+    # a DB failure here must never break the worker's terminal return.
+    # (Post-D3.4: the budget-exhaustion path above ALSO ends in a review-required
+    # block, so its run closes as "blocked" and is matched here — this block is
+    # what stamps the exhausted run's iteration metadata onto it.)
     _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
     if _kanban_task:
         try:

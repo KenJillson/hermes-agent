@@ -94,6 +94,12 @@ logger = logging.getLogger(__name__)
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+# D3.3: when the worker's remaining iteration budget falls to this many calls,
+# inject a one-shot "wrap up and hand off" notice so it can block
+# review-required WHILE it still has budget and tools (RC-002: a worker that can
+# SEE its budget behaves differently). Tunable; keep > 0 and below a typical budget.
+BUDGET_WARN_REMAINING = 10
+
 # Modules that indicate a deterministic local processing error when they
 # appear in an exception traceback WITHOUT any API-call module. Used by the
 # outer-loop error classifier to avoid retrying bugs that will fail
@@ -1385,6 +1391,11 @@ def run_conversation(
     # stale prior turn's usage.
     agent._last_turn_usage = None
 
+    # D3.3: reset the one-shot budget-warning latch each turn so a multi-turn
+    # agent that crosses the warn threshold in one turn is re-warned in the next
+    # (the iteration budget itself is rebuilt per turn in turn_context).
+    agent._budget_warning_injected = False
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
@@ -1435,6 +1446,31 @@ def run_conversation(
             if not agent.quiet_mode:
                 agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
             break
+
+        # D3.3 (budget as a VISIBLE, injected resource): once per turn budget,
+        # when the remaining iteration budget crosses the warn threshold, inject a
+        # single "wrap up + hand off" notice so the worker can block
+        # review-required while it still has budget and tools. One-shot (latched)
+        # so it does not repeat every subsequent iteration; purely additive to the
+        # message stream.
+        if (not getattr(agent, "_budget_warning_injected", False)
+                and agent.iteration_budget.remaining <= BUDGET_WARN_REMAINING):
+            agent._budget_warning_injected = True
+            _b_used = agent.iteration_budget.used
+            _b_total = agent.iteration_budget.max_total
+            _b_left = agent.iteration_budget.remaining
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"\u23f3 ITERATION BUDGET NOTICE: you have used {_b_used}/{_b_total} "
+                    f"tool-calling iterations; {_b_left} remain. When the budget reaches "
+                    f"0 the run is stopped and handed to a human for review. Wrap up NOW "
+                    f"while you still have budget: post your handoff (what changed, "
+                    f"per-AC evidence with commands + output, any LESSON) and then call "
+                    f"kanban_block with reason \"review-required: <one-line summary>\". "
+                    f"Do not start new work you cannot finish within the remaining budget."
+                ),
+            })
 
         # Fire step_callback for gateway hooks (agent:step event)
         if agent.step_callback is not None:
