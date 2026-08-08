@@ -993,6 +993,14 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # D3.1 per-card iteration budget. NULL = inherit profile/config default; a
+    # value is passed to the worker as ``--max-turns`` (cli.py's name for
+    # agent.max_iterations), capping IterationBudget for that run.
+    max_iterations: Optional[int] = None
+    # D3.5 per-call terminal timeout cap, INDEPENDENT of ``max_runtime_seconds``.
+    # NULL = inherit the runtime-derived auto-raise; a value PINS TERMINAL_TIMEOUT
+    # and suppresses the auto-raise (short per-call cap under a long total).
+    terminal_timeout_seconds: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1086,6 +1094,16 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            max_iterations=(
+                row["max_iterations"]
+                if "max_iterations" in keys and row["max_iterations"] is not None
+                else None
+            ),
+            terminal_timeout_seconds=(
+                row["terminal_timeout_seconds"]
+                if "terminal_timeout_seconds" in keys and row["terminal_timeout_seconds"] is not None
+                else None
             ),
         )
 
@@ -2481,6 +2499,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # any create that fails classification (fail-soft, backfillable).
         _add_column_if_missing(conn, "tasks", "task_class", "task_class TEXT")
 
+    if "max_iterations" not in cols:
+        # D3.1 per-card iteration budget. NULL = inherit profile/config default;
+        # a value is passed to the worker as --max-turns so it caps
+        # agent.max_iterations for that run.
+        _add_column_if_missing(conn, "tasks", "max_iterations", "max_iterations INTEGER")
+
+    if "terminal_timeout_seconds" not in cols:
+        # D3.5 per-call terminal cap, INDEPENDENT of max_runtime_seconds. NULL =
+        # inherit the runtime-derived auto-raise; a value PINS TERMINAL_TIMEOUT.
+        _add_column_if_missing(conn, "tasks", "terminal_timeout_seconds", "terminal_timeout_seconds INTEGER")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2914,6 +2943,8 @@ def create_task(
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     task_class: Optional[str] = None,
+    max_iterations: Optional[int] = None,
+    terminal_timeout_seconds: Optional[int] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3228,6 +3259,12 @@ def create_task(
                         _task_class = _cls if _cls in _cre.TASK_CLASSES else None
                     except Exception:
                         _task_class = None
+                # D3.1: NEW cards get an explicit iteration budget (visible on the
+                # board) — default when the caller did not pin one. D3.5's
+                # terminal_timeout_seconds stays explicit-only (NULL = auto-raise),
+                # so it is written through as-is.
+                _max_iterations = (max_iterations if max_iterations is not None
+                                   else DEFAULT_TASK_MAX_ITERATIONS)
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -3237,8 +3274,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, task_class
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, task_class,
+                        max_iterations, terminal_timeout_seconds
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3265,6 +3303,8 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         _task_class,
+                        _max_iterations,
+                        int(terminal_timeout_seconds) if terminal_timeout_seconds is not None else None,
                     ),
                 )
                 for pid in parents:
@@ -7190,6 +7230,13 @@ DEFAULT_LOG_BACKUP_COUNT = 1
 # and call kanban_block/kanban_complete before max_runtime_seconds kills it.
 KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
 
+# D3.1: default per-card iteration budget for NEW cards when the creator does not
+# pin one. Mirrors the builder profile's agent.max_turns so behaviour is
+# unchanged, but the budget is now EXPLICIT on the card and visible to the worker
+# (a declared resource, not an ambient config default). Existing rows keep NULL
+# (inherit config); only create_task-born cards get this default.
+DEFAULT_TASK_MAX_ITERATIONS = 60
+
 # ---------------------------------------------------------------------------
 # Respawn guard constants
 # ---------------------------------------------------------------------------
@@ -9496,12 +9543,20 @@ def _default_spawn(
         env["HERMES_KANBAN_GOAL_MODE"] = "1"
         if task.goal_max_turns is not None:
             env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(task.goal_max_turns))
-    terminal_timeout = _worker_terminal_timeout_env(
-        task.max_runtime_seconds,
-        env.get("TERMINAL_TIMEOUT"),
-    )
-    if terminal_timeout is not None:
-        env["TERMINAL_TIMEOUT"] = terminal_timeout
+    # D3.5: an explicit per-card terminal_timeout_seconds PINS the per-call cap
+    # and suppresses the runtime-derived auto-raise, so a card can hold a short
+    # per-call timeout under a long total runtime (independent knobs). NULL keeps
+    # the auto-raise (long total -> long per-call), the permissive default a long
+    # single command relies on.
+    if task.terminal_timeout_seconds is not None:
+        env["TERMINAL_TIMEOUT"] = str(int(task.terminal_timeout_seconds))
+    else:
+        terminal_timeout = _worker_terminal_timeout_env(
+            task.max_runtime_seconds,
+            env.get("TERMINAL_TIMEOUT"),
+        )
+        if terminal_timeout is not None:
+            env["TERMINAL_TIMEOUT"] = terminal_timeout
     foreground_timeout = _worker_terminal_timeout_env(
         task.max_runtime_seconds,
         env.get("TERMINAL_MAX_FOREGROUND_TIMEOUT"),
@@ -9568,6 +9623,12 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
+    # D3.1: per-card iteration budget. --max-turns is cli.py's name for the
+    # agent's max_iterations (CLI arg wins over profile config), so a card's
+    # budget caps IterationBudget for that run. NULL column = omit the flag =
+    # inherit the profile/config default.
+    if task.max_iterations is not None:
+        cmd.extend(["--max-turns", str(int(task.max_iterations))])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])

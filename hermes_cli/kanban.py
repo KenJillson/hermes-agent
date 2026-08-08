@@ -370,6 +370,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "two retries. Omit to use the dispatcher's "
                                "kanban.failure_limit config "
                                f"(default {kb.DEFAULT_FAILURE_LIMIT}).")
+    p_create.add_argument("--task-class", default=None, dest="task_class",
+                          choices=("infra", "test", "feature", "fix", "docs", "research"),
+                          help="Pin the card's task_class (the G4 routing/metrics "
+                               "axis). Omit to auto-classify from title/body at create.")
+    p_create.add_argument("--max-iterations", type=int, default=None, metavar="N",
+                          dest="max_iterations",
+                          help="Per-card tool-calling iteration budget, passed to "
+                               "the worker as --max-turns (caps agent.max_iterations "
+                               f"for the run). Omit for the default ({kb.DEFAULT_TASK_MAX_ITERATIONS}).")
+    p_create.add_argument("--terminal-timeout", type=int, default=None,
+                          metavar="SECONDS", dest="terminal_timeout_seconds",
+                          help="Per-CALL terminal timeout, independent of "
+                               "--max-runtime (the whole-worker cap): pins "
+                               "TERMINAL_TIMEOUT and suppresses the runtime-derived "
+                               "auto-raise. Omit to inherit the auto-raise.")
     p_create.add_argument("--model", default=None, dest="model_override",
                           help="Pin the worker to this model (passed as "
                                "-m <model>) without changing the profile's "
@@ -1500,6 +1515,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    max_iterations = getattr(args, "max_iterations", None)
+    if max_iterations is not None and max_iterations < 1:
+        print(f"kanban: --max-iterations must be >= 1 (got {max_iterations}).",
+              file=sys.stderr)
+        return 2
+    terminal_timeout_seconds = getattr(args, "terminal_timeout_seconds", None)
+    if terminal_timeout_seconds is not None and terminal_timeout_seconds < 1:
+        print(f"kanban: --terminal-timeout must be >= 1 second "
+              f"(got {terminal_timeout_seconds}).", file=sys.stderr)
+        return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1523,6 +1548,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
+            task_class=getattr(args, "task_class", None),
+            max_iterations=max_iterations,
+            terminal_timeout_seconds=terminal_timeout_seconds,
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
