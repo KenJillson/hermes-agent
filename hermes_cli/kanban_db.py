@@ -5156,12 +5156,24 @@ def _emit_card_record(conn, task_id, *, final_status):
     has_completed = "completed" in event_kinds
     has_human = any(k in event_kinds for k in ("unblocked", "specified", "reclaimed"))
     has_loop_block = "block_loop_detected" in event_kinds
+    # P4.0 (arch decision 2026-08-08): a worker run cut off at its iteration
+    # budget (exit_stage max_iterations_*) that a human then ACCEPTED via
+    # complete is not a clean first pass — Ken adjudicated an incomplete run.
+    # The acceptance leaves only a 'completed' event (no 'unblock'), so this
+    # keys on the run's exhaustion exit, read from the enriched runs_out
+    # (1:1 with run_rows). Fail-closed: a gated/absent exit_stage does not
+    # fire, so behaviour is unchanged unless exhaustion is positively present.
+    budget_exhausted = any(
+        str(r.get("exit_stage") or "").startswith("max_iterations")
+        for r in runs_out if (r.get("outcome") or "") != "completed")
 
     if final_status == "archived" and not has_completed:
         outcome_class = "abandoned"
     elif has_loop_block and not has_completed:
         outcome_class = "abandoned"
     elif has_human:
+        outcome_class = "human_involved"
+    elif budget_exhausted and has_completed:
         outcome_class = "human_involved"
     elif len(worker_runs) > 1:
         outcome_class = "retried"
