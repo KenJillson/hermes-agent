@@ -9623,12 +9623,6 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    # D3.1: per-card iteration budget. --max-turns is cli.py's name for the
-    # agent's max_iterations (CLI arg wins over profile config), so a card's
-    # budget caps IterationBudget for that run. NULL column = omit the flag =
-    # inherit the profile/config default.
-    if task.max_iterations is not None:
-        cmd.extend(["--max-turns", str(int(task.max_iterations))])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
@@ -9636,6 +9630,13 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
+    # D3.1 (CD-014 fix, 2026-08-08): --max-turns is a `chat` SUBCOMMAND flag
+    # and MUST follow the `chat` token. Emitting it in the top-level group
+    # (before `chat`) made top-level argparse read its value as an invalid
+    # `command` positional -> exit 2, crashing the worker on spawn (found
+    # live, Batch 5 / t_7cd06595). NULL column = omit = inherit config default.
+    if task.max_iterations is not None:
+        cmd.extend(["--max-turns", str(int(task.max_iterations))])
     if task.goal_mode:
         # Goal-mode workers must take the fully-quiet single-query path:
         # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
