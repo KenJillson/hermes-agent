@@ -2474,6 +2474,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "task_class" not in cols:
+        # D2.4 board tag: the closed G4 task-class axis, mirrored from the
+        # immutable card_record onto the live board so routing/budget can
+        # read it at dispatch. NULL on legacy rows (backfilled once) and on
+        # any create that fails classification (fail-soft, backfillable).
+        _add_column_if_missing(conn, "tasks", "task_class", "task_class TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2906,6 +2913,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    task_class: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3208,6 +3216,18 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                # D2.4: classify at create when the caller did not pin a
+                # class, so routing/budget can read task_class off the board
+                # at dispatch. Fail-soft to NULL (backfillable) — never fail
+                # a create on a classifier hiccup or an off-axis tag.
+                _task_class = task_class
+                if _task_class is None:
+                    try:
+                        from hermes_cli import card_record_enrich as _cre
+                        _cls, _ = _cre.classify(title, body)
+                        _task_class = _cls if _cls in _cre.TASK_CLASSES else None
+                    except Exception:
+                        _task_class = None
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -3217,8 +3237,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, task_class
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3244,6 +3264,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        _task_class,
                     ),
                 )
                 for pid in parents:
