@@ -1525,6 +1525,25 @@ def _cmd_create(args: argparse.Namespace) -> int:
         print(f"kanban: --terminal-timeout must be >= 1 second "
               f"(got {terminal_timeout_seconds}).", file=sys.stderr)
         return 2
+    # D4.1 authoring lint: parse the ## AC block with the SAME parser the emit
+    # uses (kb.parse_ac_text) so author-time and emit-time never diverge. Warn
+    # only (never blocks creation) on issues the author can fix now.
+    if getattr(args, "body", None):
+        try:
+            _ac_cnt, _ac_p, _ac_s, _ac_res = kb.parse_ac_text(args.body)
+        except Exception:
+            _ac_res = None
+        for _r in (_ac_res or []):
+            _c = _r.get("check")
+            if _c and _c.get("expect_source") == "null:unparsed-expect":
+                print(f"kanban: AC-{_r['index']}: unrecognised expect= — defaulted "
+                      f"to exit:0", file=sys.stderr)
+            if _r.get("extras_ignored"):
+                print(f"kanban: AC-{_r['index']}: multiple ```check blocks — only "
+                      f"the first is used", file=sys.stderr)
+            if _r.get("check_malformed"):
+                print(f"kanban: AC-{_r['index']}: a ```check fence did not close — "
+                      f"AC treated as judgment-only", file=sys.stderr)
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,

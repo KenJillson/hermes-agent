@@ -4957,49 +4957,140 @@ def _cr_evidence_rows(task_id, profile):
         return None, "null:evidence-read-failed"
 
 
-def _cr_parse_ac(conn, task_id, comments):
-    """Parse a ``## AC`` checklist (decision C) from a scope-pin comment or the
-    card body. Returns (ac_count, ac_passed, source).
+def parse_ac_text(text):
+    """Pure ``## AC`` parser (D4.1) — the ONE implementation, shared by
+    _cr_parse_ac (emit, DB-backed) and the create-time authoring lint
+    (kanban._cmd_create) so author-time and emit-time parse IDENTICALLY (arch §20
+    'logic in ONE place'). Given a single text, find the ``## AC`` block and
+    return (ac_count, ac_passed, source, ac_results); no block ->
+    (None, None, 'null:no-convention', None); empty block ->
+    (None, None, 'null:empty-ac-block', None).
 
-    ac_passed here is the checklist's own ticked-count (``- [x]``); evidence-db
-    cross-referencing is a later D2.x refinement, so the source tag names the
-    derivation (``derived:checklist-marks``) rather than claiming verification.
+    ac_passed is the authored ``- [x]`` tick-count (source stays
+    'derived:checklist-marks'; D4.2 swaps in the executed pass-count). ac_results
+    is the per-AC parse: an optional runnable ``check`` (fenced ```check block;
+    ``expect=`` captured to EOL) or a judgment (declared/inferred), stored UNRUN —
+    D4.1 records WHAT WAS AUTHORED, never a pass/fail (execution is D4.2).
+    Fail-soft: an unclosed fence degrades the AC to judgment (flag
+    ``check_malformed``); an unknown ``expect=`` defaults to exit:0 (flag
+    ``null:unparsed-expect``); never raises.
     """
     import re
+    lines = (text or "").splitlines()
+    block = None
+    for i, ln in enumerate(lines):
+        if ln.strip().lower() == "## ac":
+            block = []
+            for sub in lines[i + 1:]:
+                if sub.strip().startswith("## "):
+                    break
+                block.append(sub)
+            break
+    if block is None:
+        return None, None, "null:no-convention", None
+
+    def _parse_expect(info):
+        m = re.search(r"expect=(.+)$", info or "")
+        if not m:
+            return "exit", "0", None
+        tok = m.group(1).rstrip()
+        if tok.startswith("exit:"):
+            val = tok[len("exit:"):]
+            if re.fullmatch(r"-?\d+", val):
+                return "exit", val, None
+        elif tok.startswith("stdout~"):
+            return "stdout_regex", tok[len("stdout~"):], None
+        elif tok.startswith("stdout="):
+            return "stdout_substr", tok[len("stdout="):], None
+        return "exit", "0", "null:unparsed-expect"   # fail-closed default
+
+    ac_re = re.compile(r"^- \[([ xX])\]\s*(.*)$")
+    groups = []
+    cur = None
+    for ln in block:
+        gm = ac_re.match(ln.strip())
+        if gm:
+            if cur is not None:
+                groups.append(cur)
+            cur = [gm.group(1), gm.group(2), []]
+        elif cur is not None:
+            cur[2].append(ln)
+    if cur is not None:
+        groups.append(cur)
+
+    results = []
+    checked = 0
+    for gi, (tick, itext, body) in enumerate(groups, 1):
+        is_checked = tick in "xX"
+        if is_checked:
+            checked += 1
+        judgment_declared = bool(re.search(r"\[judgment\]", itext, re.I))
+        text_clean = re.sub(r"\s*\[judgment\]\s*", " ", itext, flags=re.I).strip()
+
+        check = None
+        extras_ignored = False
+        malformed = False
+        k = 0
+        while k < len(body):
+            fm = re.match(r"^```check\b(.*)$", body[k].strip())
+            if not fm:
+                k += 1
+                continue
+            info = fm.group(1)
+            blines = []
+            k2 = k + 1
+            closed = False
+            while k2 < len(body):
+                if body[k2].strip() == "```":
+                    closed = True
+                    break
+                blines.append(body[k2])
+                k2 += 1
+            if not closed:
+                malformed = True            # unclosed fence: flag, stop scanning
+                break
+            cmd = "\n".join(blines).strip()
+            ek, ev, esrc = _parse_expect(info)
+            if check is None and cmd:
+                check = {"command": cmd, "expect_kind": ek,
+                         "expect_value": ev, "expect_source": esrc}
+            else:
+                extras_ignored = True       # first-wins; extra check(s) dropped
+            k = k2 + 1
+
+        if check is not None:
+            entry = {"index": gi, "text": text_clean, "checked": is_checked,
+                     "kind": "check", "check": check, "judgment": None,
+                     "status": "unrun", "status_source": "gated:D4.2"}
+            if extras_ignored:
+                entry["extras_ignored"] = True
+        else:
+            entry = {"index": gi, "text": text_clean, "checked": is_checked,
+                     "kind": "judgment", "check": None,
+                     "judgment": "declared" if judgment_declared else "inferred",
+                     "status": "unrun", "status_source": "gated:D4.2"}
+            if malformed:
+                entry["check_malformed"] = True
+        results.append(entry)
+
+    total = len(groups)
+    if total == 0:
+        return None, None, "null:empty-ac-block", None
+    return total, checked, "derived:checklist-marks", results
+
+
+def _cr_parse_ac(conn, task_id, comments):
+    """Thin DB wrapper over parse_ac_text (the shared core): search comment
+    bodies then the card body; the first text carrying a ``## AC`` block wins."""
     texts = [c.get("body") for c in comments if c.get("body")]
     brows = _cr_rows(conn, "SELECT body FROM tasks WHERE id = ?", (task_id,))
     if brows and brows[0].get("body"):
         texts.append(brows[0]["body"])
-
-    block = None
     for t in texts:
-        lines = t.splitlines()
-        for i, ln in enumerate(lines):
-            if ln.strip().lower() == "## ac":
-                block = []
-                for sub in lines[i + 1:]:
-                    if sub.strip().startswith("## "):
-                        break
-                    block.append(sub)
-                break
-        if block is not None:
-            break
-
-    if block is None:
-        return None, None, "null:no-convention"
-
-    checked = unchecked = 0
-    for ln in block:
-        s = ln.strip()
-        if re.match(r"^- \[[ xX]\]", s):
-            if re.match(r"^- \[[xX]\]", s):
-                checked += 1
-            else:
-                unchecked += 1
-    total = checked + unchecked
-    if total == 0:
-        return None, None, "null:empty-ac-block"
-    return total, checked, "derived:checklist-marks"
+        cnt, passed, source, results = parse_ac_text(t)
+        if source != "null:no-convention":
+            return cnt, passed, source, results
+    return None, None, "null:no-convention", None
 
 
 def _emit_card_record(conn, task_id, *, final_status):
@@ -5181,7 +5272,7 @@ def _emit_card_record(conn, task_id, *, final_status):
         outcome_class = "first_pass"
 
     # --- verification ---
-    ac_count, ac_passed, ac_source = _cr_parse_ac(conn, task_id, comments)
+    ac_count, ac_passed, ac_source, ac_results = _cr_parse_ac(conn, task_id, comments)
     evidence_rows, evidence_src = _cr_evidence_rows(task_id, profile)
 
     # --- lessons[] (NOW: LESSON: comment text; structure GATED:D2.6) ---
@@ -5221,7 +5312,8 @@ def _emit_card_record(conn, task_id, *, final_status):
             "ac_count": ac_count,
             "ac_passed": ac_passed,
             "ac_source": ac_source,
-            "ac_results": None, "ac_results_source": "gated:D2.x",
+            "ac_results": ac_results,
+            "ac_results_source": None if ac_results is not None else "null:unparsed-or-absent",
             "evidence_rows": evidence_rows,
             "evidence_rows_source": evidence_src,
         },
