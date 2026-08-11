@@ -5061,14 +5061,14 @@ def parse_ac_text(text):
         if check is not None:
             entry = {"index": gi, "text": text_clean, "checked": is_checked,
                      "kind": "check", "check": check, "judgment": None,
-                     "status": "unrun", "status_source": "gated:D4.2"}
+                     "status": "unrun"}
             if extras_ignored:
                 entry["extras_ignored"] = True
         else:
             entry = {"index": gi, "text": text_clean, "checked": is_checked,
                      "kind": "judgment", "check": None,
                      "judgment": "declared" if judgment_declared else "inferred",
-                     "status": "unrun", "status_source": "gated:D4.2"}
+                     "status": "unrun"}
             if malformed:
                 entry["check_malformed"] = True
         results.append(entry)
@@ -5091,6 +5091,57 @@ def _cr_parse_ac(conn, task_id, comments):
         if source != "null:no-convention":
             return cnt, passed, source, results
     return None, None, "null:no-convention", None
+
+
+def _read_ac_execution(conn, task_id):
+    """D4.2: read ac-execution-<task_id>.json from the card workspace (written by
+    `kanban gate` before complete; emit runs before workspace GC). Returns the
+    dict or None. Fail-soft — any error yields None and never blocks the emit."""
+    try:
+        row = conn.execute(
+            "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        ws = row[0] if row else None
+        if not ws:
+            return None
+        path = os.path.join(ws, f"ac-execution-{task_id}.json")
+        if not os.path.isfile(path):
+            return None
+        with open(path) as fh:
+            rec = json.load(fh)
+        if rec.get("schema") != "ac-execution/1" or rec.get("card_id") != task_id:
+            return None
+        return rec
+    except Exception:
+        return None
+
+
+def _apply_ac_execution(ac_results, exec_rec):
+    """D4.2 overlay: map the gate's per-AC verdicts onto ac_results by index
+    (status unrun->passed/failed/unrunnable/needs_human), recompute ac_passed as
+    the execution-derived passed-count, and return
+    (ac_results, ac_passed, ac_source, ac_execution_summary)."""
+    by_index = {v.get("index"): v for v in (exec_rec.get("verdicts") or [])}
+    passed = 0
+    for r in ac_results:
+        v = by_index.get(r.get("index"))
+        if not v:
+            continue
+        r["status"] = v.get("status", r.get("status"))
+        if r.get("kind") == "check":
+            r["exit_code"] = v.get("exit_code")
+            r["isolation_used"] = v.get("isolation_used")
+            if r.get("status") == "passed":
+                passed += 1
+    s = exec_rec.get("summary") or {}
+    summary = {
+        "verdict": s.get("verdict"),
+        "checks_passed": s.get("checks_passed"),
+        "checks_failed": s.get("checks_failed"),
+        "checks_unrunnable": s.get("checks_unrunnable"),
+        "judgment_count": s.get("judgment_count"),
+        "executed_at": exec_rec.get("executed_at"),
+    }
+    return ac_results, passed, "executed:board-gate", summary
 
 
 def _emit_card_record(conn, task_id, *, final_status):
@@ -5273,6 +5324,19 @@ def _emit_card_record(conn, task_id, *, final_status):
 
     # --- verification ---
     ac_count, ac_passed, ac_source, ac_results = _cr_parse_ac(conn, task_id, comments)
+    # D4.2: overlay board-gate execution. `kanban gate` wrote
+    # ac-execution-<id>.json into the workspace before complete; the emit runs
+    # BEFORE workspace GC (see complete_task), so it is readable here. Present =>
+    # each ac_results status flips unrun->executed and ac_passed becomes
+    # execution-derived. Absent (un-gated card) => the D4.1 parse stands.
+    ac_execution = None
+    ac_execution_source = "null:not-gated"
+    if ac_results:
+        _exec = _read_ac_execution(conn, task_id)
+        if _exec is not None:
+            ac_results, ac_passed, ac_source, ac_execution = _apply_ac_execution(
+                ac_results, _exec)
+            ac_execution_source = None
     evidence_rows, evidence_src = _cr_evidence_rows(task_id, profile)
 
     # --- lessons[] (NOW: LESSON: comment text; structure GATED:D2.6) ---
@@ -5314,6 +5378,8 @@ def _emit_card_record(conn, task_id, *, final_status):
             "ac_source": ac_source,
             "ac_results": ac_results,
             "ac_results_source": None if ac_results is not None else "null:unparsed-or-absent",
+            "ac_execution": ac_execution,
+            "ac_execution_source": ac_execution_source,
             "evidence_rows": evidence_rows,
             "evidence_rows_source": evidence_src,
         },

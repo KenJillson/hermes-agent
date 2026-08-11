@@ -616,6 +616,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
 
+    p_gate = sub.add_parser(
+        "gate",
+        help="D4.2: run a card's ## AC checks in its workspace and record a "
+             "verdict (rc 3 = exception -> refuse accept). Used by accept-card.sh.")
+    p_gate.add_argument("card_id")
+    p_gate.add_argument("--isolation", default="auto",
+                        choices=["auto", "bwrap", "unshare", "none"],
+                        help="sandbox floor (default auto: bwrap>unshare>none)")
+    p_gate.add_argument("--timeout", type=int, default=60,
+                        help="per-check timeout seconds (default 60)")
+    p_gate.add_argument("--json", action="store_true",
+                        help="emit the full verdict JSON")
+
     p_edit = sub.add_parser(
         "edit",
         help="Edit recovery fields on an already-completed task",
@@ -1082,6 +1095,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
+            "gate":     _cmd_gate,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -2188,6 +2202,55 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+
+def _cmd_gate(args: argparse.Namespace) -> int:
+    """D4.2 board-side accept gate: run the card's authored ## AC checks in
+    its workspace, persist the verdict (ac-execution-<id>.json), and return an
+    exit code accept-card.sh branches on — rc 3 = exception (fail/unrunnable,
+    REFUSE accept); rc 0 = all_pass / needs_human (judgment is Ken's call) /
+    no_checks / no_workspace. Records only; never completes the card. Uses the
+    shared kb.parse_ac_text so it parses exactly as the emit does."""
+    from hermes_cli import ac_check_runner
+    try:
+        from agent.verification_evidence import record_terminal_result as _rtr
+    except Exception:
+        _rtr = None
+    card_id = args.card_id
+    with kb.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT body, workspace_path FROM tasks WHERE id = ?", (card_id,)
+        ).fetchone()
+    if row is None:
+        print(f"kanban: no such task {card_id!r}", file=sys.stderr)
+        return 2
+    body, workspace = row[0], row[1]
+
+    def _evhook(command, cwd, exit_code, output):
+        if _rtr and command:
+            try:
+                _rtr(command=command, cwd=cwd, session_id=card_id,
+                     exit_code=exit_code, output=output or "")
+            except Exception:
+                pass
+
+    summary = ac_check_runner.gate(
+        card_id, body, workspace, parse_fn=kb.parse_ac_text,
+        isolation=(getattr(args, "isolation", "auto") or "auto"),
+        timeout=(getattr(args, "timeout", 60) or 60),
+        evidence_hook=(_evhook if _rtr else None))
+    if getattr(args, "json", False):
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print(f"gate {card_id}: {summary.get('verdict')} "
+              f"(checks {summary.get('checks_passed', 0)}/"
+              f"{summary.get('checks_total', 0)} pass, "
+              f"{summary.get('checks_failed', 0)} fail, "
+              f"{summary.get('checks_unrunnable', 0)} unrunnable, "
+              f"{summary.get('judgment_count', 0)} judgment)")
+        if summary.get("note"):
+            print(f"  note: {summary['note']}")
+    return ac_check_runner.gate_exit_code(summary)
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
