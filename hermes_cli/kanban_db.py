@@ -5436,8 +5436,50 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class ACGateRefusedError(ValueError):
+    """Raised by ``complete_task`` when the card's runnable ``## AC`` checks
+    did not all pass (gate verdict ``exception``): a failed or unrunnable
+    check refuses completion on EVERY path — worker self-complete,
+    accept-card.sh, gateway (CD-018, D4.2). ValueError subclass so existing
+    tool-error handlers treat it as a recoverable user error. Ken overrides a
+    deliberate accept with ``complete --skip-ac-gate``."""
+
+    def __init__(self, task_id: str, summary: dict):
+        self.task_id = task_id
+        self.summary = summary or {}
+        v = self.summary
+        super().__init__(
+            f"AC gate refused completion of {task_id}: "
+            f"{v.get('checks_failed', 0)} failed, "
+            f"{v.get('checks_unrunnable', 0)} unrunnable of "
+            f"{v.get('checks_total', 0)} runnable checks. Fix the deliverable "
+            f"(or the checks), or override a deliberate accept with "
+            f"`complete --skip-ac-gate`."
+        )
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
+
+
+def _run_ac_gate(conn, task_id):
+    """CD-018: run the card's runnable ``## AC`` checks at completion,
+    board-side, and return the gate summary — or None if there is nothing to
+    gate or the gate could not run. FAIL-SAFE: a gate error (import/sandbox/
+    db) must NEVER wedge completion; only a clean ``exception`` verdict
+    (returned here) refuses. Also writes ac-execution-<id>.json, which the
+    emit read-back folds into the record on the completing path."""
+    try:
+        row = conn.execute(
+            "SELECT body, workspace_path FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return None
+        from hermes_cli import ac_check_runner
+        return ac_check_runner.gate(task_id, row[0], row[1],
+                                    parse_fn=parse_ac_text)
+    except Exception:
+        return None
 
 
 def complete_task(
@@ -5449,6 +5491,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    skip_ac_gate: bool = False,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -5506,6 +5549,33 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Gate: run the card's runnable ## AC checks (CD-018, D4.2). A failed or
+    # unrunnable check REFUSES completion on EVERY path — worker self-complete,
+    # accept-card.sh, gateway — so "no broken card reaches done" is structural,
+    # not procedural (t_44eb1363 self-completed past the accept-only gate). A
+    # rejected completion emits an auditable event, then raises; no task state
+    # is mutated. FAIL-SAFE: a gate error never blocks (only a clean
+    # ``exception`` verdict does); pass / no-checks / no-workspace / judgment
+    # complete normally. Ken overrides a deliberate accept with skip_ac_gate.
+    if not skip_ac_gate:
+        ac_gate = _run_ac_gate(conn, task_id)
+        if ac_gate is not None and ac_gate.get("verdict") == "exception":
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_ac_gate",
+                    {
+                        "verdict": ac_gate.get("verdict"),
+                        "checks_failed": ac_gate.get("checks_failed"),
+                        "checks_unrunnable": ac_gate.get("checks_unrunnable"),
+                        "checks_total": ac_gate.get("checks_total"),
+                        "summary_preview": (
+                            (summary or result or "").strip().splitlines()[0][:200]
+                            if (summary or result) else None
+                        ),
+                    },
+                )
+            raise ACGateRefusedError(task_id, ac_gate)
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,

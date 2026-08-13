@@ -609,6 +609,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("task_ids", nargs="+",
                             help="One or more task ids (only --result applies to all of them)")
     p_complete.add_argument("--result", default=None, help="Result summary")
+    p_complete.add_argument("--skip-ac-gate", action="store_true",
+                            help="Override the CD-018 AC gate: complete even if "
+                                 "a runnable ## AC check fails/is unrunnable. "
+                                 "For deliberate human accepts only.")
     p_complete.add_argument("--summary", default=None,
                             help="Structured handoff summary for downstream tasks. "
                                  "Falls back to --result if omitted.")
@@ -2328,13 +2332,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                         failed.append(tid)
                         continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                _completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                    skip_ac_gate=getattr(args, "skip_ac_gate", False),
+                )
+            except kb.ACGateRefusedError as exc:
+                failed.append(tid)
+                print(f"kanban: {exc}", file=sys.stderr)
+                continue
+            if not _completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
