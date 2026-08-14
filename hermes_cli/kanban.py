@@ -452,6 +452,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                         help="Include archived tasks")
     p_list.add_argument("--json", action="store_true")
     p_list.add_argument(
+        "--needs-review", action="store_true", dest="needs_review",
+        help="Show only cards awaiting a human (blocked / review); D4.4-read. "
+             "Cheap status filter, no gate execution.")
+    p_list.add_argument(
+        "--gate", action="store_true",
+        help="With --needs-review: run each card's ## AC checks (sandboxed, "
+             "read-only) and annotate its gate verdict. Executes checks + writes "
+             "a preview ac-execution-<id>.json; never completes a card.")
+    p_list.add_argument(
         "--sort",
         default=None,
         choices=sorted(kb.VALID_SORT_ORDERS.keys()),
@@ -1645,23 +1654,59 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
+    needs_review = getattr(args, "needs_review", False)
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
         kb.recompute_ready(conn)
-        tasks = kb.list_tasks(
-            conn,
-            assignee=assignee,
-            status=args.status,
-            tenant=args.tenant,
-            session_id=args.session,
-            include_archived=args.archived,
-            order_by=getattr(args, "sort", None),
-            workflow_template_id=args.workflow_template_id,
-            current_step_key=args.current_step_key,
-        )
+        if needs_review:
+            # D4.4-read: cards awaiting a human. `blocked` IS that set —
+            # dependency/transient blocks route to `todo`, so only
+            # review-required handoffs (kindless), needs_input, and capability
+            # reach `blocked`; `review` is included for workflows that use it.
+            # Cheap status filter; gate execution is the opt-in --gate below.
+            tasks = []
+            for _st in ("blocked", "review"):
+                tasks.extend(kb.list_tasks(
+                    conn, assignee=assignee, status=_st, tenant=args.tenant,
+                    session_id=args.session, include_archived=False,
+                    order_by=getattr(args, "sort", None),
+                    workflow_template_id=args.workflow_template_id,
+                    current_step_key=args.current_step_key))
+        else:
+            tasks = kb.list_tasks(
+                conn,
+                assignee=assignee,
+                status=args.status,
+                tenant=args.tenant,
+                session_id=args.session,
+                include_archived=args.archived,
+                order_by=getattr(args, "sort", None),
+                workflow_template_id=args.workflow_template_id,
+                current_step_key=args.current_step_key,
+            )
+    # D4.4-read (opt-in): annotate each needs-review card with its gate
+    # verdict. RUNS the card's ## AC checks (sandboxed, read-only) and writes
+    # a preview ac-execution-<id>.json — hence opt-in, never on the default
+    # list. No evidence hook (preview, not a completion); never completes.
+    verdicts: dict[str, str] = {}
+    if needs_review and getattr(args, "gate", False):
+        from hermes_cli import ac_check_runner
+        for _t in tasks:
+            try:
+                _summary = ac_check_runner.gate(
+                    _t.id, _t.body, _t.workspace_path, parse_fn=kb.parse_ac_text)
+                verdicts[_t.id] = _summary.get("verdict") or "unknown"
+            except Exception:
+                verdicts[_t.id] = "gate-error"
     if getattr(args, "json", False):
-        print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))
+        _out = []
+        for t in tasks:
+            _d = _task_to_dict(t)
+            if t.id in verdicts:
+                _d["gate_verdict"] = verdicts[t.id]
+            _out.append(_d)
+        print(json.dumps(_out, indent=2, ensure_ascii=False))
         return 0
     # Passive discoverability: when the user has multiple boards, surface
     # which one they're looking at in the list header. Single-board users
@@ -1679,10 +1724,22 @@ def _cmd_list(args: argparse.Namespace) -> int:
             f"`hermes kanban boards list`)\n"
         )
     if not tasks:
-        print("(no matching tasks)")
+        print("(no cards awaiting review)" if needs_review else "(no matching tasks)")
         return 0
     for t in tasks:
-        print(_fmt_task_line(t))
+        _line = _fmt_task_line(t)
+        if t.id in verdicts:
+            _line += f"   [gate: {verdicts[t.id]}]"
+        print(_line)
+    if verdicts:
+        _n = len(verdicts)
+        _allp = sum(1 for v in verdicts.values() if v == "all_pass")
+        _exc = sum(1 for v in verdicts.values() if v == "exception")
+        _nh = sum(1 for v in verdicts.values() if v == "needs_human")
+        print(f"\ngate summary ({_n} card(s)): {_exc} exception, "
+              f"{_nh} judgment/needs-human, {_allp} all_pass "
+              f"(auto-acceptable once D4.4-write ships), "
+              f"{_n - _exc - _nh - _allp} other")
     return 0
 
 
