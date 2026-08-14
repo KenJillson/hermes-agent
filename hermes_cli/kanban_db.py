@@ -5144,6 +5144,59 @@ def _apply_ac_execution(ac_results, exec_rec):
     return ac_results, passed, "executed:board-gate", summary
 
 
+def _apply_ac_evidence_crossref(task_id, profile, ac_results, exec_rec, *, evdb=None):
+    """D4.3: cross-reference each EXECUTED board-gate check against the durable
+    verification_evidence rows the gate wrote (record_board_gate_result), stamp a
+    per-check ``evidence_verified`` on ac_results, and return a card-level
+    ``(ac_evidence, ac_evidence_source)``.
+
+    ac_evidence is a summary dict (verdict verified|partial|absent|no_checks,
+    checks, matched) with source None when the cross-ref ran; on any inability to
+    run it returns ``(None, "null:<reason>")`` — null-discipline clean like
+    ac_execution. Fail-soft: never raises, never blocks the emit.
+
+    Keys on (session_id=card_id, root=workspace, command, exit_code): board checks
+    don't carry the task_id in the command, so command-substring association can't
+    see them — the gate wrote rows keyed by card_id + workspace precisely so this
+    join is clean. Rows are FRESHEST here (written ms before this read, at
+    completion), so missing-on-fresh is a real gap; retroactive pruned-row
+    tolerance is card-record-integrity's job, not this at-emit stamp's.
+
+    ``evdb`` overrides the evidence-DB path (tests); production leaves it None and
+    resolves the same per-profile DB the gate wrote to."""
+    try:
+        if not profile:
+            return None, "null:no-profile"
+        workspace = (exec_rec or {}).get("workspace")
+        if not workspace:
+            return None, "null:no-workspace"
+        from agent.verification_evidence import find_verification_rows
+        db = evdb or str(
+            kanban_home() / "profiles" / profile / "verification_evidence.db")
+        checks = [r for r in (ac_results or [])
+                  if r.get("kind") == "check"
+                  and r.get("status") in ("passed", "failed")]
+        matched = 0
+        for r in checks:
+            cmd = (r.get("check") or {}).get("command")
+            rows = find_verification_rows(
+                session_id=task_id, root=workspace, command=cmd,
+                exit_code=r.get("exit_code"), db_path=db)
+            ok = bool(rows)
+            r["evidence_verified"] = ok
+            if ok:
+                matched += 1
+        total = len(checks)
+        verdict = ("no_checks" if total == 0
+                   else "verified" if matched == total
+                   else "absent" if matched == 0
+                   else "partial")
+        return ({"verdict": verdict, "checks": total, "matched": matched,
+                 "at": "emit"}, None)
+    except Exception:
+        return None, "null:evidence-crossref-failed"
+
+
 def _emit_card_record(conn, task_id, *, final_status):
     """Write docs/card-records/<task_id>.json at a terminal transition.
 
@@ -5331,12 +5384,19 @@ def _emit_card_record(conn, task_id, *, final_status):
     # execution-derived. Absent (un-gated card) => the D4.1 parse stands.
     ac_execution = None
     ac_execution_source = "null:not-gated"
+    ac_evidence = None
+    ac_evidence_source = "null:not-gated"
     if ac_results:
         _exec = _read_ac_execution(conn, task_id)
         if _exec is not None:
             ac_results, ac_passed, ac_source, ac_execution = _apply_ac_execution(
                 ac_results, _exec)
             ac_execution_source = None
+            # D4.3: cross-reference each executed check against the durable
+            # verification_evidence rows the gate wrote; stamp per-check
+            # evidence_verified + a card-level ac_evidence verdict.
+            ac_evidence, ac_evidence_source = _apply_ac_evidence_crossref(
+                task_id, profile, ac_results, _exec)
     evidence_rows, evidence_src = _cr_evidence_rows(task_id, profile)
 
     # --- lessons[] (NOW: LESSON: comment text; structure GATED:D2.6) ---
@@ -5380,6 +5440,8 @@ def _emit_card_record(conn, task_id, *, final_status):
             "ac_results_source": None if ac_results is not None else "null:unparsed-or-absent",
             "ac_execution": ac_execution,
             "ac_execution_source": ac_execution_source,
+            "ac_evidence": ac_evidence,
+            "ac_evidence_source": ac_evidence_source,
             "evidence_rows": evidence_rows,
             "evidence_rows_source": evidence_src,
         },
@@ -5476,8 +5538,37 @@ def _run_ac_gate(conn, task_id):
         if not row:
             return None
         from hermes_cli import ac_check_runner
+        # D4.3: record each executed board-gate check as durable evidence via
+        # the force path (classify_verification_command drops board checks —
+        # arbitrary shell strings that match no verifyCommands / ad-hoc rule,
+        # proven empirically: the D4.2 live cards left zero rows). Write to the
+        # SAME per-profile verification_evidence.db the emit read-back reads,
+        # resolved from the completing card's last-run profile, so the emit
+        # cross-ref (session_id=card_id, root=workspace) can match. Best-effort:
+        # a resolution/import miss => no hook (the gate still runs), never a wedge.
+        _evhook = None
+        try:
+            _prow = conn.execute(
+                "SELECT profile FROM task_runs WHERE task_id = ? "
+                "AND profile IS NOT NULL ORDER BY id DESC LIMIT 1", (task_id,)
+            ).fetchone()
+            _profile = _prow[0] if _prow else None
+            if _profile:
+                from agent.verification_evidence import record_board_gate_result
+                _evdb = kanban_home() / "profiles" / _profile / "verification_evidence.db"
+
+                def _evhook(command, cwd, exit_code, output):
+                    try:
+                        record_board_gate_result(
+                            command=command, workspace=cwd, session_id=task_id,
+                            exit_code=exit_code, output=output or "",
+                            db_path=str(_evdb))
+                    except Exception:
+                        pass
+        except Exception:
+            _evhook = None
         return ac_check_runner.gate(task_id, row[0], row[1],
-                                    parse_fn=parse_ac_text)
+                                    parse_fn=parse_ac_text, evidence_hook=_evhook)
     except Exception:
         return None
 

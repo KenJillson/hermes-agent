@@ -528,6 +528,158 @@ def record_terminal_result(
     return {"id": event_id, **evidence.__dict__, "created_at": created_at}
 
 
+def _open_evidence_db(db_path=None):
+    """D4.3: open a SPECIFIC evidence DB (schema ensured), or the default when
+    db_path is None. Mirrors _connect() but targets an explicit path so the board
+    gate (which runs in the gateway process, not the worker) can write to the SAME
+    per-profile verification_evidence.db the emit read-back reads, instead of
+    depending on where get_hermes_home() resolves. Caller owns close()."""
+    from hermes_state import apply_wal_with_fallback
+
+    path = Path(db_path) if db_path else _db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        apply_wal_with_fallback(conn, db_label="verification_evidence.db")
+        conn.execute("PRAGMA busy_timeout=5000")
+        _ensure_schema(conn)
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def record_board_gate_result(
+    *,
+    command: str,
+    workspace: str | Path,
+    session_id: str,
+    exit_code: int,
+    output: str = "",
+    db_path: str | Path | None = None,
+) -> Optional[dict[str, Any]]:
+    """D4.3 (decision A): record a BOARD-GATE ``## AC`` check as durable evidence
+    UNCONDITIONALLY, bypassing classify_verification_command.
+
+    Board checks are arbitrary shell strings that match no ``verifyCommands`` and
+    no ``/tmp/hermes-verify-*`` ad-hoc pattern, so the classify path drops them and
+    the D4.3 cross-reference would have nothing to match (proven empirically: the
+    D4.2 live cards t_05a26b15 / t_414d45a8 left ZERO rows). This force-path always
+    writes.
+
+    Differences from record_terminal_result:
+      * no project_facts_for / classifier — the row is always written;
+      * ``session_id`` is the CARD id and ``root`` is the WORKSPACE, so the emit
+        cross-ref keys cleanly on (session_id=card_id, root=workspace) — board
+        checks do NOT carry the task_id in the command, so the command-substring
+        association used by _cr_evidence_rows cannot see them;
+      * kind/scope/canonical = ``board-gate`` (a free-text tag; the ``t_`` session
+        id shape already separates board rows from timestamp-keyed worker rows);
+      * ``db_path`` is EXPLICIT so writer and emit-reader agree on the DB.
+
+    Best-effort like record_terminal_result: returns the row dict, or None on any
+    soft failure. NEVER raises (the gate's evidence write must not wedge a gate)."""
+    if not command or not isinstance(command, str):
+        return None
+    if exit_code is None:
+        # An unrunnable / timed-out check has no exit code; it yields an
+        # ``exception`` verdict that REFUSES completion, so there is no emit to
+        # cross-reference. Nothing to record.
+        return None
+    root = str(Path(workspace).resolve()) if workspace else ""
+    sid = str(session_id or "default")
+    created_at = _utc_now()
+    status = "passed" if int(exit_code) == 0 else "failed"
+    try:
+        with _DB_LOCK:
+            conn = _open_evidence_db(db_path)
+            try:
+                with conn:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO verification_events(
+                            created_at, session_id, cwd, root, command,
+                            canonical_command, kind, scope, status, exit_code,
+                            output_summary
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (created_at, sid, root, root, command, "board-gate",
+                         "board-gate", "board-gate", status, int(exit_code),
+                         _summarize_output(output)),
+                    )
+                    if cur.lastrowid is None:
+                        return None
+                    event_id = int(cur.lastrowid)
+                    conn.execute(
+                        """
+                        INSERT INTO verification_state(
+                            session_id, root, last_event_id, last_edit_at,
+                            changed_paths_json
+                        ) VALUES (?, ?, ?, NULL, '[]')
+                        ON CONFLICT(session_id, root) DO UPDATE SET
+                            last_event_id = excluded.last_event_id,
+                            last_edit_at = NULL,
+                            changed_paths_json = '[]'
+                        """,
+                        (sid, root, event_id),
+                    )
+                    _prune_old_events(conn, session_id=sid, root=root)
+                    conn.commit()
+            finally:
+                conn.close()
+    except Exception:
+        return None
+    return {"id": event_id, "created_at": created_at, "session_id": sid,
+            "root": root, "command": command, "canonical_command": "board-gate",
+            "kind": "board-gate", "scope": "board-gate", "status": status,
+            "exit_code": int(exit_code)}
+
+
+def find_verification_rows(
+    *,
+    session_id: str,
+    root: str | Path | None = None,
+    command: str | None = None,
+    exit_code: int | None = None,
+    db_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """D4.3 read helper for the emit cross-reference: return verification_events
+    rows for a session, optionally narrowed by root / exact command / exit_code
+    (filters are ANDed). READ-ONLY (mode=ro); returns [] on any error or missing
+    DB (fail-soft — a cross-ref that cannot read must not block the emit)."""
+    sid = str(session_id or "")
+    if not sid:
+        return []
+    path = Path(db_path) if db_path else _db_path()
+    if not path.exists():
+        return []
+    where = ["session_id = ?"]
+    args: list[Any] = [sid]
+    if root is not None:
+        where.append("root = ?")
+        args.append(str(Path(root).resolve()))
+    if command is not None:
+        where.append("command = ?")
+        args.append(command)
+    if exit_code is not None:
+        where.append("exit_code = ?")
+        args.append(int(exit_code))
+    sql = (
+        "SELECT id, created_at, session_id, cwd, root, command, "
+        "canonical_command, kind, scope, status, exit_code "
+        "FROM verification_events WHERE " + " AND ".join(where) + " ORDER BY id"
+    )
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in conn.execute(sql, args).fetchall()]
+        finally:
+            conn.close()
+    except Exception:
+        return []
+
 def mark_workspace_edited(
     *,
     session_id: str | None,
