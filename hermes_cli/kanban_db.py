@@ -5573,6 +5573,33 @@ def _run_ac_gate(conn, task_id):
         return None
 
 
+def _darklaunch_log_autoaccept(conn, task_id, summary):
+    """D4.4-write DARK-LAUNCH (CD-022): append one JSONL line recording that
+    auto-accept WOULD have completed this review-required (blocked) card whose
+    gate verdict is all_pass. OBSERVE-ONLY — the caller NEVER completes on this
+    path. Best-effort: any error is swallowed so the dark-launch can never affect
+    completion. Written under the board's logs dir so it follows the board. The
+    D4.3 evidence stamp (verified/partial/absent) is computed at emit, not here,
+    so it is not logged; checks_passed/total is the execution-verification."""
+    try:
+        rec = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "would_auto_accept",
+            "card_id": task_id,
+            "verdict": summary.get("verdict"),
+            "checks_passed": summary.get("checks_passed"),
+            "checks_total": summary.get("checks_total"),
+            "judgment_count": summary.get("judgment_count"),
+            "note": "dark-launch log-only; NOT completed; evidence stamp is emit-side",
+        }
+        logs = worker_logs_dir()
+        logs.mkdir(parents=True, exist_ok=True)
+        with open(logs / "autoaccept-darklaunch.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5667,6 +5694,21 @@ def complete_task(
                     },
                 )
             raise ACGateRefusedError(task_id, ac_gate)
+        if (ac_gate is not None
+                and ac_gate.get("verdict") == "all_pass"
+                and os.environ.get("HERMES_KANBAN_AUTOACCEPT_DARKLAUNCH", "").strip()):
+            # D4.4-write DARK-LAUNCH (CD-022): observe-only. A review-required
+            # (blocked) card being accepted with an all_pass gate is exactly what
+            # auto-accept WOULD complete autonomously; log it and NEVER complete
+            # on this path. Default-OFF flag => absent config is zero behavior
+            # change. Best-effort; a log failure never affects completion.
+            try:
+                _srow = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                if _srow and _srow[0] == "blocked":
+                    _darklaunch_log_autoaccept(conn, task_id, ac_gate)
+            except Exception:
+                pass
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
