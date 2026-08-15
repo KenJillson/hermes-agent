@@ -519,6 +519,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "--provider <name>). Cleared together with the model.",
     )
 
+    # --- set-ro-binds (per-card sandbox ro-bind allowlist; Ken-only, CD-023) ---
+    p_set_ro = sub.add_parser(
+        "set-ro-binds",
+        help="Set or clear a card's per-card extra_ro_binds allowlist for its "
+             "## AC sandbox (Ken-only; deny-list re-validated at gate time)",
+    )
+    p_set_ro.add_argument("task_id")
+    p_set_ro.add_argument(
+        "paths", nargs="*", default=None,
+        help="Absolute off-prefix runtime path(s) to ro-bind (e.g. "
+             "~/.nvm/versions/node/vXX/bin, ~/.local). Omit (or --clear) to clear.",
+    )
+    p_set_ro.add_argument(
+        "--clear", action="store_true",
+        help="Clear the allowlist (card falls back to config-only binds).",
+    )
+
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
         "reclaim",
@@ -1096,6 +1113,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
+            "set-ro-binds": _cmd_set_ro_binds,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -1950,6 +1968,33 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_set_ro_binds(args: argparse.Namespace) -> int:
+    # Expand a literal '~' so a Ken-typed '~/.nvm/...' resolves the same way the
+    # deny-list's realpath will at gate time. Bare shell args are already
+    # expanded by the operator's shell; this covers quoted/programmatic paths.
+    raw = list(getattr(args, "paths", None) or [])
+    if getattr(args, "clear", False) or not raw:
+        paths = None
+    else:
+        paths = [os.path.expanduser(p) for p in raw]
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.set_extra_ro_binds(conn, args.task_id, paths)
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if not ok:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    if paths:
+        print(f"Set extra_ro_binds on {args.task_id}: {':'.join(paths)} "
+              "(deny-list re-validated at gate time)")
+    else:
+        print(f"Cleared extra_ro_binds on {args.task_id} "
+              "(card uses config-only binds)")
+    return 0
+
+
 def _cmd_reclaim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         ok = kb.reclaim_task(
@@ -2280,12 +2325,18 @@ def _cmd_gate(args: argparse.Namespace) -> int:
     card_id = args.card_id
     with kb.connect_closing() as conn:
         row = conn.execute(
-            "SELECT body, workspace_path FROM tasks WHERE id = ?", (card_id,)
+            "SELECT body, workspace_path, extra_ro_binds FROM tasks WHERE id = ?",
+            (card_id,)
         ).fetchone()
     if row is None:
         print(f"kanban: no such task {card_id!r}", file=sys.stderr)
         return 2
     body, workspace = row[0], row[1]
+    # CD-023: per-card ro-bind allowlist (Ken-set column, ':'-separated). Applied
+    # on the manual/scripted accept gate exactly as on the dispatch gate
+    # (kanban_db._run_ac_gate); every entry is re-validated against the deny-list
+    # at bind time. NULL -> None -> config-only binds (today's behaviour).
+    _card_ro_binds = (row[2].split(":") if row[2] else None)
 
     def _evhook(command, cwd, exit_code, output):
         if _rtr and command:
@@ -2299,7 +2350,8 @@ def _cmd_gate(args: argparse.Namespace) -> int:
         card_id, body, workspace, parse_fn=kb.parse_ac_text,
         isolation=(getattr(args, "isolation", "auto") or "auto"),
         timeout=(getattr(args, "timeout", 60) or 60),
-        evidence_hook=(_evhook if _rtr else None))
+        evidence_hook=(_evhook if _rtr else None),
+        extra_ro_binds=_card_ro_binds)
     if getattr(args, "json", False):
         print(json.dumps(summary, indent=2, sort_keys=True))
     else:

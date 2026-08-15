@@ -72,23 +72,38 @@ def _extra_ro_bind_denied(realpath, home):
     return False
 
 
-def _resolve_extra_ro_binds():
-    """Validated extra ro-bind paths, sourced ONLY from the board process env
-    (HERMES_KANBAN_EXTRA_RO_BINDS, ':'-separated), which is populated from the
-    profile .env — NEVER from a card body (author checks run under _scrubbed_env
-    and cannot set it). Each entry is realpath'd and deny-list checked; a
-    rejected or missing path is dropped with a stderr note, not mounted. Empty by
-    default, so absent config == the minimal bind set."""
+def _resolve_extra_ro_binds(extra_paths=None):
+    """Validated extra ro-bind paths = the config env set UNION the optional
+    per-card allowlist (`extra_paths`, CD-023), both validated identically.
+
+    Config source (HERMES_KANBAN_EXTRA_RO_BINDS, ':'-separated) is populated from
+    the profile .env — NEVER from a card body (author checks run under
+    _scrubbed_env and cannot set it). Per-card source (`extra_paths`) is the
+    tasks.extra_ro_binds column, set ONLY by the Ken-run `set-ro-binds` CLI verb
+    and threaded here by kanban_db._run_ac_gate — also never author-supplied.
+    Both sources pass through the SAME realpath + deny-list check, so a per-card
+    entry can no more re-expose ~/.ssh or profiles/*/.env than a config entry
+    can; a rejected, missing, or duplicate path is dropped (with a stderr note
+    for the first two), not mounted. Empty by default, so absent config AND no
+    per-card allowlist == the minimal bind set (today's behaviour)."""
+    candidates = []
     raw = os.environ.get(_EXTRA_RO_BINDS_ENV, "").strip()
-    if not raw:
+    if raw:
+        candidates.extend(raw.split(":"))
+    if extra_paths:
+        candidates.extend(extra_paths)
+    if not candidates:
         return []
     home = os.path.expanduser("~")
     out = []
-    for entry in raw.split(":"):
-        p = entry.strip()
+    seen = set()
+    for entry in candidates:
+        p = (entry or "").strip()
         if not p:
             continue
         rp = os.path.realpath(p)
+        if rp in seen:
+            continue                          # dedupe config∪per-card overlap
         if _extra_ro_bind_denied(rp, home):
             sys.stderr.write(
                 "[ac_check_runner] refusing extra_ro_bind (deny-list): %s\n" % p)
@@ -97,12 +112,15 @@ def _resolve_extra_ro_binds():
             sys.stderr.write(
                 "[ac_check_runner] skipping extra_ro_bind (not present): %s\n" % p)
             continue
+        seen.add(rp)
         out.append(rp)
     return out
 
 
-def _wrap(cmd, workspace, isolation):
-    """Return the argv list that runs `cmd` (a shell string) under `isolation`."""
+def _wrap(cmd, workspace, isolation, extra_ro_binds=None):
+    """Return the argv list that runs `cmd` (a shell string) under `isolation`.
+    `extra_ro_binds` (CD-023) is the per-card allowlist, unioned with the config
+    env set and deny-list validated inside _resolve_extra_ro_binds()."""
     ws = str(workspace)
     if isolation == "bwrap":
         # Selective binds (CD-021 hardening): do NOT --ro-bind / /, which would
@@ -123,7 +141,7 @@ def _wrap(cmd, workspace, isolation):
                 "--ro-bind-try", "/etc/ca-certificates", "/etc/ca-certificates",
                 "--dev", "/dev", "--proc", "/proc",
                 "--tmpfs", "/run", "--tmpfs", "/tmp"]
-        for _p in _resolve_extra_ro_binds():
+        for _p in _resolve_extra_ro_binds(extra_ro_binds):
             argv += ["--ro-bind-try", _p, _p]
         argv += ["--bind", ws, ws, "--chdir", ws,
                  "--unshare-net", "--unshare-pid", "--die-with-parent",
@@ -136,10 +154,12 @@ def _wrap(cmd, workspace, isolation):
     return ["/bin/sh", "-c", cmd]         # fallback: no namespace isolation
 
 
-def run_check(command, workspace, *, timeout=_DEFAULT_TIMEOUT, isolation="auto"):
-    """Run one check command. Returns a dict; never raises for command failure."""
+def run_check(command, workspace, *, timeout=_DEFAULT_TIMEOUT, isolation="auto",
+              extra_ro_binds=None):
+    """Run one check command. Returns a dict; never raises for command failure.
+    `extra_ro_binds` (CD-023) forwards the per-card allowlist to _wrap()."""
     iso = _detect_sandbox() if isolation == "auto" else isolation
-    argv = _wrap(command, workspace, iso)
+    argv = _wrap(command, workspace, iso, extra_ro_binds=extra_ro_binds)
     result = {"isolation_used": iso, "timed_out": False, "run_error": None,
               "exit_code": None, "stdout": "", "stderr": ""}
     try:
@@ -207,9 +227,10 @@ def evaluate(check, run):
 
 
 def run_ac_checks(ac_results, workspace, *, timeout=_DEFAULT_TIMEOUT,
-                  isolation="auto"):
+                  isolation="auto", extra_ro_binds=None):
     """Execute every check-kind AC; judgment ACs are recorded needs-human, never
-    run. Returns (verdicts, summary)."""
+    run. Returns (verdicts, summary). `extra_ro_binds` (CD-023) is the per-card
+    allowlist, forwarded to each run_check()."""
     verdicts = []
     for r in (ac_results or []):
         base = {"index": r.get("index"), "kind": r.get("kind")}
@@ -218,7 +239,8 @@ def run_ac_checks(ac_results, workspace, *, timeout=_DEFAULT_TIMEOUT,
                              "judgment": r.get("judgment")})
             continue
         run = run_check(r["check"]["command"], workspace,
-                        timeout=timeout, isolation=isolation)
+                        timeout=timeout, isolation=isolation,
+                        extra_ro_binds=extra_ro_binds)
         status = evaluate(r["check"], run)
         verdicts.append({**base, "status": status,
                          "command": r["check"]["command"],
@@ -279,7 +301,7 @@ def persist_execution(card_id, workspace, verdicts, summary, *, path=None):
 # record_terminal_result hook.
 
 def gate(card_id, body, workspace, *, parse_fn, isolation="auto",
-         timeout=_DEFAULT_TIMEOUT, evidence_hook=None):
+         timeout=_DEFAULT_TIMEOUT, evidence_hook=None, extra_ro_binds=None):
     """Run the card's authored checks in its workspace and persist the verdict.
     RECORDS ONLY — never accepts/completes (that decision is the caller's, from
     summary['verdict']). Returns the summary dict. A card with no workspace or no
@@ -300,7 +322,8 @@ def gate(card_id, body, workspace, *, parse_fn, isolation="auto",
                 "checks_unrunnable": 0, "judgment_count": 0, "all_clean": False,
                 "note": f"workspace missing: {workspace}"}
     verdicts, summary = run_ac_checks(ac_results, workspace,
-                                      isolation=isolation, timeout=timeout)
+                                      isolation=isolation, timeout=timeout,
+                                      extra_ro_binds=extra_ro_binds)
     try:
         persist_execution(card_id, workspace, verdicts, summary)
     except OSError as e:

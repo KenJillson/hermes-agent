@@ -2446,6 +2446,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "provider_override", "provider_override TEXT"
         )
 
+    if "extra_ro_binds" not in cols:
+        # CD-023 per-card sandbox ro-bind allowlist: a ':'-separated list of
+        # off-prefix runtime paths (e.g. ~/.nvm/..., ~/.local) that THIS card's
+        # ## AC checks may ro-bind into the bwrap sandbox, on TOP of the config
+        # HERMES_KANBAN_EXTRA_RO_BINDS set. NULL (the default for every existing
+        # and future row) = today's behaviour exactly (config-only binds). Set
+        # ONLY by the Ken-run `set-ro-binds` CLI verb -> set_extra_ro_binds();
+        # never written from a card body/## AC/worker path, and every entry is
+        # re-validated against ac_check_runner._extra_ro_bind_denied() at gate
+        # time, so it can never re-expose ~/.ssh or profiles/*/.env.
+        _add_column_if_missing(
+            conn, "tasks", "extra_ro_binds", "extra_ro_binds TEXT"
+        )
+
     if "reasoning_effort" not in cols:
         # Per-task thinking depth for the worker. NULL = the worker profile's
         # own agent.reasoning_effort, which is what existing rows were getting.
@@ -3540,6 +3554,63 @@ def set_model_override(
         _append_event(
             conn, task_id, "model_override_set",
             {"model": model, "provider": provider},
+        )
+        return True
+
+
+def set_extra_ro_binds(
+    conn: sqlite3.Connection,
+    task_id: str,
+    paths: Optional[Iterable[str]],
+) -> bool:
+    """CD-023: set (or clear) this card's per-card ``extra_ro_binds`` allowlist.
+
+    ``paths=None`` or an empty iterable CLEARS the allowlist — the card falls
+    back to config-only binds, which is today's default behaviour. Otherwise the
+    entries are stored verbatim as a ':'-joined string.
+
+    Security note: the deny-list validation (realpath +
+    ``ac_check_runner._extra_ro_bind_denied``) is applied at GATE time, not here,
+    so a stored path is ALWAYS re-checked against the live filesystem before it
+    is ever bound. A stored value can never itself widen the sandbox — it only
+    proposes paths that must still pass the deny-list.
+
+    This is the ONLY writer of ``tasks.extra_ro_binds``. It is a
+    board-management verb (Ken-run ``hermes kanban set-ro-binds``), never
+    reachable from a card body / ## AC / worker output — which is the entire
+    trust boundary of the per-card allowlist: an author cannot grant a bind to
+    their own checks.
+
+    Allowed on any non-archived task. Returns True on success, False if the task
+    id is unknown.
+    """
+    if paths is None:
+        stored = None
+    else:
+        cleaned = [p.strip() for p in paths if p and p.strip()]
+        for p in cleaned:
+            # ':' is the column/env separator and a newline would corrupt the
+            # JSONL event log; a real path on this box needs neither.
+            if ":" in p or "\n" in p:
+                raise ValueError(
+                    "extra_ro_bind path may not contain ':' or newline: %r" % p)
+        stored = ":".join(cleaned) or None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] == "archived":
+            raise RuntimeError(
+                "cannot set extra_ro_binds on archived task %s" % task_id)
+        conn.execute(
+            "UPDATE tasks SET extra_ro_binds = ? WHERE id = ?",
+            (stored, task_id),
+        )
+        _append_event(
+            conn, task_id, "extra_ro_binds_set",
+            {"paths": (stored.split(":") if stored else [])},
         )
         return True
 
@@ -5533,11 +5604,17 @@ def _run_ac_gate(conn, task_id):
     emit read-back folds into the record on the completing path."""
     try:
         row = conn.execute(
-            "SELECT body, workspace_path FROM tasks WHERE id = ?", (task_id,)
+            "SELECT body, workspace_path, extra_ro_binds FROM tasks WHERE id = ?",
+            (task_id,)
         ).fetchone()
         if not row:
             return None
         from hermes_cli import ac_check_runner
+        # CD-023: per-card ro-bind allowlist (Ken-set column, ':'-separated).
+        # Split to a raw list; ac_check_runner re-validates every entry against
+        # the deny-list at bind time. NULL column -> None -> [] -> config-only
+        # binds (exactly today's behaviour for any card Ken has not touched).
+        _card_ro_binds = (row[2].split(":") if row[2] else None)
         # D4.3: record each executed board-gate check as durable evidence via
         # the force path (classify_verification_command drops board checks —
         # arbitrary shell strings that match no verifyCommands / ad-hoc rule,
@@ -5568,7 +5645,8 @@ def _run_ac_gate(conn, task_id):
         except Exception:
             _evhook = None
         return ac_check_runner.gate(task_id, row[0], row[1],
-                                    parse_fn=parse_ac_text, evidence_hook=_evhook)
+                                    parse_fn=parse_ac_text, evidence_hook=_evhook,
+                                    extra_ro_binds=_card_ro_binds)
     except Exception:
         return None
 
