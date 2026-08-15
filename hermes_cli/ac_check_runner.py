@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
 
 _OUTPUT_CAP = 64 * 1024          # bytes of stdout/stderr retained per check
@@ -46,18 +47,88 @@ def _scrubbed_env(workspace):
     return env
 
 
+_EXTRA_RO_BINDS_ENV = "HERMES_KANBAN_EXTRA_RO_BINDS"
+
+
+def _extra_ro_bind_denied(realpath, home):
+    """True if `realpath` (already realpath'd) must NOT be ro-bound into the
+    sandbox: the filesystem root, a system-sensitive tree, a secret directory or
+    anything under it, or an ANCESTOR of a secret directory (binding it would
+    pull the secret back in). This deny-list defends the config-only
+    extra_ro_binds hook so a bad config line cannot re-expose ~/.ssh or
+    profiles/*/.env."""
+    if realpath == os.sep:
+        return True
+    for r in ("/etc", "/proc", "/sys", "/dev", "/root", "/boot"):
+        if realpath == r or realpath.startswith(r + os.sep):
+            return True
+    for s in (os.path.join(home, ".ssh"),
+              os.path.join(home, ".hermes"),
+              os.path.join(home, ".gnupg")):
+        if realpath == s or realpath.startswith(s + os.sep):
+            return True          # candidate is / lives under a secret dir
+        if s == realpath or s.startswith(realpath + os.sep):
+            return True          # candidate is an ancestor of a secret dir
+    return False
+
+
+def _resolve_extra_ro_binds():
+    """Validated extra ro-bind paths, sourced ONLY from the board process env
+    (HERMES_KANBAN_EXTRA_RO_BINDS, ':'-separated), which is populated from the
+    profile .env — NEVER from a card body (author checks run under _scrubbed_env
+    and cannot set it). Each entry is realpath'd and deny-list checked; a
+    rejected or missing path is dropped with a stderr note, not mounted. Empty by
+    default, so absent config == the minimal bind set."""
+    raw = os.environ.get(_EXTRA_RO_BINDS_ENV, "").strip()
+    if not raw:
+        return []
+    home = os.path.expanduser("~")
+    out = []
+    for entry in raw.split(":"):
+        p = entry.strip()
+        if not p:
+            continue
+        rp = os.path.realpath(p)
+        if _extra_ro_bind_denied(rp, home):
+            sys.stderr.write(
+                "[ac_check_runner] refusing extra_ro_bind (deny-list): %s\n" % p)
+            continue
+        if not os.path.exists(rp):
+            sys.stderr.write(
+                "[ac_check_runner] skipping extra_ro_bind (not present): %s\n" % p)
+            continue
+        out.append(rp)
+    return out
+
+
 def _wrap(cmd, workspace, isolation):
     """Return the argv list that runs `cmd` (a shell string) under `isolation`."""
     ws = str(workspace)
     if isolation == "bwrap":
-        # ro-bind host root, but MASK /run with a tmpfs so /run/docker.sock is
-        # NOT reachable — the board runs as a user in the `docker` group, and an
-        # exposed docker socket is a root escape that --unshare-net does not stop.
-        # Writable workspace; new /dev, /proc; no network; own pid ns.
-        return ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-                "--tmpfs", "/run", "--bind", ws, ws, "--chdir", ws,
-                "--unshare-net", "--unshare-pid", "--die-with-parent",
-                "--", "/bin/sh", "-c", cmd]
+        # Selective binds (CD-021 hardening): do NOT --ro-bind / /, which would
+        # expose host secrets (~/.ssh, profiles/*/.env) to a check's persisted
+        # stdout. Bind only the runtime prefixes a check legitimately needs. On
+        # this usrmerge box /bin,/sbin,/lib are symlinks into /usr and /lib64 is
+        # absent, so we bind /usr once and recreate the merge symlinks. /run stays
+        # a tmpfs so /run/docker.sock (a root escape --unshare-net does not stop)
+        # is masked. Optional config-only extra ro-binds (deny-list validated,
+        # never author-supplied) cover off-prefix runtimes (e.g. ~/.nvm, ~/.local).
+        argv = ["bwrap",
+                "--ro-bind", "/usr", "/usr",
+                "--symlink", "usr/bin", "/bin",
+                "--symlink", "usr/sbin", "/sbin",
+                "--symlink", "usr/lib", "/lib",
+                "--ro-bind-try", "/etc/alternatives", "/etc/alternatives",
+                "--ro-bind-try", "/etc/ssl", "/etc/ssl",
+                "--ro-bind-try", "/etc/ca-certificates", "/etc/ca-certificates",
+                "--dev", "/dev", "--proc", "/proc",
+                "--tmpfs", "/run", "--tmpfs", "/tmp"]
+        for _p in _resolve_extra_ro_binds():
+            argv += ["--ro-bind-try", _p, _p]
+        argv += ["--bind", ws, ws, "--chdir", ws,
+                 "--unshare-net", "--unshare-pid", "--die-with-parent",
+                 "--", "/bin/sh", "-c", cmd]
+        return argv
     if isolation == "unshare":
         # userns net+pid isolation; filesystem stays host (cwd pins to workspace)
         return ["unshare", "--user", "--map-root-user", "--net", "--pid", "--fork",
