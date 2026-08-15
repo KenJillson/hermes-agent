@@ -953,6 +953,10 @@ class Task:
     # model (pre-existing behaviour). Solves the "model from provider A,
     # profile configured for provider B" mismatch class.
     provider_override: Optional[str] = None
+    # CD-023 per-card sandbox ro-bind allowlist (':'-separated), set only by the
+    # Ken-run `set-ro-binds` verb. NULL = config-only binds. CD-024 surfaces it on
+    # the Task so `list --gate` preview applies the same binds the accept gate does.
+    extra_ro_binds: Optional[str] = None
     # Per-task reasoning effort for the worker (one of
     # ``hermes_constants.VALID_REASONING_EFFORTS``, or ``"none"`` for thinking
     # off). When set, the dispatcher passes ``--reasoning <level>`` so the
@@ -1065,6 +1069,7 @@ class Task:
             ),
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
+            extra_ro_binds=row["extra_ro_binds"] if "extra_ro_binds" in keys and row["extra_ro_binds"] else None,
             provider_override=(
                 row["provider_override"]
                 if "provider_override" in keys and row["provider_override"]

@@ -1713,7 +1713,9 @@ def _cmd_list(args: argparse.Namespace) -> int:
         for _t in tasks:
             try:
                 _summary = ac_check_runner.gate(
-                    _t.id, _t.body, _t.workspace_path, parse_fn=kb.parse_ac_text)
+                    _t.id, _t.body, _t.workspace_path, parse_fn=kb.parse_ac_text,
+                    extra_ro_binds=(_t.extra_ro_binds.split(":")
+                                    if _t.extra_ro_binds else None))
                 verdicts[_t.id] = _summary.get("verdict") or "unknown"
             except Exception:
                 verdicts[_t.id] = "gate-error"
