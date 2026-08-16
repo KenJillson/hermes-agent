@@ -5745,6 +5745,34 @@ def _darklaunch_log_autoaccept(conn, task_id, summary):
         pass
 
 
+def _darklaunch_log_arbiter(conn, task_id, summary, decision, reason):
+    """D4.5 Sub-CD B1 DARK-LAUNCH (CD-026): append one JSONL line recording what the
+    AC-failure arbiter WOULD decide for a card whose completion is being REFUSED on a
+    mechanical AC exception. OBSERVE-ONLY -- the caller still refuses; nothing
+    escalates and nothing spends (that is B2). Best-effort: any error is swallowed so
+    the dark-launch can never affect completion. Symmetric to
+    _darklaunch_log_autoaccept (the D4.4-write dark-launch at the all_pass branch)."""
+    try:
+        rec = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "would_escalate_on_ac_failure",
+            "card_id": task_id,
+            "verdict": summary.get("verdict"),
+            "decision": decision,
+            "reason": reason,
+            "checks_failed": summary.get("checks_failed"),
+            "checks_unrunnable": summary.get("checks_unrunnable"),
+            "checks_total": summary.get("checks_total"),
+            "note": "dark-launch log-only; card still REFUSED; no escalation, no spend",
+        }
+        logs = worker_logs_dir()
+        logs.mkdir(parents=True, exist_ok=True)
+        with open(logs / "arbiter-darklaunch.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5838,6 +5866,18 @@ def complete_task(
                         ),
                     },
                 )
+            if os.environ.get("HERMES_KANBAN_ARBITER_DARKLAUNCH", "").strip():
+                # D4.5 Sub-CD B1 DARK-LAUNCH (CD-026): observe-only. This completion
+                # is being refused on a mechanical AC exception -- exactly the failure
+                # the AC-failure arbiter WOULD escalate on. Log the would-be decision
+                # (escalation gated by the Lane-A spend cap) and STILL refuse; nothing
+                # escalates, nothing spends (that is B2). Default-OFF; best-effort.
+                try:
+                    from hermes_cli import spend_accounting as _sa
+                    _dec, _rsn = _sa.arbiter_decision(conn, task_id, ac_gate)
+                    _darklaunch_log_arbiter(conn, task_id, ac_gate, _dec, _rsn)
+                except Exception:
+                    pass
             raise ACGateRefusedError(task_id, ac_gate)
         if (ac_gate is not None
                 and ac_gate.get("verdict") == "all_pass"

@@ -120,3 +120,40 @@ def over_spend_cap(conn, task_id, *, ledger_lines=None, ledger_file=None):
     spend = card_cloud_spend_usd(
         task_id, ledger_lines=ledger_lines, ledger_file=ledger_file)
     return spend >= resolved_cap(conn, task_id)
+
+
+# ============= D4.5 Sub-CD B1: objective arbiter decision (CD-026) ==============
+# The escalation TRIGGER is the board's objective AC verdict (ac_check_runner.gate)
+# -- honest-broker: a mechanical `exception` (a check failed or was unrunnable),
+# never a model's opinion of its own family's output. Judgment / no-check cards
+# have no mechanical arbiter and route to the human exception gate (D4.4), never
+# auto-escalate. Interpretation ONLY: does not run checks (gate() did) and does not
+# spend (over_spend_cap is a read-only pre-call gate).
+
+ESCALATE = "escalate"       # AC failed AND under the card's Lane-A $ cap
+OVER_CAP = "over_cap"       # AC failed but at/over the cap -> D3.4 review-required block
+PASS = "pass"               # all_pass -> nothing to escalate
+NO_ARBITER = "no_arbiter"   # needs_human / no_checks / no_workspace -> human, not auto
+
+
+def arbiter_decision(conn, task_id, gate_summary, *, ledger_lines=None,
+                     ledger_file=None):
+    """Return (decision, reason) from the board AC-gate summary + the spend-gate.
+    Mapping (design sec 2): all_pass->PASS; exception->ESCALATE (under cap) or
+    OVER_CAP (at/over cap); needs_human/no_checks/no_workspace/unknown->NO_ARBITER.
+    OBSERVE-path best-effort: a ledger-read failure degrades to ESCALATE with
+    spend_unknown rather than claiming over-cap (B2 fails closed at the real spend
+    seam)."""
+    verdict = (gate_summary or {}).get("verdict")
+    if verdict == "all_pass":
+        return PASS, "all_pass"
+    if verdict != "exception":
+        return NO_ARBITER, "no-mechanical-arbiter:%s" % verdict
+    try:
+        over = over_spend_cap(conn, task_id, ledger_lines=ledger_lines,
+                              ledger_file=ledger_file)
+    except Exception as e:
+        return ESCALATE, "ac_failure;spend_unknown:%s" % type(e).__name__
+    if over:
+        return OVER_CAP, "ac_failure;over_cap"
+    return ESCALATE, "ac_failure;under_cap"
