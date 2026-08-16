@@ -536,6 +536,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Clear the allowlist (card falls back to config-only binds).",
     )
 
+    # --- set-spend-cap (per-card Lane-A cloud dollar ceiling; Ken-only, D4.5) ---
+    p_set_cap = sub.add_parser(
+        "set-spend-cap",
+        help="Set or clear a card's per-card Lane-A cloud dollar spend cap "
+             "(Ken-only; cleared = the HERMES_KANBAN_MAX_CARD_SPEND default)",
+    )
+    p_set_cap.add_argument("task_id")
+    p_set_cap.add_argument(
+        "usd", nargs="?", default=None,
+        help="Dollar cap for this card's cloud (Lane A) spend, e.g. 20. "
+             "Omit (or 'none' / --clear) to clear back to the config default.",
+    )
+    p_set_cap.add_argument(
+        "--clear", action="store_true",
+        help="Clear the cap (card falls back to the config default).",
+    )
+
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
         "reclaim",
@@ -1114,6 +1131,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
             "set-ro-binds": _cmd_set_ro_binds,
+            "set-spend-cap": _cmd_set_spend_cap,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -1994,6 +2012,36 @@ def _cmd_set_ro_binds(args: argparse.Namespace) -> int:
     else:
         print(f"Cleared extra_ro_binds on {args.task_id} "
               "(card uses config-only binds)")
+    return 0
+
+
+def _cmd_set_spend_cap(args: argparse.Namespace) -> int:
+    raw = getattr(args, "usd", None)
+    if getattr(args, "clear", False) or raw is None or \
+            str(raw).strip().lower() in {"none", "-", "null", ""}:
+        usd = None
+    else:
+        try:
+            usd = float(raw)
+        except (TypeError, ValueError):
+            print(f"kanban: spend cap must be a number, got {raw!r}",
+                  file=sys.stderr)
+            return 2
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.set_max_card_spend(conn, args.task_id, usd)
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if not ok:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    if usd is None:
+        print(f"Cleared spend cap on {args.task_id} "
+              "(card uses the HERMES_KANBAN_MAX_CARD_SPEND default)")
+    else:
+        print(f"Set spend cap on {args.task_id}: ${usd:.2f} "
+              "(Lane-A cloud spend; consulted at escalation time)")
     return 0
 
 

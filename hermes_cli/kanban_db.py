@@ -2465,6 +2465,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "extra_ro_binds", "extra_ro_binds TEXT"
         )
 
+    if "max_card_spend_usd" not in cols:
+        # D4.5 Sub-CD A per-card Lane-A cloud dollar cap: the max cloud spend
+        # (metered cost_usd, Lane A) an AC-failure escalation may reach for THIS
+        # card before the arbiter refuses and blocks it review-required (D3.4).
+        # NULL (the default for every existing and future row) = the config
+        # default HERMES_KANBAN_MAX_CARD_SPEND applies (today's behaviour: no
+        # per-card override). Set ONLY by the Ken-run `set-spend-cap` CLI verb ->
+        # set_max_card_spend(); never written from a card body/## AC/worker path.
+        _add_column_if_missing(
+            conn, "tasks", "max_card_spend_usd", "max_card_spend_usd REAL"
+        )
+
     if "reasoning_effort" not in cols:
         # Per-task thinking depth for the worker. NULL = the worker profile's
         # own agent.reasoning_effort, which is what existing rows were getting.
@@ -3616,6 +3628,56 @@ def set_extra_ro_binds(
         _append_event(
             conn, task_id, "extra_ro_binds_set",
             {"paths": (stored.split(":") if stored else [])},
+        )
+        return True
+
+
+def set_max_card_spend(
+    conn: sqlite3.Connection,
+    task_id: str,
+    usd: Optional[float],
+) -> bool:
+    """D4.5 Sub-CD A: set (or clear) this card's per-card Lane-A cloud dollar cap.
+
+    ``usd=None`` CLEARS the override -- the card falls back to the config default
+    ``HERMES_KANBAN_MAX_CARD_SPEND`` (spend_accounting.resolved_cap). A value is
+    stored verbatim as REAL dollars. Fail-closed: a negative, non-finite, or
+    absurd (>= 1e6) value is REJECTED (ValueError), never stored -- a bad cap must
+    never silently widen spend.
+
+    This is the ONLY writer of ``tasks.max_card_spend_usd``. It is a
+    board-management verb (Ken-run ``hermes kanban set-spend-cap``), never
+    reachable from a card body / ## AC / worker output -- the entire trust boundary
+    of the per-card cap: an author cannot raise their own card's ceiling.
+
+    Allowed on any non-archived task. Returns True on success, False if unknown id.
+    """
+    if usd is None:
+        stored = None
+    else:
+        try:
+            stored = float(usd)
+        except (TypeError, ValueError):
+            raise ValueError("max_card_spend must be a number, got %r" % (usd,))
+        if stored != stored or stored < 0 or stored >= 1e6:
+            raise ValueError(
+                "max_card_spend must be finite and in [0, 1e6): %r" % (stored,))
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] == "archived":
+            raise RuntimeError(
+                "cannot set max_card_spend on archived task %s" % task_id)
+        conn.execute(
+            "UPDATE tasks SET max_card_spend_usd = ? WHERE id = ?",
+            (stored, task_id),
+        )
+        _append_event(
+            conn, task_id, "max_card_spend_set",
+            {"usd": stored},
         )
         return True
 
