@@ -301,12 +301,21 @@ def persist_execution(card_id, workspace, verdicts, summary, *, path=None):
 # record_terminal_result hook.
 
 def gate(card_id, body, workspace, *, parse_fn, isolation="auto",
-         timeout=_DEFAULT_TIMEOUT, evidence_hook=None, extra_ro_binds=None):
+         timeout=_DEFAULT_TIMEOUT, evidence_hook=None, extra_ro_binds=None,
+         path=None):
     """Run the card's authored checks in its workspace and persist the verdict.
     RECORDS ONLY — never accepts/completes (that decision is the caller's, from
     summary['verdict']). Returns the summary dict. A card with no workspace or no
     runnable ## AC yields a non-blocking verdict so the gate never refuses a card
-    that simply has nothing to check."""
+    that simply has nothing to check.
+
+    `path` (CD-A) is forwarded verbatim to persist_execution(). It lets a caller
+    name the durable record's location so repeated gate() calls for one card —
+    D5.1 per-component, per-iteration graph runs — do not overwrite each other.
+    Default None preserves today's behaviour exactly: the record lands at
+    <workspace>/ac-execution-<card_id>.json. The terminal board gate passes no
+    path, so the terminal record keeps the canonical name and wins by
+    construction (D5.1 design v2 §2.3, §2.5)."""
     if not body:
         return {"verdict": "no_checks", "ac_total": 0, "checks_total": 0,
                 "checks_passed": 0, "checks_failed": 0, "checks_unrunnable": 0,
@@ -325,7 +334,7 @@ def gate(card_id, body, workspace, *, parse_fn, isolation="auto",
                                       isolation=isolation, timeout=timeout,
                                       extra_ro_binds=extra_ro_binds)
     try:
-        persist_execution(card_id, workspace, verdicts, summary)
+        persist_execution(card_id, workspace, verdicts, summary, path=path)
     except OSError as e:
         summary["persist_error"] = str(e)     # verdict still returned to caller
     if evidence_hook:
