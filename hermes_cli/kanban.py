@@ -553,6 +553,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Clear the cap (card falls back to the config default).",
     )
 
+    # --- set-executor (per-card build executor opt-in; Ken-only, CD-028) ---
+    p_set_exec = sub.add_parser(
+        "set-executor",
+        help="Set or clear the build executor for a card (Ken-only; cleared = "
+             "the standard worker path, which is the default for every card)",
+    )
+    p_set_exec.add_argument("task_id")
+    p_set_exec.add_argument(
+        "executor", nargs="?", default=None,
+        help="Executor that runs this card, e.g. build_graph (the D5.1 "
+             "build-harness graph). Omit (or 'none' / --clear) to clear.",
+    )
+    p_set_exec.add_argument(
+        "--clear", action="store_true",
+        help="Clear the opt-in (card uses the standard worker path).",
+    )
+
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
         "reclaim",
@@ -1132,6 +1149,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "set-model": _cmd_set_model,
             "set-ro-binds": _cmd_set_ro_binds,
             "set-spend-cap": _cmd_set_spend_cap,
+            "set-executor": _cmd_set_executor,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -2042,6 +2060,31 @@ def _cmd_set_spend_cap(args: argparse.Namespace) -> int:
     else:
         print(f"Set spend cap on {args.task_id}: ${usd:.2f} "
               "(Lane-A cloud spend; consulted at escalation time)")
+    return 0
+
+
+def _cmd_set_executor(args: argparse.Namespace) -> int:
+    raw = getattr(args, "executor", None)
+    if getattr(args, "clear", False) or raw is None or \
+            str(raw).strip().lower() in {"none", "-", "null", ""}:
+        executor = None
+    else:
+        executor = str(raw).strip()
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.set_graph_executor(conn, args.task_id, executor)
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if not ok:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    if executor is None:
+        print(f"Cleared graph_executor on {args.task_id} "
+              "(card uses the standard worker path)")
+    else:
+        print(f"Set graph_executor on {args.task_id}: {executor} "
+              "(routed to that executor once D5.1 lands)")
     return 0
 
 

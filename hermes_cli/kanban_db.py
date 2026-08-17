@@ -957,6 +957,11 @@ class Task:
     # Ken-run `set-ro-binds` verb. NULL = config-only binds. CD-024 surfaces it on
     # the Task so `list --gate` preview applies the same binds the accept gate does.
     extra_ro_binds: Optional[str] = None
+    # CD-028 (D5.1 prereq CD-B) per-card build executor. NULL = the standard
+    # worker path, which is every existing and future row. Set only by the
+    # Ken-run `set-executor` verb -> set_graph_executor(); never on create and
+    # never from a card body / ## AC / worker output (D5.1 F7).
+    graph_executor: Optional[str] = None
     # Per-task reasoning effort for the worker (one of
     # ``hermes_constants.VALID_REASONING_EFFORTS``, or ``"none"`` for thinking
     # off). When set, the dispatcher passes ``--reasoning <level>`` so the
@@ -1070,6 +1075,7 @@ class Task:
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             extra_ro_binds=row["extra_ro_binds"] if "extra_ro_binds" in keys and row["extra_ro_binds"] else None,
+            graph_executor=row["graph_executor"] if "graph_executor" in keys and row["graph_executor"] else None,
             provider_override=(
                 row["provider_override"]
                 if "provider_override" in keys and row["provider_override"]
@@ -2477,6 +2483,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "max_card_spend_usd", "max_card_spend_usd REAL"
         )
 
+    if "graph_executor" not in cols:
+        # CD-028 (D5.1 prereq CD-B) per-card build executor: names the harness
+        # that runs THIS card. The only accepted value today is 'build_graph'
+        # (the D5.1 build-harness graph). NULL (the default for every existing
+        # and future row) = today's behaviour exactly: the standard worker path.
+        # Set ONLY by the Ken-run `set-executor` CLI verb ->
+        # set_graph_executor(); never written from a card body/## AC/worker
+        # path, and deliberately absent from create_task and
+        # decompose_triage_task, whose INSERTs each name their columns
+        # explicitly. Routing must NOT key on tasks.task_class, which is
+        # classifier-derived from author-supplied title/body and would make a
+        # cloud-spending capability reachable from a card body (D5.1 F7).
+        _add_column_if_missing(
+            conn, "tasks", "graph_executor", "graph_executor TEXT"
+        )
+
     if "reasoning_effort" not in cols:
         # Per-task thinking depth for the worker. NULL = the worker profile's
         # own agent.reasoning_effort, which is what existing rows were getting.
@@ -3678,6 +3700,69 @@ def set_max_card_spend(
         _append_event(
             conn, task_id, "max_card_spend_set",
             {"usd": stored},
+        )
+        return True
+
+
+# CD-028 (D5.1 prereq CD-B): the closed set of accepted per-card executors. A
+# value outside it is REJECTED at set time (ValueError) and never stored. This
+# column has no later re-validation step -- unlike extra_ro_binds, whose entries
+# are re-checked against the live filesystem at gate time -- so a stored typo
+# would route the card nowhere while reading exactly like a card that was never
+# opted in. Adding a second harness is a one-line change here.
+GRAPH_EXECUTORS = ("build_graph",)
+
+
+def set_graph_executor(
+    conn: sqlite3.Connection,
+    task_id: str,
+    executor: Optional[str],
+) -> bool:
+    """CD-028 (D5.1 prereq CD-B): set (or clear) this card's build executor.
+
+    ``executor=None`` CLEARS the opt-in -- the card runs the standard worker
+    path, which is what every card does today and what every existing row
+    already holds. Otherwise the value must be a member of ``GRAPH_EXECUTORS``;
+    anything else is REJECTED (ValueError) and nothing is stored.
+
+    This is the ONLY writer of ``tasks.graph_executor``. It is a
+    board-management verb (Ken-run ``hermes kanban set-executor``), never
+    reachable from a card body / ## AC / worker output -- the entire trust
+    boundary of per-card routing (D5.1 F7). Routing must not key on
+    ``tasks.task_class``, which is classifier-derived at create time from
+    author-supplied title and body: worker-created cards exist, provenance is
+    not recorded, and routing on it would make a cloud-spending capability
+    reachable from a card body. ``create_task`` and ``decompose_triage_task``
+    each name their INSERT columns explicitly and neither names this one, so the
+    column is unreachable at create by construction.
+
+    Allowed on any non-archived task. Returns True on success, False if the task
+    id is unknown.
+    """
+    if executor is None:
+        stored = None
+    else:
+        stored = str(executor).strip()
+        if stored not in GRAPH_EXECUTORS:
+            raise ValueError(
+                "graph_executor must be one of %s, got %r"
+                % (", ".join(repr(e) for e in GRAPH_EXECUTORS), executor))
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] == "archived":
+            raise RuntimeError(
+                "cannot set graph_executor on archived task %s" % task_id)
+        conn.execute(
+            "UPDATE tasks SET graph_executor = ? WHERE id = ?",
+            (stored, task_id),
+        )
+        _append_event(
+            conn, task_id, "graph_executor_set",
+            {"executor": stored},
         )
         return True
 
