@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 from typing import Any, Literal, Optional, TypedDict
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Ladder positions (design section 1 flow, section 2.2 rung caps).
 RUNGS = ("none", "rung1", "rung2", "rung3")
@@ -127,6 +127,33 @@ class WorkflowState(TypedDict):
     classify_log_failed: bool
     holdout: bool
 
+    # CD-031 additions. Also NOT in the section 4 list, same justification shape
+    # as the two above -- plus one hard mechanical reason found by testing:
+    # LangGraph builds its channels from THIS TypedDict, and an update naming a
+    # key that is not a channel is SILENTLY DROPPED. It does not raise. So the
+    # section 4.1 HALT guard, which works by writing halt_reason and routing to
+    # `human`, would have been a NO-OP: every halt discarded, the graph routing
+    # on as though the payload were clean, and every test green. Verified
+    # 2026-08-18 against langgraph 1.2.10 before these fields were added.
+    #
+    #   halt_reason         field:rule naming the HALT tier tripped at a node
+    #                       return. Never the matched text. Section 4.1.
+    #   terminal_reason     why the run ended -- assembled / human_review /
+    #                       cloud_review_cap / model_call_* /
+    #                       node_not_implemented:* / fix_rung3_auth_deferred.
+    #                       BOTH section 2.2 limiters terminate to `human`, so
+    #                       without this they are indistinguishable after the
+    #                       fact and "which limiter bound?" cannot be answered.
+    #   last_verdict_passed the section 2.1 review edges branch on it. Computed
+    #                       by the PRIMITIVE's _verdict_passed, never
+    #                       reimplemented -- six improvised vocabularies across
+    #                       five live cards is why that normalizer exists, and a
+    #                       second copy here would drift from it silently, in
+    #                       the direction of spending.
+    halt_reason: Optional[str]
+    terminal_reason: Optional[str]
+    last_verdict_passed: bool
+
 
 def new_workflow_state(
     card_id: str,
@@ -177,6 +204,9 @@ def new_workflow_state(
         reviewer_model=None,
         classify_log_failed=False,
         holdout=False,
+        halt_reason=None,
+        terminal_reason=None,
+        last_verdict_passed=False,
     )
 
 
