@@ -307,6 +307,29 @@ youtube = [
 # starlette==1.3.1 pinned for CVE-2026-48710 (BadHost) — fastapi pulls Starlette
 # transitively and pre-1.0.1 is the vulnerable range. See the mcp extra above.
 web = ["fastapi==0.133.1", "uvicorn[standard]==0.41.0", "starlette==1.3.1", "python-multipart==0.0.32"]
+# D5.1 build harness (LOCAL DIVERGENCE -- CD-029, KenJillson/hermes-agent
+# @ hermes-local. NOT upstream.) LangGraph backs the Phase-5 build-harness
+# graph that the spawned worker invokes for a card opted in via
+# tasks.graph_executor (CD-028). Exact-pinned per the core-dependencies
+# policy at the top of this file.
+#
+# DO NOT DROP THIS WHEN RESOLVING AN UPSTREAM MERGE CONFLICT. Removing it
+# takes the D5.1 harness out of the environment SILENTLY: managed_uv.py
+# rebuilds the runtime with `uv sync --extra all --locked` into a FRESH
+# venv, so a langgraph that is not declared here simply never exists in the
+# new environment. If this conflicts, re-add it here AND re-run `uv lock`.
+#
+# Deliberately NOT in tools/lazy_deps.py. A lazy entry would resolve against
+# a live index at card runtime, outside uv.lock and outside [tool.uv]
+# exclude-newer. Being in both [all] and LAZY_DEPS is also forbidden by
+# tests/test_project_metadata.py.
+#
+# langgraph-checkpoint (base) arrives transitively and carries the in-memory
+# saver D5.1 uses. langgraph-checkpoint-sqlite and langgraph-checkpoint-redis
+# are deliberately NOT declared: they are the packages the unverified CVE
+# claim names (d5.1-build-harness-graph-v2.md 8.2), and pinning the real CVE
+# identifiers is a blocking gate on D5.3.
+graph = ["langgraph==1.2.10"]
 all = [
   # Policy (2026-05-12): `[all]` includes only extras that genuinely
   # CAN'T be lazy-installed via `tools/lazy_deps.py` — i.e. things every
@@ -339,6 +362,7 @@ all = [
   "hermes-agent[google]",
   "hermes-agent[web]",
   "hermes-agent[youtube]",
+  "hermes-agent[graph]",
 ]
 
 [build-system]
