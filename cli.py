@@ -17859,6 +17859,94 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
+def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
+    """CD-033 (D5.2b-i): park a graph-executor card. Returns the worker's exit
+    code, or None when this is NOT a graph card -- in which case the caller's
+    normal single-query turn runs completely unchanged.
+
+    Called from the quiet single-query path BETWEEN agent init and the model
+    loop, for cards whose Ken-only ``graph_executor`` column is set
+    (``kanban_db.set_graph_executor`` is the sole writer, validating against
+    the closed ``GRAPH_EXECUTORS`` enum).
+
+    THE GRAPH IS NOT INVOKED AT THIS CD, and that is the point of it.
+    ``build_graph.run()`` takes ``plan`` and ``diff``, which its own docstring
+    says the CALLER re-derives from the worktree -- and no derivation exists,
+    because ``run()`` has never had a caller. An empty diff is not inert:
+    cheap_gate -> arbiter "pass" -> ``GATE_PASS_TARGET`` is ``cloud_review``,
+    whose prompt reads ``state["diff"]``, so invoking with an empty diff can
+    BUY a cloud review of nothing on the very first dispatch. The spend arbiter
+    gates dollars, not input sanity. CD-033 therefore wires the dispatcher
+    handshake and parks; CD-034 adds derivation and invokes.
+
+    PARKS VIA ``block_task``, NOT ``complete_task``. complete_task runs the
+    CD-018 AC gate and raises ACGateRefusedError on an ``exception`` verdict --
+    plausibly exactly where a parked graph card sits. block_task has no gate,
+    and it is what the goal loop's own block_fn already uses.
+    ``kind="needs_input"`` additionally joins the unblock-loop breaker, so a
+    card that keeps parking routes to ``triage`` after BLOCK_RECURRENCE_LIMIT
+    rather than looping against a cron.
+
+    A TERMINAL TRANSITION IS MANDATORY. A worker that exits rc=0 while its task
+    is still ``running`` is recorded as a protocol violation, with a durable
+    marker and an auto-block streak. That is why this function does NOT inherit
+    the goal loop's caller-side exception swallow: a swallowed failure here
+    would be a silent no-op AND a protocol violation.
+    """
+    import os as _os
+
+    task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id:
+        return None
+
+    from hermes_cli import kanban_db as _kb
+
+    conn = _kb.connect()
+    try:
+        task = _kb.get_task(conn, task_id)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if task is None:
+        return None
+
+    executor = getattr(task, "graph_executor", None)
+    if not executor:
+        return None
+
+    # An executor outside the closed enum can only arrive from a hand-edited
+    # DB (set_graph_executor validates membership). Fail closed with a reason
+    # that says which, rather than treating it as the known one.
+    if executor in _kb.GRAPH_EXECUTORS:
+        reason = "graph_not_dispatchable:no_work_product"
+    else:
+        reason = "graph_executor_unknown:%s" % (executor,)
+
+    try:
+        c = _kb.connect()
+        try:
+            parked = _kb.block_task(c, task_id, reason=reason, kind="needs_input")
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.error("build-graph park FAILED for %s: %s", task_id, exc)
+        return 1
+
+    if not parked:
+        logger.error(
+            "build-graph park REFUSED for %s -- not in a blockable state", task_id
+        )
+        return 1
+
+    logger.info("build-graph card %s parked: %s", task_id, reason)
+    return 0
+
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
@@ -18367,6 +18455,19 @@ def main(
                         # status lines).  The response is printed once below.
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
+                        # CD-033 (D5.2b-i): a card with graph_executor set is
+                        # executed BY THE GRAPH, not by a model turn. At this
+                        # CD the graph is not invoked -- see
+                        # _run_build_graph_q's docstring for why an empty diff
+                        # is a SPEND hazard rather than a no-op. The hook parks
+                        # the card and we exit; a terminal transition is
+                        # mandatory or the dispatcher records a protocol
+                        # violation. Returns None for every non-graph card, in
+                        # which case the turn below runs unchanged.
+                        _graph_rc = _run_build_graph_q(cli)
+                        if _graph_rc is not None:
+                            print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+                            sys.exit(_graph_rc)
                         try:
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,
