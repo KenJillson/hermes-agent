@@ -53,6 +53,7 @@ from typing import Any, Callable, Optional
 from hermes_cli import build_graph_eval as ev
 from hermes_cli import build_graph_sanitize as sz
 from hermes_cli.build_graph_state import (
+    SCHEMA_VERSION,
     WorkflowState,
     new_workflow_state,
     selection_signals,
@@ -604,8 +605,15 @@ def route_after_fix(state):
 # graph construction
 # --------------------------------------------------------------------------
 
-def build(deps: Deps):
-    """Compile the graph. Returns (app, serde)."""
+def build(deps: Deps, *, checkpointer=None):
+    """Compile the graph. Returns (app, serde).
+
+    `checkpointer` is an optional pre-made (saver, serde) pair. Absent, the
+    D5.1 in-memory checkpointer is built exactly as before -- so every existing
+    caller is unaffected and the default behaviour of this module does not
+    change. run() supplies the pair when it needs a reference to the SAVER
+    itself, which the (app, serde) return does not carry.
+    """
     from langgraph.graph import StateGraph, START, END
 
     g = StateGraph(WorkflowState)
@@ -658,22 +666,109 @@ def build(deps: Deps):
     g.add_edge("assemble", END)
     g.add_edge("human", END)
 
-    saver, serde = sz.make_checkpointer()
+    if checkpointer is None:
+        saver, serde = sz.make_checkpointer()
+    else:
+        saver, serde = checkpointer
     return g.compile(checkpointer=saver), serde
 
 
 def run(conn, task_id, workspace, *, body="", component="main", plan="", diff="",
-        directive=None, deps=None, thread_id=None, recursion_limit=40):
+        directive=None, deps=None, thread_id=None, recursion_limit=40,
+        checkpoint="memory", resume=False):
     """Entry point (fork ruling 1: worker-side, offline-testable).
 
     NO HTTP SURFACE, structurally (section 4.1). This module exposes none.
+
+    checkpoint="memory"     D5.1 behaviour. InMemorySaver, no durability. This
+                            is the DEFAULT, so nothing that calls run() today
+                            changes behaviour.
+              "workspace"   CD-032. Persisted under the card workspace.
+
+    resume=True adopts an existing checkpoint for this thread. It requires
+    checkpoint="workspace", and it is OPT-IN rather than automatic: thread_id
+    defaults to "<task_id>:<component>", which is STABLE ACROSS DISPATCHES, so
+    an automatic resume would silently re-enter a card that already finished.
+    Explicit opt-in is the same posture as CD-028's Ken-only routing column.
+
+    RESUME SEMANTICS -- verified on the box 2026-08-19, and the two cases are
+    not the same:
+
+      * INTERRUPTED thread (a node raised): invoke(None) CONTINUES at the
+        crashed node; completed supersteps are not repeated.
+      * TERMINAL thread (reached END): a PARTIAL input RE-ENTERS FROM START
+        with the named channels merged over the restored ones, and channels
+        not named survive untouched.
+
+    This function takes the SECOND form deliberately. `plan` and `diff` are
+    RE-DERIVED by the caller, which holds the worktree, and passed as the
+    partial input; control state (rung, rung_attempts, cloud_review_calls, the
+    objection sets, the recurrence fields) comes off the checkpoint. That is
+    correct independently of the sanitizer being lossy: the worktree is the
+    truth and a checkpoint is a stale copy of it, so restoring a diff from a
+    checkpoint older than the worktree is wrong even with perfect fidelity.
+
+    Re-entering at cheap_gate with rung_attempts preserved is precisely what
+    makes the section 2.2 rung caps bind ACROSS dispatches instead of resetting
+    on every one.
     """
     deps = deps or Deps(conn=conn, task_id=task_id, workspace=workspace, body=body)
     deps.conn, deps.task_id, deps.workspace, deps.body = conn, task_id, workspace, body
     if deps.gate is None or deps.arbiter is None or deps.parse_ac is None:
         deps.resolve_real()
 
-    app, serde = build(deps)
+    if checkpoint not in ("memory", "workspace"):
+        raise ValueError(
+            "checkpoint must be 'memory' or 'workspace', got %r. This is a "
+            "caller error at entry, before any card state exists, so it raises "
+            "rather than parking." % (checkpoint,))
+
+    tid = thread_id or "%s:%s" % (task_id, component)
+    cfg = {"configurable": {"thread_id": tid},
+           "recursion_limit": recursion_limit}
+
+    ckmod = None
+    pair = None
+    if checkpoint == "workspace":
+        from hermes_cli import build_graph_checkpoint as _ck
+        ckmod = _ck
+        pair = ckmod.make_workspace_checkpointer(workspace)
+
+    app, serde = build(deps, checkpointer=pair)
+
+    def _parked(reason):
+        """A refusal PARKS the card; it does not raise.
+
+        Same posture as an unbuilt node (CD-031): a raise under a checkpointer
+        loses state and may re-spend cloud calls already paid for, while a
+        parked card is bounded and visible to a human.
+        """
+        parked = new_workflow_state(task_id, component, plan=plan, diff=diff,
+                                    directive=directive)
+        parked["terminal_reason"] = reason
+        return parked
+
+    def _invoke(payload):
+        if ckmod is None:
+            return app.invoke(payload, cfg)
+        try:
+            return app.invoke(payload, cfg)
+        except ckmod.CheckpointTooLarge:
+            # A checkpointer is not a node and has no edges, so it cannot
+            # route. This is the only place the size refusal can become a
+            # parked card instead of a crashed run.
+            return _parked("checkpoint_too_large")
+
+    if resume:
+        if checkpoint != "workspace":
+            return _parked("resume_requires_workspace_checkpoint")
+        refusal = ckmod.resume_refusal(pair[0], tid, schema_version=SCHEMA_VERSION)
+        if refusal:
+            return _parked(refusal)
+        # Partial input: re-derived work product only. Everything else is
+        # restored from the checkpoint.
+        return _invoke({"plan": plan, "diff": diff})
+
     # new_workflow_state populates EVERY field, including the three CD-031
     # additions. No field is patched in afterwards: a partially-populated
     # TypedDict defeats the point of pinning the schema, and LangGraph silently
@@ -681,7 +776,4 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
     state = new_workflow_state(task_id, component, plan=plan, diff=diff,
                                directive=directive)
     validate(state)
-
-    cfg = {"configurable": {"thread_id": thread_id or "%s:%s" % (task_id, component)},
-           "recursion_limit": recursion_limit}
-    return app.invoke(state, cfg)
+    return _invoke(state)
