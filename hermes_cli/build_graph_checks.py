@@ -38,18 +38,37 @@ Measured on the box 2026-08-20, tirith's exit codes are:
 rc 2 is overloaded. A gate keyed on exit status cannot distinguish a
 below-threshold finding from a typo in its own command -- the exact
 broken-and-passing-look-alike failure this codebase keeps rediscovering. So the
-tirith specs use ``--format json`` and an ``expect=stdout~`` match on
-``"total_findings": 0,``:
+tirith specs use ``--format json`` and evaluate the envelope INSIDE the check
+command, keeping ``expect=exit:0`` at the spec level. (CD-036's docstring said
+``expect=stdout~`` here; the shipped ``_spec`` has always used
+``expect_kind="exit"``. Corrected 2026-08-20, CD-037.)
 
-    clean              -> matches   -> passed
-    any finding        -> no match  -> failed
-    malformed command  -> no JSON   -> no match -> failed   (fail-closed)
+    findings == []     -> parses   -> passed
+    any finding        -> parses   -> failed
+    malformed command  -> no JSON  -> unparseable -> failed   (fail-closed)
+    tirith absent      -> empty    -> unparseable -> failed   (fail-closed)
 
-``total_findings`` sits in the first ~200 bytes of the envelope and
-``run_check`` truncates stdout from the TAIL at 64 KiB, so it is always present.
-This also sidesteps an unexplained observation: a HIGH-only tree returns 1 even
-at ``--fail-on critical``, where the MEDIUM-only result predicts 2. Recorded as
-observed-and-unexplained; nothing here depends on threshold semantics.
+CORRECTED 2026-08-20 (CD-037). CD-036 keyed this gate on the marker
+``"total_findings": 0,``, measured from a DIRECTORY scan. This module asks for
+the PER-FILE envelope, and the two are DIFFERENT SCHEMAS:
+
+    tirith scan ... --file F   -> schema_version 3, keys schema_version /
+                                  path / is_config_file / findings.
+                                  NO ``total_findings`` KEY AT ALL.
+    tirith scan ... DIR        -> schema_version 4, keys including
+                                  scanned_count, ``total_findings``, files[].
+
+So the marker could never match, ``grep -q`` never fired, and because the loop
+fails closed, EVERY CLEAN FILE FAILED THE GATE. It went unnoticed because every
+card that ever exercised this gate -- CD-036's own probe and both AC-3 arms --
+also carried a deliberately failing ``## AC`` check, so the summary verdict was
+``exception`` either way and the accidental failure hid inside the intended one.
+A gate with no fixture that is expected to PASS is not tested.
+
+The check now PARSES the per-file envelope (``CLEAN_PREDICATE``) rather than
+matching a substring of it. Threshold semantics remain
+observed-and-unexplained -- a HIGH-only tree returns 1 even at ``--fail-on
+critical`` -- and nothing here depends on them, which is still the point.
 
 SCOPE: CHANGED FILES, PLUS AN UNCONDITIONAL AI-INSTRUCTION CARVE-OUT
 ---------------------------------------------------------------------
@@ -94,9 +113,37 @@ TIRITH = "/usr/local/bin/tirith"
 
 TIRITH_PROFILE = "ai-agent-repo"
 
-# The clean marker in --format json. Trailing comma included so it cannot
-# prefix-match a multi-digit count.
-CLEAN_MARKER = '"total_findings": 0,'
+# The clean predicate, applied to ONE per-file envelope arriving on stdin.
+#
+# NOT a string match, and the reason is measured rather than stylistic.
+# CD-036 keyed on '"total_findings": 0,'. That key does not exist in the
+# envelope this module actually asks for: `--file` returns schema_version 3
+# ({"schema_version","path","is_config_file","findings"}), while a DIRECTORY
+# scan returns schema_version 4 (which does carry "total_findings"). CD-036
+# measured the directory envelope and then wrote --file invocations, so the
+# marker could never match, `grep -q` never fired, and _tirith_loop's
+# fail-closed design turned every CLEAN file into exit 1. Two schemas, one
+# marker, and no test that distinguished clean input from dirty.
+#
+# The naive repair -- swapping the marker to '"findings": []' -- is ALSO
+# broken: `grep -q` uses BRE, where `[]` opens a bracket expression instead
+# of matching two literal brackets, so it fails on clean input exactly like
+# the original. `grep -qF` does work, but is pinned to tirith's
+# pretty-printer spacing. Measured, all four, 2026-08-20.
+#
+# Parsing fails closed three ways: unparseable stdin (which INCLUDES the
+# empty stream, i.e. tirith could not run at all), a missing `findings` key
+# (schema drift -- a future schema_version bump degrades to "refuse", not to
+# "pass"), and any non-empty findings array. It is also independent of
+# --fail-on threshold semantics, which remain observed-and-unexplained.
+CLEAN_PREDICATE = (
+    "import json,sys\n"
+    "try:\n"
+    "    d=json.load(sys.stdin)\n"
+    "except Exception:\n"
+    "    sys.exit(1)\n"
+    "f=d.get('findings')\n"
+    "sys.exit(0 if isinstance(f,list) and not f else 1)\n")
 
 # Read by this project's own workers out of the card workspace. Scanned whether
 # or not the card touched them -- see the module docstring.
@@ -190,9 +237,9 @@ def _tirith_loop(paths_expr: str) -> str:
     """
     return ("for f in %s; do [ -f \"$f\" ] || continue; "
             "%s scan --format json --profile %s --file \"$f\" "
-            "| grep -q %s || exit 1; done"
+            "| python3 -c %s || exit 1; done"
             % (paths_expr, shlex.quote(TIRITH), shlex.quote(TIRITH_PROFILE),
-               shlex.quote(CLEAN_MARKER)))
+               shlex.quote(CLEAN_PREDICATE)))
 
 
 def tirith_changed_spec(files, index) -> dict:
