@@ -53,6 +53,7 @@ from typing import Any, Callable, Optional
 from hermes_cli import build_graph_checks as ck
 from hermes_cli import build_graph_eval as ev
 from hermes_cli import build_graph_sanitize as sz
+from hermes_cli import build_graph_trace as tl
 from hermes_cli.build_graph_state import (
     SCHEMA_VERSION,
     WorkflowState,
@@ -625,48 +626,69 @@ def build(deps: Deps, *, checkpointer=None):
 
     g = StateGraph(WorkflowState)
 
-    g.add_node("cheap_gate", make_cheap_gate(deps))
-    g.add_node("cloud_review", make_cloud_review(
+    # CD-038: the trace emitter, wired AT REGISTRATION so that no node body,
+    # router, prompt builder or state field changes. The tracer's wrappers are
+    # transparent -- they return the wrapped callable's value unchanged and
+    # RE-RAISE its exceptions -- and with HERMES_GRAPH_TRACE=0 every wrapper is
+    # the identity function, so the callables registered below are the SAME
+    # OBJECTS as before this CD.
+    #
+    # deps.model is wrapped because run_id is a call_model RETURN VALUE, not a
+    # workflow_state field. Getting the ledger join key any other way would
+    # mean a state schema change; it does not need one. The wrap is idempotent
+    # by marker, so a second build() on the same Deps cannot nest it.
+    tracer = tl.Tracer(thread_id=getattr(deps, "task_id", "") or "")
+    deps.tracer = tracer
+    deps.model = tracer.model(deps.model)
+
+    def _add(name, fn):
+        g.add_node(name, tracer.node(name, fn))
+
+    def _cond(source, fn, path_map):
+        g.add_conditional_edges(source, tracer.edge(source, fn), path_map)
+
+    _add("cheap_gate", make_cheap_gate(deps))
+    _add("cloud_review", make_cloud_review(
         deps, activity="code_review", node_name="cloud_review"))
-    g.add_node("cloud_re_review", make_cloud_review(
+    _add("cloud_re_review", make_cloud_review(
         deps, activity="re_review", node_name="cloud_re_review"))
-    g.add_node("classify_failure", make_classify_failure(deps))
-    g.add_node("fix_rung1", make_fix(deps, rung="rung1", activity="fix_sonnet"))
-    g.add_node("fix_rung2", make_fix(deps, rung="rung2", activity="fix_opus"))
-    g.add_node("fix_rung3", make_fix_rung3(deps))
-    g.add_node("assemble", node_assemble)
-    g.add_node("human", node_human)
+    _add("classify_failure", make_classify_failure(deps))
+    _add("fix_rung1", make_fix(deps, rung="rung1", activity="fix_sonnet"))
+    _add("fix_rung2", make_fix(deps, rung="rung2", activity="fix_opus"))
+    _add("fix_rung3", make_fix_rung3(deps))
+    _add("assemble", node_assemble)
+    _add("human", node_human)
 
     # Unbuilt: wired, honest, terminal-to-human.
     for name in ("plan", "plan_review", "implement", "local_review"):
-        g.add_node(name, unbuilt(name))
+        _add(name, unbuilt(name))
         g.add_edge(name, "human")
 
     g.add_edge(START, "cheap_gate")
 
-    g.add_conditional_edges(
+    _cond(
         "cheap_gate", lambda s: route_after_gate(s, deps),
         {"cloud_review": "cloud_review", "local_review": "local_review",
          "fix_rung1": "fix_rung1", "fix_rung2": "fix_rung2",
          "fix_rung3": "fix_rung3", "human": "human"})
 
-    g.add_conditional_edges(
+    _cond(
         "cloud_review", route_after_review,
         {"assemble": "assemble", "cloud_re_review": "cloud_re_review",
          "human": "human"})
 
-    g.add_conditional_edges(
+    _cond(
         "cloud_re_review", route_after_re_review,
         {"assemble": "assemble", "classify_failure": "classify_failure",
          "human": "human"})
 
-    g.add_conditional_edges(
+    _cond(
         "classify_failure", route_after_classify,
         {"fix_rung1": "fix_rung1", "fix_rung2": "fix_rung2",
          "fix_rung3": "fix_rung3", "human": "human"})
 
     for fix in ("fix_rung1", "fix_rung2", "fix_rung3"):
-        g.add_conditional_edges(
+        _cond(
             fix, route_after_fix,
             {"cheap_gate": "cheap_gate", "human": "human"})
 
@@ -760,15 +782,25 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
         return parked
 
     def _invoke(payload):
-        if ckmod is None:
-            return app.invoke(payload, cfg)
         try:
-            return app.invoke(payload, cfg)
-        except ckmod.CheckpointTooLarge:
-            # A checkpointer is not a node and has no edges, so it cannot
-            # route. This is the only place the size refusal can become a
-            # parked card instead of a crashed run.
-            return _parked("checkpoint_too_large")
+            if ckmod is None:
+                return app.invoke(payload, cfg)
+            try:
+                return app.invoke(payload, cfg)
+            except ckmod.CheckpointTooLarge:
+                # A checkpointer is not a node and has no edges, so it cannot
+                # route. This is the only place the size refusal can become a
+                # parked card instead of a crashed run.
+                return _parked("checkpoint_too_large")
+        finally:
+            # CD-038: one summary line per invocation, carrying the trace's own
+            # dropped-line count. In a FINALLY deliberately -- it is written
+            # even when a node raises, and a crashed run is exactly when the
+            # trace is worth having. A dropped line that is not counted is
+            # indistinguishable from a node that never ran.
+            _tracer = getattr(deps, "tracer", None)
+            if _tracer is not None:
+                _tracer.summary()
 
     if resume:
         if checkpoint != "workspace":
