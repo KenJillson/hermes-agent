@@ -17869,15 +17869,32 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
     (``kanban_db.set_graph_executor`` is the sole writer, validating against
     the closed ``GRAPH_EXECUTORS`` enum).
 
-    THE GRAPH IS NOT INVOKED AT THIS CD, and that is the point of it.
+    CD-034 SPLITS ON WHETHER THE CARD CAN REACH A PRICED EDGE.
+
     ``build_graph.run()`` takes ``plan`` and ``diff``, which its own docstring
-    says the CALLER re-derives from the worktree -- and no derivation exists,
-    because ``run()`` has never had a caller. An empty diff is not inert:
-    cheap_gate -> arbiter "pass" -> ``GATE_PASS_TARGET`` is ``cloud_review``,
-    whose prompt reads ``state["diff"]``, so invoking with an empty diff can
-    BUY a cloud review of nothing on the very first dispatch. The spend arbiter
-    gates dollars, not input sanity. CD-033 therefore wires the dispatcher
-    handshake and parks; CD-034 adds derivation and invokes.
+    says the CALLER re-derives from the worktree -- and no derivation exists
+    yet. An empty diff is not inert IF a priced node is reachable: cheap_gate
+    -> arbiter "pass" -> ``GATE_PASS_TARGET`` is ``cloud_review``, whose prompt
+    reads ``state["diff"]``, so invoking would buy a review of nothing. The
+    spend arbiter gates dollars, not input sanity.
+
+    But a priced node is reachable ONLY through a parseable ``## AC`` block --
+    ``all_pass`` needs passing checks and ``exception`` needs failing or
+    unrunnable ones. With no such block, three short-circuits compose:
+
+      * ``parse_ac_text`` -> ac_results is None
+      * ``ac_check_runner.gate()`` -> early return {"verdict": "no_checks"},
+        BEFORE any subprocess and before persist_execution
+      * ``spend_accounting.arbiter_decision()`` -> NO_ARBITER, returning BEFORE
+        over_spend_cap, so there is no ledger ssh either
+
+    and ``route_after_gate`` sends no_arbiter to ``human`` -> END. The whole
+    traversal is START -> cheap_gate -> human -> END with no subprocess, no
+    model call and no dollars.
+
+    So: NO ## AC -> invoke for real. ## AC present -> park exactly as CD-033
+    did, until CD-035 lands diff derivation. The hazard is not tolerated here,
+    it is made unreachable.
 
     PARKS VIA ``block_task``, NOT ``complete_task``. complete_task runs the
     CD-018 AC gate and raises ACGateRefusedError on an ``exception`` verdict --
@@ -17916,13 +17933,42 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
     if not executor:
         return None
 
-    # An executor outside the closed enum can only arrive from a hand-edited
-    # DB (set_graph_executor validates membership). Fail closed with a reason
-    # that says which, rather than treating it as the known one.
-    if executor in _kb.GRAPH_EXECUTORS:
+    if executor not in _kb.GRAPH_EXECUTORS:
+        # An executor outside the closed enum can only arrive from a
+        # hand-edited DB (set_graph_executor validates membership). Fail
+        # closed with a reason that says which, rather than treating it as
+        # the known one.
+        reason = "graph_executor_unknown:%s" % (executor,)
+    elif _kb.parse_ac_text(task.body or "")[3]:
+        # CD-034: this card HAS parseable ## AC, so cheap_gate can return
+        # all_pass or exception -- and BOTH reach a priced node. No work
+        # product exists to review, so park, exactly as CD-033 did. CD-035
+        # lands diff derivation and removes this branch.
         reason = "graph_not_dispatchable:no_work_product"
     else:
-        reason = "graph_executor_unknown:%s" % (executor,)
+        # No parseable ## AC: every priced edge is unreachable (see the
+        # docstring for the three short-circuits, each read at source). This
+        # is the first time the graph runs inside a worker, and it is free.
+        workspace = (_os.environ.get("HERMES_KANBAN_WORKSPACE") or "").strip()
+        try:
+            from hermes_cli import build_graph as _bg
+
+            gc = _kb.connect()
+            try:
+                state = _bg.run(gc, task_id, workspace, body=task.body or "")
+            finally:
+                try:
+                    gc.close()
+                except Exception:
+                    pass
+            reason = "graph_terminal:%s" % (
+                (state or {}).get("terminal_reason") or "unknown")
+        except Exception as exc:
+            # A crash here would leave the card `running` and earn a protocol
+            # violation. Park with the exception TYPE only -- its text can
+            # carry payload, and payload must not reach the board.
+            logger.error("build-graph invoke FAILED for %s: %s", task_id, exc)
+            reason = "graph_invoke_failed:%s" % type(exc).__name__
 
     try:
         c = _kb.connect()

@@ -54,7 +54,8 @@ import sys
 from typing import Any, Callable, Optional
 
 # The canonical sanitizer lives in the OTHER repo, at
-# $HERMES_HOME/lib/model_call/sanitizer.py. Reaching across the repo boundary at
+# <hermes-config>/lib/model_call/sanitizer.py -- which is NOT always $HERMES_HOME;
+# see hermes_home() below. Reaching across the repo boundary at
 # runtime is a real coupling and is recorded as such -- but the alternative is
 # duplicating three security predicates into hermes-agent, and two copies of a
 # security rule in two repos drift silently. The coupling is the lesser harm and
@@ -65,8 +66,56 @@ _SANITIZER_RELPATH = os.path.join("lib", "model_call", "sanitizer.py")
 _sanitizer_mod = None
 
 
+def _derived_config_root() -> str:
+    """The config root implied by this module's own location on disk.
+
+    hermes-agent is checked out AT <hermes-config>/hermes-agent (CLAUDE.md 2),
+    so this file sits at <config-root>/hermes-agent/hermes_cli/ and three
+    dirnames up is the root. Derived rather than configured, so it stays correct
+    with no env at all -- and it is only ever a CANDIDATE: the caller still
+    proves the file it loaded.
+    """
+    here = os.path.abspath(__file__)
+    return os.path.dirname(os.path.dirname(os.path.dirname(here)))
+
+
 def hermes_home() -> str:
-    return os.environ.get("HERMES_HOME", _DEFAULT_HERMES_HOME)
+    """The hermes-config repo root. NOT necessarily $HERMES_HOME.
+
+    A kanban WORKER is spawned with HERMES_HOME pointed at its PROFILE root
+    (kanban_db._default_spawn calls resolve_profile_env, deliberately, so the
+    worker reads profile-scoped config). lib/model_call/ lives in the CONFIG
+    repo and not under any profile, so in a worker $HERMES_HOME/lib/model_call
+    is always absent -- and _load_sanitizer() therefore failed closed on every
+    graph run inside a worker. Invisible until the graph first ran in one
+    (2026-08-19); every offline test had the two roots coinciding.
+
+    Resolution is ORDERED, and the first candidate that actually CONTAINS the
+    sanitizer wins:
+
+      1. HERMES_CONFIG_ROOT   explicit override
+      2. HERMES_HOME          correct for gateway/CLI, wrong for a worker
+      3. _derived_config_root()
+      4. _DEFAULT_HERMES_HOME
+
+    This widens WHERE we look. It does not widen WHAT we accept: _load_sanitizer()
+    still asserts the realpath of the module it imported and still checks the
+    attribute shape, so a wrong file on the path fails closed exactly as before.
+
+    When no candidate holds the file, the FIRST candidate is returned so the
+    error names the most likely intended root rather than a fallback.
+    """
+    seen = []
+    for cand in (os.environ.get("HERMES_CONFIG_ROOT"),
+                 os.environ.get("HERMES_HOME"),
+                 _derived_config_root(),
+                 _DEFAULT_HERMES_HOME):
+        if not cand or cand in seen:
+            continue
+        seen.append(cand)
+        if os.path.isfile(os.path.join(cand, _SANITIZER_RELPATH)):
+            return cand
+    return seen[0] if seen else _DEFAULT_HERMES_HOME
 
 
 def expected_sanitizer_path() -> str:
@@ -94,8 +143,10 @@ def _load_sanitizer():
     if not os.path.isfile(want):
         raise RuntimeError(
             "canonical sanitizer not found at %s -- checkpoint sanitation "
-            "cannot be established, so the graph must not run. Set HERMES_HOME "
-            "or check the hermes-config checkout." % want)
+            "cannot be established, so the graph must not run. Set "
+            "HERMES_CONFIG_ROOT (note: a kanban worker's HERMES_HOME is its "
+            "PROFILE root, not the config repo) or check the hermes-config "
+            "checkout." % want)
 
     libdir = os.path.join(hermes_home(), "lib")
     if libdir not in sys.path:
