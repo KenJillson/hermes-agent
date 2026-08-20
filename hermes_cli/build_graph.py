@@ -674,6 +674,7 @@ def build(deps: Deps, *, checkpointer=None):
 
 
 def run(conn, task_id, workspace, *, body="", component="main", plan="", diff="",
+        diff_files=0, diff_added_lines=0,
         directive=None, deps=None, thread_id=None, recursion_limit=40,
         checkpoint="memory", resume=False):
     """Entry point (fork ruling 1: worker-side, offline-testable).
@@ -744,6 +745,8 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
         parked card is bounded and visible to a human.
         """
         parked = new_workflow_state(task_id, component, plan=plan, diff=diff,
+                                    diff_files=diff_files,
+                                    diff_added_lines=diff_added_lines,
                                     directive=directive)
         parked["terminal_reason"] = reason
         return parked
@@ -774,6 +777,8 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
     # TypedDict defeats the point of pinning the schema, and LangGraph silently
     # drops updates naming keys that are not channels.
     state = new_workflow_state(task_id, component, plan=plan, diff=diff,
+                               diff_files=diff_files,
+                               diff_added_lines=diff_added_lines,
                                directive=directive)
     validate(state)
     return _invoke(state)

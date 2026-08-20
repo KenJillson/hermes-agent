@@ -17933,42 +17933,75 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
     if not executor:
         return None
 
+    workspace = (_os.environ.get("HERMES_KANBAN_WORKSPACE") or "").strip()
+    derived = {"diff": "", "diff_files": 0, "diff_added_lines": 0}
+
     if executor not in _kb.GRAPH_EXECUTORS:
         # An executor outside the closed enum can only arrive from a
         # hand-edited DB (set_graph_executor validates membership). Fail
         # closed with a reason that says which, rather than treating it as
         # the known one.
         reason = "graph_executor_unknown:%s" % (executor,)
-    elif _kb.parse_ac_text(task.body or "")[3]:
-        # CD-034: this card HAS parseable ## AC, so cheap_gate can return
-        # all_pass or exception -- and BOTH reach a priced node. No work
-        # product exists to review, so park, exactly as CD-033 did. CD-035
-        # lands diff derivation and removes this branch.
-        reason = "graph_not_dispatchable:no_work_product"
     else:
-        # No parseable ## AC: every priced edge is unreachable (see the
-        # docstring for the three short-circuits, each read at source). This
-        # is the first time the graph runs inside a worker, and it is free.
-        workspace = (_os.environ.get("HERMES_KANBAN_WORKSPACE") or "").strip()
-        try:
-            from hermes_cli import build_graph as _bg
+        # CD-035 (D5.2b-iii prereq): DERIVE THE WORK PRODUCT, then invoke.
+        #
+        # The split CD-034 made is preserved exactly, and only its second half
+        # changes. A card with NO parseable ## AC cannot reach a priced edge --
+        # three short-circuits compose (parse_ac_text -> None,
+        # ac_check_runner.gate() -> early "no_checks", arbiter -> NO_ARBITER,
+        # and route_after_gate sends no_arbiter to `human`) -- so it still runs
+        # free on an empty diff, unchanged. A card WITH one CAN reach a priced
+        # edge, and CD-034 parked it because reviewing an empty diff would buy
+        # a review of nothing. It now runs IF AND ONLY IF a real diff exists.
+        #
+        # `plan` is deliberately NOT derived. Producing a plan is the `plan`
+        # node's job and that node is unbuilt; CD-035 is diff derivation only.
+        reason = None
+        if _kb.parse_ac_text(task.body or "")[3]:
+            kind = (getattr(task, "workspace_kind", None) or "scratch")
+            if kind != "worktree":
+                # RULED 2026-08-20. kanban_db.resolve_workspace materialises a
+                # git worktree ONLY for kind='worktree'; `scratch` is a bare
+                # directory under the board root and `dir` is an arbitrary
+                # path, so neither has a repo to diff. Park rather than make a
+                # priced node CONDITIONALLY unreachable -- structural
+                # unreachability is the guarantee CD-034 earned and this keeps
+                # it. A card that needs the graph is created with
+                # `--workspace worktree:<repo>`.
+                reason = "graph_no_diff_source:%s" % (kind,)
+            else:
+                from hermes_cli import build_graph_diff as _bgd
 
-            gc = _kb.connect()
+                verdict = _bgd.derive(workspace)
+                if verdict["ok"]:
+                    derived = verdict
+                else:
+                    reason = verdict["reason"]
+
+        if reason is None:
             try:
-                state = _bg.run(gc, task_id, workspace, body=task.body or "")
-            finally:
+                from hermes_cli import build_graph as _bg
+
+                gc = _kb.connect()
                 try:
-                    gc.close()
-                except Exception:
-                    pass
-            reason = "graph_terminal:%s" % (
-                (state or {}).get("terminal_reason") or "unknown")
-        except Exception as exc:
-            # A crash here would leave the card `running` and earn a protocol
-            # violation. Park with the exception TYPE only -- its text can
-            # carry payload, and payload must not reach the board.
-            logger.error("build-graph invoke FAILED for %s: %s", task_id, exc)
-            reason = "graph_invoke_failed:%s" % type(exc).__name__
+                    state = _bg.run(gc, task_id, workspace,
+                                    body=task.body or "",
+                                    diff=derived["diff"],
+                                    diff_files=derived["diff_files"],
+                                    diff_added_lines=derived["diff_added_lines"])
+                finally:
+                    try:
+                        gc.close()
+                    except Exception:
+                        pass
+                reason = "graph_terminal:%s" % (
+                    (state or {}).get("terminal_reason") or "unknown")
+            except Exception as exc:
+                # A crash here would leave the card `running` and earn a
+                # protocol violation. Park with the exception TYPE only -- its
+                # text can carry payload, and payload must not reach the board.
+                logger.error("build-graph invoke FAILED for %s: %s", task_id, exc)
+                reason = "graph_invoke_failed:%s" % type(exc).__name__
 
     try:
         c = _kb.connect()
