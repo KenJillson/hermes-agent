@@ -50,6 +50,7 @@ import subprocess
 import tempfile
 from typing import Any, Callable, Optional
 
+from hermes_cli import build_graph_checks as ck
 from hermes_cli import build_graph_eval as ev
 from hermes_cli import build_graph_sanitize as sz
 from hermes_cli.build_graph_state import (
@@ -302,7 +303,8 @@ class Deps:
     """
 
     def __init__(self, *, gate=None, arbiter=None, model=None, parse_ac=None,
-                 conn=None, task_id="", workspace="", body=""):
+                 conn=None, task_id="", workspace="", body="",
+                 changed_files=None):
         self.gate = gate
         self.arbiter = arbiter
         self.model = model or call_model
@@ -311,6 +313,10 @@ class Deps:
         self.task_id = task_id
         self.workspace = workspace
         self.body = body
+        # CD-036 (D5.5): the files this card changed, for the synthetic check
+        # specs. Empty is the honest default -- it narrows coverage to the
+        # AI-instruction carve-out rather than silently passing.
+        self.changed_files = list(changed_files or [])
 
     def resolve_real(self):
         """Bind the real primitives. Called only when defaults are needed, so
@@ -358,7 +364,8 @@ def make_cheap_gate(deps: Deps):
                                             state["iteration"]))
         summary = deps.gate(
             state["card_id"], deps.body, deps.workspace,
-            parse_fn=deps.parse_ac,
+            parse_fn=ck.wrap_parse_fn(deps.parse_ac, deps.workspace,
+                                      deps.changed_files),
             path=rec,
         )
         return guard({"gate_summary": summary, "ac_record_path": rec,
@@ -674,7 +681,7 @@ def build(deps: Deps, *, checkpointer=None):
 
 
 def run(conn, task_id, workspace, *, body="", component="main", plan="", diff="",
-        diff_files=0, diff_added_lines=0,
+        diff_files=0, diff_added_lines=0, changed_files=None,
         directive=None, deps=None, thread_id=None, recursion_limit=40,
         checkpoint="memory", resume=False):
     """Entry point (fork ruling 1: worker-side, offline-testable).
@@ -715,6 +722,7 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
     """
     deps = deps or Deps(conn=conn, task_id=task_id, workspace=workspace, body=body)
     deps.conn, deps.task_id, deps.workspace, deps.body = conn, task_id, workspace, body
+    deps.changed_files = list(changed_files or [])
     if deps.gate is None or deps.arbiter is None or deps.parse_ac is None:
         deps.resolve_real()
 

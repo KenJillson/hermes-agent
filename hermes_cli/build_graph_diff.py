@@ -325,7 +325,7 @@ def derive(workspace: str, *, runner=None) -> dict:
     def _park(reason: str, **extra) -> dict:
         out = {"ok": False, "reason": reason, "diff": "", "diff_files": 0,
                "diff_added_lines": 0, "base": "", "base_ref": "",
-               "base_how": "", "diff_bytes": 0}
+               "base_how": "", "diff_bytes": 0, "changed_files": []}
         out.update(extra)
         return out
 
@@ -371,6 +371,23 @@ def derive(workspace: str, *, runner=None) -> dict:
         return _park("graph_no_diff_source:diff_failed")
     text = p.stdout or ""
 
+    # CD-036: the changed-file list, for the D5.5 synthetic check specs.
+    # -z (NUL-delimited) rather than newline: a filename may legally contain a
+    # newline, and a newline-split list would silently become two wrong paths.
+    # Rename detection reports the DESTINATION path, so a moved file is covered.
+    changed = []
+    try:
+        q = _git(workspace, ["diff", "--name-only", "-z", base], runner=runner)
+        if q.returncode == 0:
+            changed = [x for x in (q.stdout or "").split("\0") if x]
+    except (OSError, subprocess.SubprocessError):
+        # Best-effort by design: the diff itself is the deliverable, and losing
+        # the file list must not park a card whose diff derived cleanly. An
+        # empty list narrows D5.5 coverage to the AI-instruction carve-out,
+        # which is the graceful degradation -- not a silent pass, because that
+        # carve-out still runs.
+        changed = []
+
     nbytes = len(text.encode("utf-8"))
     if nbytes > MAX_DIFF_BYTES:
         # Never truncated. See the module docstring.
@@ -386,7 +403,7 @@ def derive(workspace: str, *, runner=None) -> dict:
 
     return {"ok": True, "reason": None, "diff": text, "diff_files": files,
             "diff_added_lines": added, "base": base, "base_ref": ref,
-            "base_how": how, "diff_bytes": nbytes}
+            "base_how": how, "diff_bytes": nbytes, "changed_files": changed}
 
 
 _assert_allowed_git()
