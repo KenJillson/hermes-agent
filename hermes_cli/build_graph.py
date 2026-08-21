@@ -754,6 +754,13 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
             "caller error at entry, before any card state exists, so it raises "
             "rather than parking." % (checkpoint,))
 
+    if resume == "auto" and checkpoint != "workspace":
+        raise ValueError(
+            'resume="auto" requires checkpoint="workspace", got %r. Same '
+            "posture as the validation above: a caller error at entry, "
+            "before any card state exists, so it raises rather than "
+            "parking -- there is no card state to lose yet." % (checkpoint,))
+
     tid = thread_id or "%s:%s" % (task_id, component)
     cfg = {"configurable": {"thread_id": tid},
            "recursion_limit": recursion_limit}
@@ -802,6 +809,20 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
             if _tracer is not None:
                 _tracer.summary()
 
+    if resume == "auto":
+        # CD-040. The criterion is that the worker must not be TOLD to
+        # look, so the presence of a checkpoint for THIS thread is the
+        # whole decision, and run() already holds the saver.
+        #
+        # This cannot re-enter a finished card. complete_task removes the
+        # workspace, and checkpoint_root is a managed descendant of it, so
+        # the checkpoint goes with it (checkpoint_root docstring). A card
+        # that finished has nothing to resume from; a card that PARKED
+        # keeps both, and is exactly the card whose rung_attempts must
+        # carry. RUNG_ATTEMPT_CAP is 1 -- without this the ladder resets
+        # every dispatch and the cap does almost no work.
+        resume = bool(pair[0].has_thread(tid))
+
     if resume:
         if checkpoint != "workspace":
             return _parked("resume_requires_workspace_checkpoint")
@@ -810,7 +831,11 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
             return _parked(refusal)
         # Partial input: re-derived work product only. Everything else is
         # restored from the checkpoint.
-        return _invoke({"plan": plan, "diff": diff})
+        return _invoke({"plan": plan, "diff": diff,
+                        "diff_files": diff_files,
+                        "diff_added_lines": diff_added_lines,
+                        "terminal_reason": None,
+                        "halt_reason": None})
 
     # new_workflow_state populates EVERY field, including the three CD-031
     # additions. No field is patched in afterwards: a partially-populated

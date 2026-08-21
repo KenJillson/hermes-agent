@@ -17989,7 +17989,9 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
                                     diff=derived["diff"],
                                     diff_files=derived["diff_files"],
                                     diff_added_lines=derived["diff_added_lines"],
-                                    changed_files=derived.get("changed_files"))
+                                    changed_files=derived.get("changed_files"),
+                                    checkpoint="workspace",
+                                    resume="auto")
                 finally:
                     try:
                         gc.close()
