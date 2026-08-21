@@ -10,13 +10,21 @@ primitive has been READ AT SOURCE this session:
   built     cheap_gate (ac_check_runner.gate), cloud_review, cloud_re_review,
             classify_failure, fix_rung1, fix_rung2 (all model-call), assemble,
             human, and fix_rung3 as an auth-deferred node (section 8 deferral 6)
-  unbuilt   plan, plan_review, implement, local_review
+  unbuilt   plan, plan_review, local_review
+  CD-041    implement -- BUILT, but with NO INBOUND EDGE. See build().
 
-The line is not arbitrary. plan / implement / local_review wrap `delegate_task`
-and fix_rung3's real body wraps `terminal()`, and NEITHER primitive has been
-read. Writing them now would mean guessing a signature, which rule 1 forbids.
-They are present in the topology with their edges wired, so the graph does not
-need reshaping when they land at D5.2.
+The line is not arbitrary. `plan` and `local_review` wrap `delegate_task`
+and fix_rung3's real body wraps `terminal()`. CD-041 READ `delegate_task`
+at source and built `implement` on it, so that primitive is no longer
+unread; `plan` and `local_review` stay unbuilt because each needs a work
+product `delegate_task` does not return -- a plan, and a verdict, the
+latter being `local_review`'s own deliverable. `terminal()` is still
+unread, and writing a node on an unread primitive would mean guessing a
+signature, which rule 1 forbids.
+
+The unbuilt nodes are present in the topology with their edges wired.
+`implement` deliberately is NOT: it has its OUTBOUND edge and no inbound
+one, so it cannot be entered from START until the topology rewire.
 
 AN UNBUILT NODE ROUTES TO `human`. IT DOES NOT RAISE.
 A raise inside a node kills the run, and under the in-memory checkpointer that
@@ -90,6 +98,14 @@ LADDER = ("rung1", "rung2", "rung3")
 # between them when its primitive lands at D5.2. Recorded as a deliberate
 # deviation from section 2.1 rather than left as an accident.
 GATE_PASS_TARGET = "cloud_review"
+
+# CD-041: the closed status vocabulary a delegate_task per-task result can
+# carry, read at source from tools/delegate_tool.py. A status outside this
+# set is NOT treated as a failure of a known kind -- it parks as
+# implement_unknown_status, because an unrecognised status means the
+# contract moved and guessing which way it moved is how a wrong answer
+# becomes a silent one.
+IMPLEMENT_STATUSES = ("ok", "error", "timeout", "failed")
 
 # model-call staged exit codes, from lib/model_call/cli.py (read 2026-08-18).
 RC_OK = 0
@@ -304,6 +320,7 @@ class Deps:
     """
 
     def __init__(self, *, gate=None, arbiter=None, model=None, parse_ac=None,
+                 agent=None, delegate=None, derive=None,
                  conn=None, task_id="", workspace="", body="",
                  changed_files=None):
         self.gate = gate
@@ -318,6 +335,21 @@ class Deps:
         # specs. Empty is the honest default -- it narrows coverage to the
         # AI-instruction carve-out rather than silently passing.
         self.changed_files = list(changed_files or [])
+        # CD-041 (D5.2b-iv). `agent` is the LIVE AIAgent the worker already
+        # holds; delegate_task REFUSES without one (tools/delegate_tool.py:
+        # "delegate_task requires a parent agent context"). `delegate` and
+        # `derive` are injection seams for the offline driver.
+        #
+        # resolve_real() deliberately does NOT bind these two. Binding
+        # `delegate` there would make run() import tools.delegate_tool --
+        # and therefore the whole agent -- for every offline test that
+        # injects a gate double, destroying the "offline-testable against a
+        # temp DB" property fork ruling 1 requires. They are bound LAZILY
+        # inside the node, so a test that injects them never touches the
+        # agent and a run that never reaches `implement` never imports it.
+        self.agent = agent
+        self.delegate = delegate
+        self.derive = derive
 
     def resolve_real(self):
         """Bind the real primitives. Called only when defaults are needed, so
@@ -342,6 +374,128 @@ def unbuilt(name: str):
 
     _node.__name__ = "unbuilt_%s" % name
     _node.unbuilt = True
+    return _node
+
+
+def make_implement(deps: Deps):
+    """Design section 1: `implement` wraps delegate_task -> local, worktree write.
+
+    UNREACHABLE AT THIS CD. build() registers this node with its design section
+    1 OUTBOUND edge (implement -> cheap_gate) and NO inbound edge, so it cannot
+    be entered from START. Wiring the inbound side is the topology rewire, and
+    that is where the first spend happens: delegate_task spawns a child agent
+    and there is no CD-034-style free-path split for it.
+
+    FOUR THINGS READ AT SOURCE, each of which would be wrong if recalled:
+
+      * `parent_agent` is MANDATORY. Without it delegate_task returns
+        tool_error() immediately. That is what deps.agent carries.
+      * A CALLER-SUPPLIED `max_iterations` IS IGNORED -- delegate_task logs it
+        at debug and substitutes delegation.max_iterations from config. This
+        node therefore CANNOT bound its child's iteration budget from the call
+        site, and passing the argument would only look like it could. The child
+        timeout is config-side too (_get_child_timeout).
+      * `background=True` IS NOT AVAILABLE HERE. async_delivery_supported() is
+        false for one-shot runners -- delegate_tool names Kanban workers
+        explicitly -- and the call silently falls back to synchronous execution
+        with a note appended. Passing background=False states that rather than
+        depending on a fallback.
+      * THE CHILD DOES NOT INHERIT THE WORKTREE. _resolve_workspace_hint is
+        best-effort and PROMPT-ONLY: it reads TERMINAL_CWD or parent-agent
+        attributes and injects a path into the child's prompt. So the goal
+        NAMES deps.workspace explicitly. Relying on inheritance would have the
+        child edit some other tree, derive() return an empty diff, and the card
+        park with a reason pointing at git rather than at the real cause.
+
+    THE DIFF IS RE-DERIVED HERE, AND THAT IS NOT HOUSEKEEPING. cloud_review's
+    prompt reads state["diff"] and this node writes the worktree. Without the
+    re-derive, the moment the inbound edge lands, cloud_review buys a review of
+    the diff as it stood BEFORE the implementer ran -- for a fresh card, the
+    empty one. That is exactly the spend hazard CD-034 made structurally
+    unreachable, rebuilt on the other side of the graph.
+
+    NO PAYLOAD FROM THE CHILD EVER REACHES terminal_reason. Not the summary,
+    not `error`, not an exception string. terminal_reason goes to the board via
+    block_task(reason=...), and the vocabulary below is closed and
+    code-authored -- same posture as cli.py's graph_invoke_failed:<TypeName>.
+
+    NO SCHEMA CHANGE. Every field written already exists in WorkflowState, so
+    SCHEMA_VERSION stays 2 and resume_refusal keeps accepting every checkpoint
+    written since CD-032. Carrying the child's summary in state would have
+    forced a bump; it is not worth one.
+    """
+
+    def _node(state):
+        if deps.agent is None:
+            return {"terminal_reason": "implement_no_agent"}
+
+        delegate = deps.delegate
+        if delegate is None:
+            try:
+                from tools.delegate_tool import delegate_task as delegate
+            except Exception:
+                # An import failure must PARK, not raise. A raise inside a node
+                # kills the run and, under a checkpointer, can re-spend cloud
+                # calls already paid for (CD-031 posture).
+                return {"terminal_reason": "implement_delegate_unavailable"}
+
+        raw = delegate(
+            goal=build_implement_goal(state, deps.workspace),
+            context=build_implement_context(state),
+            role="leaf",
+            background=False,
+            parent_agent=deps.agent,
+        )
+
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else None
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict):
+            return {"terminal_reason": "implement_unparseable"}
+
+        # A REFUSAL IS ALSO VALID JSON. tool_error() returns
+        # {"error": "..."} with NO `results` key, so "it parsed" is not "it
+        # ran". The absence of `results` is the discriminator.
+        results = payload.get("results")
+        if not isinstance(results, list):
+            return {"terminal_reason": "implement_refused"}
+        if not results or not isinstance(results[0], dict):
+            return {"terminal_reason": "implement_no_result"}
+
+        first = results[0]
+        status = first.get("status")
+        if status not in IMPLEMENT_STATUSES:
+            return {"terminal_reason": "implement_unknown_status"}
+        if status != "ok":
+            return {"terminal_reason": "implement_%s" % status}
+
+        model = first.get("model")
+        update = {"implementer_model": model if isinstance(model, str) else None}
+
+        derive = deps.derive
+        if derive is None:
+            try:
+                from hermes_cli import build_graph_diff as _bgd
+            except Exception:
+                return {"terminal_reason": "implement_derive_unavailable"}
+            derive = _bgd.derive
+
+        verdict = derive(deps.workspace)
+        if not isinstance(verdict, dict) or not verdict.get("ok"):
+            reason = (verdict or {}).get("reason") if isinstance(verdict, dict) else None
+            return {"terminal_reason": reason or "graph_no_diff_source:unknown"}
+
+        # changed_files lives on Deps, NOT in state, so this is a Deps mutation
+        # and is easy to miss. Without it the next cheap_gate builds its D5.5
+        # synthetic check specs over the PRE-implement file list.
+        deps.changed_files = list(verdict.get("changed_files") or [])
+        update["diff"] = verdict["diff"]
+        update["diff_files"] = verdict["diff_files"]
+        update["diff_added_lines"] = verdict["diff_added_lines"]
+        return guard(update, state)
+
+    _node.__name__ = "implement"
     return _node
 
 
@@ -497,6 +651,28 @@ def node_human(state):
 # --------------------------------------------------------------------------
 # prompts + objection extraction
 # --------------------------------------------------------------------------
+
+def build_implement_goal(state, workspace: str) -> str:
+    """The child's goal. NAMES THE WORKTREE -- see make_implement's docstring.
+
+    No commit, no push, no history rewrite: build_graph_diff.derive() computes
+    the card's work product as a diff against the merge-base, and its ONE
+    mutating command is pinned to `git add -A -N` (record intent, stage no
+    content). A child that committed would move HEAD out from under that.
+    """
+    return ("Implement component %r of card %s.\n\n"
+            "Work in this directory and nowhere else:\n  %s\n\n"
+            "Make the change on disk. Do NOT commit, push, create branches, or "
+            "otherwise alter git history -- the harness derives the diff "
+            "itself.\n\nPLAN:\n%s\n"
+            % (state["component"], state["card_id"], workspace, state["plan"]))
+
+
+def build_implement_context(state):
+    """Optional context. Returns None rather than an empty string when there is
+    no directive, so the child's prompt carries no empty section."""
+    return state.get("directive") or None
+
 
 def build_review_prompt(state) -> str:
     return ("Review the following change for component %r of card %s.\n\n"
@@ -660,9 +836,25 @@ def build(deps: Deps, *, checkpointer=None):
     _add("human", node_human)
 
     # Unbuilt: wired, honest, terminal-to-human.
-    for name in ("plan", "plan_review", "implement", "local_review"):
+    for name in ("plan", "plan_review", "local_review"):
         _add(name, unbuilt(name))
         g.add_edge(name, "human")
+
+    # CD-041: `implement` is BUILT. Its OUTBOUND edge is the design section 1
+    # edge (implement -> cheap_gate). Its INBOUND edge is DELIBERATELY ABSENT:
+    # START goes to cheap_gate, and the only router that could name this node
+    # is route_after_gate, whose path_map does not contain it and whose four
+    # arbiter values are pass / escalate / over_cap / no_arbiter. So the node
+    # is unreachable from START and this CD is INERT IN PRODUCTION -- a
+    # property of the compiled graph, asserted by the driver rather than
+    # claimed here.
+    #
+    # The outbound edge is cheap_gate rather than human because whether
+    # langgraph compiles a node with NO outgoing edge is not something this CD
+    # needs to find out by guessing. Giving it the edge it will keep removes
+    # the question and leaves the rewire as inbound-side work only.
+    _add("implement", make_implement(deps))
+    g.add_edge("implement", "cheap_gate")
 
     g.add_edge(START, "cheap_gate")
 
@@ -705,6 +897,7 @@ def build(deps: Deps, *, checkpointer=None):
 def run(conn, task_id, workspace, *, body="", component="main", plan="", diff="",
         diff_files=0, diff_added_lines=0, changed_files=None,
         directive=None, deps=None, thread_id=None, recursion_limit=40,
+        agent=None,
         checkpoint="memory", resume=False):
     """Entry point (fork ruling 1: worker-side, offline-testable).
 
@@ -744,6 +937,10 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
     """
     deps = deps or Deps(conn=conn, task_id=task_id, workspace=workspace, body=body)
     deps.conn, deps.task_id, deps.workspace, deps.body = conn, task_id, workspace, body
+    # CD-041: default None, so every existing caller -- cli.py included --
+    # is byte-for-byte unaffected. Only an explicit agent= populates it.
+    if agent is not None:
+        deps.agent = agent
     deps.changed_files = list(changed_files or [])
     if deps.gate is None or deps.arbiter is None or deps.parse_ac is None:
         deps.resolve_real()
