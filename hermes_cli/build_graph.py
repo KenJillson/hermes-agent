@@ -99,13 +99,35 @@ LADDER = ("rung1", "rung2", "rung3")
 # deviation from section 2.1 rather than left as an accident.
 GATE_PASS_TARGET = "cloud_review"
 
-# CD-041: the closed status vocabulary a delegate_task per-task result can
-# carry, read at source from tools/delegate_tool.py. A status outside this
-# set is NOT treated as a failure of a known kind -- it parks as
-# implement_unknown_status, because an unrecognised status means the
-# contract moved and guessing which way it moved is how a wrong answer
-# becomes a silent one.
-IMPLEMENT_STATUSES = ("ok", "error", "timeout", "failed")
+# CD-041a CORRECTION. CD-041 shipped ("ok", "error", "timeout", "failed").
+# THAT SET WAS WRONG IN BOTH DIRECTIONS and the node could never succeed:
+# "ok" is NEVER a task status, and "completed" -- the SUCCESS value -- was
+# absent, so every successful child parked as implement_unknown_status.
+# "interrupted" was missing too. It failed closed, which is why nothing
+# broke visibly; it was simply inert.
+#
+# The error was reading a grep instead of the assignment site. "ok" appears
+# at delegate_tool.py:2360 inside result_meta for TOOL_TRACE entries -- a
+# per-tool-call status, not the task status. The two dict families are
+# told apart by a sibling key: a per-task result carries "task_index" and
+# a tool_trace entry does not.
+#
+# DERIVED BY AST from the two functions that actually produce task results
+# (_run_single_child, _execute_and_aggregate), not transcribed:
+#   status = "..."   -> interrupted / completed / failed   (2324/2329/2331)
+#   dict literals    -> timeout / error                    (2279/2532/3040/3052/3077)
+# `unknown` is excluded deliberately: it lives only in
+# _subagent_stop_tool_call_history, which is tool_trace, not a task result.
+#
+# The driver now RE-DERIVES this set from the installed delegate_tool.py by
+# AST and asserts equality, so this constant can never again be a claim
+# about the contract rather than a reading of it.
+IMPLEMENT_STATUSES = ("completed", "failed", "interrupted", "timeout", "error")
+
+# The ONE value that means the child did the work. summary present, not
+# interrupted, and not the "(empty)" sentinel run_agent.py emits when it
+# gives up after repeated empty-LLM-response retries.
+IMPLEMENT_OK = "completed"
 
 # model-call staged exit codes, from lib/model_call/cli.py (read 2026-08-18).
 RC_OK = 0
@@ -467,7 +489,7 @@ def make_implement(deps: Deps):
         status = first.get("status")
         if status not in IMPLEMENT_STATUSES:
             return {"terminal_reason": "implement_unknown_status"}
-        if status != "ok":
+        if status != IMPLEMENT_OK:
             return {"terminal_reason": "implement_%s" % status}
 
         model = first.get("model")
