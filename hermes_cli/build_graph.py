@@ -11,7 +11,8 @@ primitive has been READ AT SOURCE this session:
             classify_failure, fix_rung1, fix_rung2 (all model-call), assemble,
             human, and fix_rung3 as an auth-deferred node (section 8 deferral 6)
   unbuilt   plan, plan_review, local_review
-  CD-041    implement -- BUILT, but with NO INBOUND EDGE. See build().
+  CD-042    implement -- BUILT AND REACHABLE. START routes to it when the
+            card has no work product yet; see route_entry().
 
 The line is not arbitrary. `plan` and `local_review` wrap `delegate_task`
 and fix_rung3's real body wraps `terminal()`. CD-041 READ `delegate_task`
@@ -23,8 +24,20 @@ unread, and writing a node on an unread primitive would mean guessing a
 signature, which rule 1 forbids.
 
 The unbuilt nodes are present in the topology with their edges wired.
-`implement` deliberately is NOT: it has its OUTBOUND edge and no inbound
-one, so it cannot be entered from START until the topology rewire.
+
+CD-042 REWIRED THE ENTRY. START is no longer a static edge to cheap_gate;
+it is a conditional edge that reads whether the card already HAS a work
+product. A card with a diff goes straight to cheap_gate, which is exactly
+the CD-033/034/035 path and is unchanged. A card with an EMPTY diff goes
+to `implement` first.
+
+That second branch is the point of the CD, and it is a SPEND REDUCTION
+rather than a new cost. Before it, a from-scratch card ran its AC checks
+against an unimplemented workspace, failed them, and the arbiter returned
+ESCALATE -- so `fix_rung1`, a METERED CLOUD CALL, was doing the
+implementing. Routing through `implement` puts a free local child in front
+of that. Measured claim, not a hope: verify it on the ledger after the
+first live card.
 
 AN UNBUILT NODE ROUTES TO `human`. IT DOES NOT RAISE.
 A raise inside a node kills the run, and under the in-memory checkpointer that
@@ -128,6 +141,22 @@ IMPLEMENT_STATUSES = ("completed", "failed", "interrupted", "timeout", "error")
 # interrupted, and not the "(empty)" sentinel run_agent.py emits when it
 # gives up after repeated empty-LLM-response retries.
 IMPLEMENT_OK = "completed"
+
+# CD-042: how many times `implement` may run for one card, ACROSS
+# DISPATCHES. Separate from RUNG_ATTEMPT_CAP, which governs the fix ladder
+# and does not apply here.
+#
+# Without a cap the loop is UNBOUNDED: a failed child leaves the diff
+# empty, so the next dispatch routes to `implement` again, forever. The
+# board's BLOCK_RECURRENCE_LIMIT breaker would eventually send the card to
+# triage, but that is a backstop for a misbehaving card, not a budget for
+# this node.
+#
+# The count lives in the EXISTING `rung_attempts` dict channel, so there is
+# NO SCHEMA CHANGE -- SCHEMA_VERSION stays 2 and every checkpoint written
+# since CD-032 still resumes. LADDER does not contain "implement", so
+# next_available_rung ignores the key and the fix ladder is unaffected.
+IMPLEMENT_ATTEMPT_CAP = 1
 
 # model-call staged exit codes, from lib/model_call/cli.py (read 2026-08-18).
 RC_OK = 0
@@ -461,6 +490,22 @@ def make_implement(deps: Deps):
                 # calls already paid for (CD-031 posture).
                 return {"terminal_reason": "implement_delegate_unavailable"}
 
+        # CD-042 THE ATTEMPT CAP, checked HERE rather than in route_entry so
+        # the refusal carries a REASON. A router cannot write state, so a cap
+        # enforced there would park the card as a bare "human_review" with
+        # nothing saying why. Entering the node to refuse costs nothing: no
+        # child, no subprocess, no dollars.
+        if state["rung_attempts"].get("implement", 0) >= IMPLEMENT_ATTEMPT_CAP:
+            return {"terminal_reason": "implement_attempt_cap"}
+
+        # Bumped BEFORE the call, so the attempt counts even if the child never
+        # returns cleanly. EVERY return below carries it -- an attempt that is
+        # not recorded is an attempt that repeats forever.
+        attempts = bump_rung(state, "implement")
+
+        def _park(reason):
+            return {"terminal_reason": reason, "rung_attempts": attempts}
+
         raw = delegate(
             goal=build_implement_goal(state, deps.workspace),
             context=build_implement_context(state),
@@ -474,39 +519,40 @@ def make_implement(deps: Deps):
         except ValueError:
             payload = None
         if not isinstance(payload, dict):
-            return {"terminal_reason": "implement_unparseable"}
+            return _park("implement_unparseable")
 
         # A REFUSAL IS ALSO VALID JSON. tool_error() returns
         # {"error": "..."} with NO `results` key, so "it parsed" is not "it
         # ran". The absence of `results` is the discriminator.
         results = payload.get("results")
         if not isinstance(results, list):
-            return {"terminal_reason": "implement_refused"}
+            return _park("implement_refused")
         if not results or not isinstance(results[0], dict):
-            return {"terminal_reason": "implement_no_result"}
+            return _park("implement_no_result")
 
         first = results[0]
         status = first.get("status")
         if status not in IMPLEMENT_STATUSES:
-            return {"terminal_reason": "implement_unknown_status"}
+            return _park("implement_unknown_status")
         if status != IMPLEMENT_OK:
-            return {"terminal_reason": "implement_%s" % status}
+            return _park("implement_%s" % status)
 
         model = first.get("model")
-        update = {"implementer_model": model if isinstance(model, str) else None}
+        update = {"implementer_model": model if isinstance(model, str) else None,
+                  "rung_attempts": attempts}
 
         derive = deps.derive
         if derive is None:
             try:
                 from hermes_cli import build_graph_diff as _bgd
             except Exception:
-                return {"terminal_reason": "implement_derive_unavailable"}
+                return _park("implement_derive_unavailable")
             derive = _bgd.derive
 
         verdict = derive(deps.workspace)
         if not isinstance(verdict, dict) or not verdict.get("ok"):
             reason = (verdict or {}).get("reason") if isinstance(verdict, dict) else None
-            return {"terminal_reason": reason or "graph_no_diff_source:unknown"}
+            return _park(reason or "graph_no_diff_source:unknown")
 
         # changed_files lives on Deps, NOT in state, so this is a Deps mutation
         # and is easy to miss. Without it the next cheap_gate builds its D5.5
@@ -800,6 +846,47 @@ def route_after_classify(state):
     return "fix_rung2" if rung_available(state, "rung2") else "human"
 
 
+def route_entry(state):
+    """START. CD-042: does this card already HAVE a work product?
+
+    THE PREDICATE IS THE DIFF, AND IT IS A PROXY -- say so rather than pretend
+    otherwise. "diff is empty" is not identical to "nothing has been built". A
+    card whose change already exists upstream routes to `implement` and asks a
+    child to build something already built; the child no-ops, the diff stays
+    empty, and the attempt cap bounds it. That is the accepted cost of a
+    predicate that is cheap, has no schema footprint, and is correct on the two
+    cases that matter:
+
+      * A FRESH card has no diff -> implement. Before CD-042 this card ran its
+        AC checks against an unimplemented workspace, failed, and the arbiter
+        escalated to fix_rung1 -- a METERED CLOUD CALL doing the implementing.
+      * A RESUMED card HAS a diff, because run() re-derives it from the
+        worktree and passes it in the partial input. So it re-enters at
+        cheap_gate and does NOT re-implement. Resume correctness falls out of
+        the predicate rather than needing its own flag.
+
+    The CD-033/034/035 path -- a card created to review an EXISTING change --
+    is byte-for-byte unchanged: non-empty diff, straight to cheap_gate.
+    """
+    if state.get("terminal_reason"):
+        return "human"
+    if (state.get("diff") or "").strip():
+        return "cheap_gate"
+    return "implement"
+
+
+def route_after_implement(state):
+    """Post-implement. Same shape as route_after_fix.
+
+    Replaces CD-041's STATIC implement -> cheap_gate edge. A static edge would
+    run cheap_gate even when implement had already parked the card, executing
+    the AC checks for nothing before route_after_gate sent it to `human`.
+    """
+    if state.get("terminal_reason"):
+        return "human"
+    return "cheap_gate"
+
+
 def route_after_fix(state):
     """Post-fix verification, or `human` when the ladder is spent."""
     if state.get("terminal_reason"):
@@ -876,9 +963,17 @@ def build(deps: Deps, *, checkpointer=None):
     # needs to find out by guessing. Giving it the edge it will keep removes
     # the question and leaves the rewire as inbound-side work only.
     _add("implement", make_implement(deps))
-    g.add_edge("implement", "cheap_gate")
+    _cond("implement", route_after_implement,
+          {"cheap_gate": "cheap_gate", "human": "human"})
 
-    g.add_edge(START, "cheap_gate")
+    # CD-042: conditional entry. NOTE FOR ANY FUTURE TOPOLOGY ASSERTION --
+    # a START branch registers under builder.branches["__start__"] and does
+    # NOT appear in builder.edges. An assertion that looks only at
+    # builder.edges will report START as unwired. Verified against
+    # langgraph 1.2.10.
+    _cond(START, route_entry,
+          {"implement": "implement", "cheap_gate": "cheap_gate",
+           "human": "human"})
 
     _cond(
         "cheap_gate", lambda s: route_after_gate(s, deps),
