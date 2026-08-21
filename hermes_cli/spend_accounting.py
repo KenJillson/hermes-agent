@@ -141,9 +141,18 @@ def arbiter_decision(conn, task_id, gate_summary, *, ledger_lines=None,
     """Return (decision, reason) from the board AC-gate summary + the spend-gate.
     Mapping (design sec 2): all_pass->PASS; exception->ESCALATE (under cap) or
     OVER_CAP (at/over cap); needs_human/no_checks/no_workspace/unknown->NO_ARBITER.
-    OBSERVE-path best-effort: a ledger-read failure degrades to ESCALATE with
-    spend_unknown rather than claiming over-cap (B2 fails closed at the real spend
-    seam)."""
+    A ledger-read failure FAILS CLOSED (RULED 2026-08-21): it returns
+    OVER_CAP with a spend_unknown reason, which route_after_gate sends to
+    `human`. An unreadable ledger means the cap CANNOT BE ENFORCED, and the
+    ledger is read over ssh to coder@10.10.40.2, so transport failure is a
+    routine event rather than an exotic one.
+
+    The previous behaviour returned ESCALATE, which reaches fix_rung1 and
+    SPENDS -- the failure of the control that exists to prevent spending was
+    itself a decision to spend. Its stated justification, that "B2 fails
+    closed at the real spend seam", is UNSUPPORTED: over_spend_cap has
+    exactly one call site (this function), resolved_cap only one (that), and
+    nothing downstream reads the cap. Measured 2026-08-20."""
     verdict = (gate_summary or {}).get("verdict")
     if verdict == "all_pass":
         return PASS, "all_pass"
@@ -153,7 +162,7 @@ def arbiter_decision(conn, task_id, gate_summary, *, ledger_lines=None,
         over = over_spend_cap(conn, task_id, ledger_lines=ledger_lines,
                               ledger_file=ledger_file)
     except Exception as e:
-        return ESCALATE, "ac_failure;spend_unknown:%s" % type(e).__name__
+        return OVER_CAP, "ac_failure;spend_unknown:%s" % type(e).__name__
     if over:
         return OVER_CAP, "ac_failure;over_cap"
     return ESCALATE, "ac_failure;under_cap"
