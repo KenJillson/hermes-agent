@@ -371,7 +371,7 @@ class Deps:
     """
 
     def __init__(self, *, gate=None, arbiter=None, model=None, parse_ac=None,
-                 agent=None, delegate=None, derive=None,
+                 agent=None, delegate=None, derive=None, over_cap=None,
                  conn=None, task_id="", workspace="", body="",
                  changed_files=None):
         self.gate = gate
@@ -401,6 +401,11 @@ class Deps:
         self.agent = agent
         self.delegate = delegate
         self.derive = derive
+        # CD-045: the per-card dollar ceiling predicate. Same seam shape and
+        # same reason as the two above -- bound LAZILY inside the gate helper
+        # so that resolve_real() never makes importing this module require a
+        # live ledger, an ssh path, or a board connection.
+        self.over_cap = over_cap
 
     def resolve_real(self):
         """Bind the real primitives. Called only when defaults are needed, so
@@ -615,12 +620,64 @@ def make_cheap_gate(deps: Deps):
     return _node
 
 
+def spend_gate(deps: Deps, state):
+    """CD-045. Consult the per-card dollar ceiling BEFORE a metered call.
+
+    Returns a terminal update when the card must not spend, else None.
+
+    WHY IN THE NODE AND NOT AT A ROUTER. A router cannot write state, so a
+    refusal enforced there parks the card as a bare human_review with nothing
+    saying why. CD-042 already ruled this exact trade for the implement cap:
+    entering the node to refuse costs nothing -- no call, no subprocess, no
+    dollars -- and the refusal carries a REASON.
+
+    WHY NOT arbiter_decision. That primitive is AC-VERDICT-SHAPED: it reads
+    gate_summary and returns PASS on `all_pass` BEFORE it ever consults the
+    ledger. Called mid-walk on a card that passed its gate it would return PASS
+    every time -- a check that structurally CANNOT FIRE, and one that would
+    look correct in review. The ceiling predicate is called directly instead.
+
+    FAILS CLOSED, per the 2026-08-20 ruling. The ledger is read over ssh to
+    another host, so transport failure is routine rather than exotic, and an
+    unreadable ledger means the ceiling cannot be enforced. The failure of the
+    control that exists to prevent spending must not itself be a decision to
+    spend. The two refusals carry DIFFERENT reasons because they mean different
+    things to whoever reads the parked card: one says the card is out of money,
+    the other says nobody knows.
+
+    THE FREE LOCAL LANE IS NOT GATED, and that asymmetry is the point. The
+    classify activity resolves to the local lane and costs nothing; gating it
+    would make a provably free path depend on an ssh to another host and, under
+    the rule above, park free cards on a transport failure. An AST assertion
+    over this module pins which call sites carry this gate and which do not.
+    """
+    cap = deps.over_cap
+    if cap is None:
+        try:
+            from hermes_cli import spend_accounting as _sa
+        except Exception:
+            return {"terminal_reason": "spend_cap_unavailable"}
+        cap = _sa.over_spend_cap
+    try:
+        blocked = cap(deps.conn, deps.task_id)
+    except Exception as exc:
+        return {"terminal_reason": "spend_unknown:%s" % type(exc).__name__}
+    if blocked:
+        return {"terminal_reason": "over_spend_cap"}
+    return None
+
+
 def make_cloud_review(deps: Deps, *, activity: str, node_name: str):
     """cloud_review / cloud_re_review. --mode read_only, no --cwd (note 2)."""
 
     def _node(state):
         if state["cloud_review_calls"] >= CLOUD_REVIEW_CAP:
             return {"terminal_reason": "cloud_review_cap"}
+        # After the count cap deliberately: that check is free, this one costs
+        # a ledger read over ssh.
+        refusal = spend_gate(deps, state)
+        if refusal:
+            return refusal
         prompt = build_review_prompt(state)
         out = deps.model(
             activity=activity, prompt=prompt, workspace=deps.workspace,
@@ -694,6 +751,9 @@ def make_fix(deps: Deps, *, rung: str, activity: str):
     """fix_rung1 / fix_rung2. --mode write, --cwd the worktree (note 2)."""
 
     def _node(state):
+        refusal = spend_gate(deps, state)
+        if refusal:
+            return refusal
         out = deps.model(
             activity=activity, prompt=build_fix_prompt(state),
             workspace=deps.workspace, card_id=state["card_id"],
