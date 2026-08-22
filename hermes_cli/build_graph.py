@@ -480,6 +480,24 @@ def make_implement(deps: Deps):
         if deps.agent is None:
             return {"terminal_reason": "implement_no_agent"}
 
+        # CD-044: FAIL CLOSED ON AN EMPTY SPECIFICATION.
+        #
+        # A child given no statement of intent does NOT no-op. Measured on
+        # t_6ea5ea7f 2026-08-21: given a worktree containing a two-line README,
+        # it wrote a Hello World main.py. That satisfies derive(), makes
+        # route_entry's diff predicate true, and routes an INVENTION onward as
+        # a legitimate work product -- on a card with a ## AC block, into the
+        # metered region, where it is paid for. A no-op would have parked
+        # visibly; this failed OPEN.
+        #
+        # Placed with the no-agent park above, and ABOVE the attempt cap,
+        # deliberately: this cannot succeed on retry -- the card body will not
+        # have grown -- so it must not consume an attempt. No child, no
+        # subprocess, no dollars.
+        spec = (deps.body or "").strip()
+        if not spec:
+            return {"terminal_reason": "implement_no_spec"}
+
         delegate = deps.delegate
         if delegate is None:
             try:
@@ -507,7 +525,7 @@ def make_implement(deps: Deps):
             return {"terminal_reason": reason, "rung_attempts": attempts}
 
         raw = delegate(
-            goal=build_implement_goal(state, deps.workspace),
+            goal=build_implement_goal(state, deps.workspace, spec),
             context=build_implement_context(state),
             role="leaf",
             background=False,
@@ -720,20 +738,47 @@ def node_human(state):
 # prompts + objection extraction
 # --------------------------------------------------------------------------
 
-def build_implement_goal(state, workspace: str) -> str:
+def build_implement_goal(state, workspace: str, spec: str) -> str:
     """The child's goal. NAMES THE WORKTREE -- see make_implement's docstring.
 
     No commit, no push, no history rewrite: build_graph_diff.derive() computes
     the card's work product as a diff against the merge-base, and its ONE
     mutating command is pinned to `git add -A -N` (record intent, stage no
     content). A child that committed would move HEAD out from under that.
+
+    CD-044: `spec` IS THE CARD BODY, carried on Deps by the caller. It is NOT
+    the `plan` channel, and the four reasons are worth keeping because the
+    obvious fix is the other one:
+
+      * PROVENANCE. `plan` is the (unbuilt) `plan` node's output slot -- this
+        module's own docstring lists it under `unbuilt`. Filling it from the
+        card body destroys the ability to tell "no plan node ran" from "a plan
+        node ran and produced this", permanently, in checkpointed state.
+      * COUPLING THROUGH A PAID PROMPT. build_review_prompt reads that same
+        channel. Routing the body through it would mean every future change to
+        what the FREE implementer sees silently changes what a METERED reviewer
+        is sent.
+      * THE RESUME CLOBBER. run()'s resume partial input NAMES that channel,
+        and cli.py always passes "". A terminal-thread resume merges named
+        channels over the restored ones, so a plan threaded at the call site is
+        erased on the second dispatch. The card body on Deps is re-set from the
+        live card row on every run() call and is never checkpointed, so it
+        cannot have that failure.
+      * CHECKPOINT BYTES. `plan` is a checkpointed channel and card bodies are
+        unbounded operator text. CD-043 was a checkpointed channel compounding
+        past MAX_DIFF_BYTES; run() already has a CheckpointTooLarge park.
+
+    THIS IS THE INTERIM CONTRACT, NOT THE END STATE. The card body is a
+    specification, not a plan. When the `plan` node is built it slots ABOVE
+    this and the body becomes the fallback. Said here so a future session
+    does not discover the layering by surprise.
     """
     return ("Implement component %r of card %s.\n\n"
             "Work in this directory and nowhere else:\n  %s\n\n"
             "Make the change on disk. Do NOT commit, push, create branches, or "
             "otherwise alter git history -- the harness derives the diff "
-            "itself.\n\nPLAN:\n%s\n"
-            % (state["component"], state["card_id"], workspace, state["plan"]))
+            "itself.\n\nSPECIFICATION:\n%s\n"
+            % (state["component"], state["card_id"], workspace, spec))
 
 
 def build_implement_context(state):
