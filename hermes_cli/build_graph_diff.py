@@ -96,6 +96,41 @@ from typing import Callable, Optional
 # Anchored in build_graph_checkpoint.py; see the docstring for the arithmetic.
 MAX_DIFF_BYTES = 64 * 1024
 
+# CD-043. The workspace checkpointer writes <workspace>/.graph-checkpoints/
+# INSIDE the card's git worktree (build_graph_checkpoint.checkpoint_root), so
+# `add -A -N` + `diff` capture the harness's OWN envelope as the card's work
+# product. MEASURED on t_6ea5ea7f 2026-08-22: diff_len 16939 at derive time,
+# 79261 bytes three supersteps later -- already past MAX_DIFF_BYTES, because
+# the envelope carries the `diff` channel, so every checkpoint contains the
+# previous diff. It compounds; it does not merely add.
+#
+# Three consequences, all of them money: the card self-poisons at the size
+# ceiling; build_review_prompt pays a metered reviewer to read serialized
+# harness state instead of the change; and _numstat counts the envelope as a
+# FILE, so diff_files inflates and the `large_diff` selection signal promotes
+# the card to a more expensive model on the strength of an artifact.
+#
+# EXCLUDED AT DIFF TIME, NOT AT `add` TIME. _PINNED_ADD_ARGV pins the one
+# mutating command to exactly ("add", "-A", "-N"); `-N` records intent and
+# stages no content, so an excluded path never reaches the diff text, _numstat
+# or changed_files. Excluding at `add` would have required widening that pin --
+# the module docstring's standing lesson is to NARROW a guard, never loosen it.
+#
+# EXCLUDE-ONLY, NOT `-- . :(exclude)`. An exclude-only pathspec means
+# "everything except" and is cwd-INDEPENDENT. Prefixing `.` would scope the
+# diff to the cwd, and is_work_tree() is true in a SUBDIRECTORY -- so a
+# `dir:<path>` workspace inside a repo would silently rescope the diff from
+# the whole repo to that subtree. That is a behaviour change beyond this CD.
+# Verified against the box's git 2.34.1, with a typo'd-pathspec negative
+# control proving the assertion is not vacuous (a bad pathspec exits rc=0 and
+# excludes nothing).
+#
+# The NAME is owned by build_graph_checkpoint.CHECKPOINT_DIRNAME. It is NOT
+# imported: that module imports langgraph, and this one is deliberately
+# runnable without it. The driver asserts the two agree by importing both.
+CHECKPOINT_DIRNAME = ".graph-checkpoints"
+_EXCLUDE_CHECKPOINTS = ":(exclude,top)%s" % CHECKPOINT_DIRNAME
+
 # Per-git-command wall clock. A diff is local work on a small tree; a command
 # that takes longer than this is wedged, not slow, and a wedged git under a
 # worker would burn the card's whole runtime budget silently.
@@ -356,7 +391,7 @@ def derive(workspace: str, *, runner=None) -> dict:
         return _park("graph_no_diff_source:intent_to_add_failed")
 
     try:
-        p = _git(workspace, ["diff", "--numstat", base], runner=runner)
+        p = _git(workspace, ["diff", "--numstat", base, "--", _EXCLUDE_CHECKPOINTS], runner=runner)
     except (OSError, subprocess.SubprocessError) as exc:
         return _park("graph_no_diff_source:numstat_error:%s" % type(exc).__name__)
     if p.returncode != 0:
@@ -364,7 +399,7 @@ def derive(workspace: str, *, runner=None) -> dict:
     files, added = _numstat(p.stdout or "")
 
     try:
-        p = _git(workspace, ["diff", base], runner=runner)
+        p = _git(workspace, ["diff", base, "--", _EXCLUDE_CHECKPOINTS], runner=runner)
     except (OSError, subprocess.SubprocessError) as exc:
         return _park("graph_no_diff_source:diff_error:%s" % type(exc).__name__)
     if p.returncode != 0:
@@ -377,7 +412,7 @@ def derive(workspace: str, *, runner=None) -> dict:
     # Rename detection reports the DESTINATION path, so a moved file is covered.
     changed = []
     try:
-        q = _git(workspace, ["diff", "--name-only", "-z", base], runner=runner)
+        q = _git(workspace, ["diff", "--name-only", "-z", base, "--", _EXCLUDE_CHECKPOINTS], runner=runner)
         if q.returncode == 0:
             changed = [x for x in (q.stdout or "").split("\0") if x]
     except (OSError, subprocess.SubprocessError):
