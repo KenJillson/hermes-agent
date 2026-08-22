@@ -96,6 +96,27 @@ from typing import Callable, Optional
 # Anchored in build_graph_checkpoint.py; see the docstring for the arithmetic.
 MAX_DIFF_BYTES = 64 * 1024
 
+# CD-046. THE ONE VERDICT BELOW THAT IS NOT A FAILURE.
+#
+# derive() reports eight failure reasons. Seven mean the harness cannot SEE the
+# worktree -- no repo, no default ref, no merge-base, a failed add/numstat/diff,
+# or a diff over the ceiling. This one means the worktree is fine and nothing
+# has been built yet, which since CD-042 is the graph's ENTRY condition rather
+# than a fault: route_entry sends an empty diff to the implementer node.
+#
+# `ok` STAYS FALSE for it, deliberately. `ok` means "there is a work product"
+# and there is not one -- make_implement calls this same derive() AFTER its
+# child runs, to decide whether the child did anything. Widening `ok` here
+# would make a child that did nothing indistinguishable from one that worked,
+# which is CD-044's fail-open rebuilt one function to the left. What CD-046
+# changes is what the CALLER does with the verdict, never the verdict.
+#
+# It is NAMED because the dispatcher has to tell it apart from the other seven,
+# and a bare string literal compared across two modules is the CD-036/037
+# marker defect waiting to happen: a value edited on one side can then never
+# match the other, and the gate refuses everything while looking correct.
+EMPTY_DIFF_REASON = "graph_no_work_product:empty_diff"
+
 # CD-043. The workspace checkpointer writes <workspace>/.graph-checkpoints/
 # INSIDE the card's git worktree (build_graph_checkpoint.checkpoint_root), so
 # `add -A -N` + `diff` capture the harness's OWN envelope as the card's work
@@ -430,10 +451,12 @@ def derive(workspace: str, *, runner=None) -> dict:
                      diff_bytes=nbytes, base=base, base_ref=ref, base_how=how)
 
     if not text.strip():
-        # An empty diff is the CD-034 spend hazard by another route: the card
-        # has a `## AC` block, so cheap_gate can reach a priced node, and there
-        # is nothing to review. Park rather than buy a review of nothing.
-        return _park("graph_no_work_product:empty_diff",
+        # CD-034 parked here because an empty diff would have bought a cloud
+        # review of nothing. CD-042 put a free local child in front of that,
+        # and CD-046 lets the caller act on the distinction. The verdict itself
+        # is unchanged -- see the named constant at the top of this module for
+        # why it must stay a non-ok result.
+        return _park(EMPTY_DIFF_REASON,
                      base=base, base_ref=ref, base_how=how)
 
     return {"ok": True, "reason": None, "diff": text, "diff_files": files,

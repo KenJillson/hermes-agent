@@ -17972,10 +17972,33 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
             else:
                 from hermes_cli import build_graph_diff as _bgd
 
+                # CD-046. THE EXEMPTION, AND WHY IT IS EXACTLY ONE REASON.
+                #
+                # Seven of derive()'s eight failure reasons mean the harness
+                # cannot see the worktree; they still park here, unchanged. The
+                # eighth means the worktree is fine and nothing has been built
+                # yet -- which since CD-042 is the graph's entry condition, not
+                # a fault. Parking all eight identically meant the ONE
+                # population CD-042 was built for, a from-scratch card WITH a
+                # parseable `## AC` block, never reached the graph at all: the
+                # implementer node and an all_pass gate verdict were MUTUALLY
+                # EXCLUSIVE in production and nothing said so. Measured
+                # 2026-08-22 -- probe 1 reached the implementer node only
+                # because it deliberately carried no `## AC` block.
+                #
+                # THE CD-034/035 GUARANTEE SURVIVES, structurally rather than
+                # by refusing to start. route_entry sends an empty diff to the
+                # implementer, which re-derives the diff itself before the
+                # cheap gate can see it and returns a terminal_reason on
+                # failure; route_after_implement short-circuits to `human` on
+                # that, so the gate is not entered on a parked card. No path
+                # reaches a priced node with an empty diff, and the implementer
+                # attempt cap -- counted in checkpointed state -- bounds
+                # re-dispatch.
                 verdict = _bgd.derive(workspace)
                 if verdict["ok"]:
                     derived = verdict
-                else:
+                elif verdict["reason"] != _bgd.EMPTY_DIFF_REASON:
                     reason = verdict["reason"]
 
         if reason is None:
