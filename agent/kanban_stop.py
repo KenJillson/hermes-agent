@@ -25,12 +25,39 @@ _DEFAULT_MAX_ATTEMPTS = 2
 def kanban_stop_nudge_enabled() -> bool:
     """Return whether the kanban stop-guard is active for this process.
 
-    On when ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), unless
-    ``HERMES_KANBAN_STOP_NUDGE`` explicitly disables it.
+    On when ``HERMES_KANBAN_TASK`` is set AND this is not a ``delegate_task``
+    child, unless ``HERMES_KANBAN_STOP_NUDGE`` explicitly disables it.
+
+    A delegated child runs in the SAME process as its parent worker, so the
+    parent's ``HERMES_KANBAN_TASK`` is visible to it and the env var alone
+    cannot tell them apart. It never could: this docstring previously said
+    "(dispatcher-spawned worker)" as though the variable carried lineage.
+    See docs/root-causes-v1.1.md RC-005.
+
+    The process-context predicate is used deliberately, not the ContextVar-only
+    one. Its env term is clearable by a child -- but doing so only re-enables
+    pressure ON ITSELF to call a tool it does not have. Nothing is authorized
+    on the far side of this predicate, so forgeability is not a property that
+    matters here. ``kanban_db._assert_not_delegated_child_mutation`` IS an
+    authorization site and must NOT borrow this reasoning.
+
+    The ``except`` below fails OPEN, reversing this codebase's usual posture,
+    and that is deliberate. Failing closed would let an unrelated import error
+    silently disable the stop-guard for every LEGITIMATE worker, which
+    reintroduces RC-002 (worker exits rc=0 -> dispatcher protocol_violation)
+    invisibly, because the guard that stopped running is the one that reports.
+    Fail closed on the side of the capability; here the capability is the nudge.
     """
     env = os.environ.get("HERMES_KANBAN_STOP_NUDGE")
     if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
         return False
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        if is_delegated_child_process_context():
+            return False
+    except Exception:
+        pass
     task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     return bool(task)
 
