@@ -19,8 +19,12 @@ import json
 import shlex
 import subprocess
 
-# Config default dollar ceiling. Author-UNREACHABLE: sourced only from the board
-# process environment (profile .env), never from a card body / ## AC / worker.
+# Config default dollar ceiling, read from the board process environment
+# (profile .env). A card body / ## AC cannot set it -- but that is a statement
+# about card authorship, NOT containment: this name is not in the set
+# scrub_kanban_env removes, so a delegated child's subprocess inherits it, and
+# any process holding a `terminal` tool can set it for a subprocess it spawns.
+# See docs/root-causes-v1.1.md RC-005 -- OPEN.
 _DEFAULT_CAP_ENV = "HERMES_KANBAN_MAX_CARD_SPEND"
 _DEFAULT_CAP_USD = 5.0
 
@@ -94,8 +98,8 @@ def card_cloud_spend_usd(task_id, *, ledger_lines=None, ledger_file=None):
 def resolved_cap(conn, task_id):
     """Effective dollar ceiling: the per-card override (tasks.max_card_spend_usd,
     written only by the Ken-only `set-spend-cap` verb) if set, else the config
-    default. Author-unreachable by construction. Missing column (pre-migration) or
-    unknown id -> default."""
+    default. On the reach of that default see the note at _DEFAULT_CAP_ENV.
+    Missing column (pre-migration) or unknown id -> default."""
     try:
         row = conn.execute(
             "SELECT max_card_spend_usd FROM tasks WHERE id = ?", (task_id,)

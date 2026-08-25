@@ -165,13 +165,22 @@ KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 def _assert_not_delegated_child_mutation() -> None:
     """Reject Kanban state mutations from ``delegate_task`` child contexts.
 
-    The structured kanban tools and CLI dispatch layer both have fast-fail
-    guards for better UX, but neither is a trust boundary: a delegated child can
-    still shell out to the CLI or import this module directly. The actual
-    invariant belongs at the DB/filesystem mutation layer so every public
-    mutator that uses ``write_txn`` (tasks, runs, comments, attachments,
-    dispatcher claims, repair events, subscriptions, GC, etc.) and every board
-    metadata mutator fails closed before touching durable state.
+    Placed at the DB/filesystem mutation layer so that every public mutator
+    using ``write_txn`` (tasks, runs, comments, attachments, dispatcher claims,
+    repair events, subscriptions, GC, etc.) and every board metadata mutator
+    refuses in ONE place rather than once per tool. That placement is about
+    coverage, not containment.
+
+    NOT A TRUST BOUNDARY -- and neither are the tool-layer and CLI-dispatch
+    guards. All three resolve "is this a delegated child?" from process state
+    the child itself controls: the ContextVar is always False in a subprocess,
+    so the predicate reduces to an environment marker chosen by whoever spawns
+    the process, and anything holding a ``terminal`` tool can spawn one without
+    it. Treat this as a fast-fail guard that produces a clear error at the
+    widest seam, not as the invariant. Containment requires an ambient,
+    process-level boundary that does not exist yet.
+
+    See docs/root-causes-v1.1.md RC-005 -- OPEN.
     """
     try:
         from agent.delegation_context import is_delegated_child_process_context
