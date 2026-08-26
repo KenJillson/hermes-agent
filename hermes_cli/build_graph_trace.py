@@ -51,6 +51,25 @@ IDENTITY function -- ``build()`` then registers exactly the callables it
 registers today, byte-for-byte the same objects. Not "a tracer that writes
 nothing": no wrapper at all. That is what makes the kill switch trustworthy.
 
+AC-4 -- THE MEMORY-LEAK WATCH (CD-049)
+--------------------------------------
+Phase 5 acceptance criterion 4 is "a long-running graph does not accumulate
+unreleased state". It had no owner from the day the plan was written. It lives
+here rather than in its own harness because this module already brackets every
+superstep, already has a kill switch, already has a payload guard and already
+has a writer; a second mechanism observing the same boundaries would need all
+four again.
+
+Every emitted line carries ``rss_kb`` and ``blocks`` (absolute) plus
+``rss_delta_kb`` and ``blocks_delta`` (from the invocation baseline), and the
+summary line carries the start/end/peak envelope with ``nodes_traced`` as the
+denominator. ``blocks`` is ``sys.getallocatedblocks()``, which FALLS when
+memory is released -- ``ru_maxrss`` is a high-water mark and cannot report the
+healthy case, so it is not used.
+
+A COUNT IS NOT PAYLOAD, and these are counts. The allowlist argument above is
+unchanged by them.
+
 Standard library only, plus the same OPTIONAL late import of
 hermes_cli.kanban_db for the board logs dir that build_graph_eval uses.
 """
@@ -59,11 +78,12 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from typing import Any, Callable, Optional
 
 # Bump when the FIELD SET changes, same contract as build_graph_eval's.
-TRACE_SCHEMA_VERSION = 1
+TRACE_SCHEMA_VERSION = 2
 
 LOG_FILENAME = "graph-trace.jsonl"
 
@@ -113,6 +133,47 @@ _GATE_FIELDS = ("verdict", "checks_total", "checks_passed", "checks_failed",
 # are NOT here: text is model output and rationale can quote it.
 _MODEL_FIELDS = ("ok", "lane", "model", "activity", "task_class", "run_id",
                  "cost_usd", "rejected")
+
+
+# ---------------------------------------------------------------------------
+# AC-4 -- the memory-leak watch (CD-049).
+#
+# Phase 5 acceptance criterion 4: "a long-running graph does not accumulate
+# unreleased state (a documented LangGraph production failure mode)". Two cheap
+# samples, taken where the spans already are.
+#
+# `blocks` is the load-bearing one. sys.getallocatedblocks() counts LIVE
+# allocated blocks, so it FALLS when memory is released -- unlike ru_maxrss,
+# which is a high-water mark and therefore cannot report the healthy case at
+# all. rss_kb is the footprint the box actually feels.
+#
+# NEVER RAISES. Same posture as _emit: a watcher that can break the card's path
+# is a worse defect than the leak it looks for.
+# ---------------------------------------------------------------------------
+
+_PAGE_SIZE = None
+
+
+def _rss_kb():
+    """Resident set size in KiB from /proc/self/statm, or None off Linux."""
+    global _PAGE_SIZE
+    try:
+        if _PAGE_SIZE is None:
+            _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+        with open("/proc/self/statm", "r", encoding="ascii") as fh:
+            resident_pages = int(fh.read().split()[1])
+        return resident_pages * _PAGE_SIZE // 1024
+    except Exception:
+        return None
+
+
+def mem_sample():
+    """(rss_kb, blocks). Either may be None. NEVER raises."""
+    try:
+        blocks = sys.getallocatedblocks()
+    except Exception:
+        blocks = None
+    return _rss_kb(), blocks
 
 
 def enabled(env: Optional[dict] = None) -> bool:
@@ -207,6 +268,20 @@ class Tracer:
         # `sink` exists so the offline driver can capture lines without
         # touching a board logs directory. Production leaves it None.
         self._sink = sink
+        # AC-4 (CD-049). The invocation baseline every span deltas against,
+        # and the running peak. Deliberately a conditional EXPRESSION rather
+        # than an early return: CD-038e counts this module's enabled-guard
+        # early returns and expects FOUR, and this CD adds none. The kill
+        # switch's identity property is about what build() REGISTERS, and a
+        # baseline sample changes no registered object.
+        #
+        # That anchor greps SOURCE TEXT, so spelling the guard out in a
+        # comment would itself have moved the count. The first draft of this
+        # CD did exactly that and was refused by its own gate before it
+        # reached git -- a comment is not exempt from a grep.
+        self.nodes = 0
+        self.mem0 = mem_sample() if self.enabled else (None, None)
+        self.mem_peak_rss_kb = self.mem0[0]
 
     # -- emission -------------------------------------------------------
     def _emit(self, record: dict) -> None:
@@ -218,6 +293,7 @@ class Tracer:
             record["pid"] = self.pid
             record["thread_id"] = self.thread_id
             record["schema_version"] = TRACE_SCHEMA_VERSION
+            record.update(self._mem())
             line = json.dumps(record, sort_keys=True)
             if self._sink is not None:
                 self._sink(line)
@@ -233,12 +309,41 @@ class Tracer:
         except Exception:
             self.dropped += 1
 
+    def _mem(self) -> dict:
+        """Per-span memory fields: ABSOLUTE and DELTA, both, every line.
+
+        Absolute alone cannot show accumulation without the reader holding the
+        previous line. Delta alone hides the scale it accumulated from.
+        """
+        rss, blocks = mem_sample()
+        if rss is not None and (self.mem_peak_rss_kb is None
+                                or rss > self.mem_peak_rss_kb):
+            self.mem_peak_rss_kb = rss
+        out = {"rss_kb": rss, "blocks": blocks}
+        if rss is not None and self.mem0[0] is not None:
+            out["rss_delta_kb"] = rss - self.mem0[0]
+        if blocks is not None and self.mem0[1] is not None:
+            out["blocks_delta"] = blocks - self.mem0[1]
+        return out
+
     def summary(self) -> None:
-        """Final line. A dropped-line count makes silence unambiguous."""
+        """Final line. A dropped-line count makes silence unambiguous.
+
+        AC-4 (CD-049): also the invocation-level memory envelope. `nodes` is
+        the denominator -- growth per superstep is the quantity the criterion
+        is about, and a total with no superstep count cannot yield it.
+        """
         if not self.enabled:
             return
+        rss, blocks = mem_sample()
         self._emit({"event": "graph_trace_summary",
-                    "lines_written": self.written, "lines_dropped": self.dropped})
+                    "lines_written": self.written, "lines_dropped": self.dropped,
+                    "nodes_traced": self.nodes,
+                    "mem_rss_start_kb": self.mem0[0],
+                    "mem_rss_end_kb": rss,
+                    "mem_rss_peak_kb": self.mem_peak_rss_kb,
+                    "mem_blocks_start": self.mem0[1],
+                    "mem_blocks_end": blocks})
 
     # -- wrappers -------------------------------------------------------
     def node(self, name: str, fn: Callable) -> Callable:
@@ -247,6 +352,7 @@ class Tracer:
 
         def _wrapped(state):
             t0 = time.perf_counter()
+            self.nodes += 1
             try:
                 update = fn(state)
             except BaseException as exc:
