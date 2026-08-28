@@ -152,6 +152,43 @@ EMPTY_DIFF_REASON = "graph_no_work_product:empty_diff"
 CHECKPOINT_DIRNAME = ".graph-checkpoints"
 _EXCLUDE_CHECKPOINTS = ":(exclude,top)%s" % CHECKPOINT_DIRNAME
 
+# CD-050. THE SAME EXCLUSION, EXTENDED TO THE GATE'S OWN EXHAUST.
+#
+# CD-043 above excluded the checkpointer's envelope because the harness was
+# writing itself into the card's work product. These two are that defect one
+# iteration later, and they become live the moment a fix is applied and the
+# diff re-derived (CD-051):
+#
+#   ac-execution-<card>-<component>-<iteration>.json
+#       written into the workspace by make_cheap_gate, which also increments
+#       `iteration` -- so a second gate pass leaves TWO untracked records.
+#       Recorded as not-fixed in CD-036's own commit message.
+#   __pycache__/
+#       the AC sandbox binds the workspace READ-WRITE, so any authored check
+#       that imports the card's Python leaves bytecode beside it.
+#
+# THE .pyc IS NOT MERELY NOISE. tirith's control_chars rule fires on compiled
+# bytecode BY CONSTRUCTION -- it exists to catch terminal-escape smuggling in
+# pasted text. Measured 2026-08-26 on t_ae6332d7: a scan of the .pyc returned
+# rule_id control_chars at HIGH; the same card's .py returned findings []. So
+# a compiled artefact in the changed-file list is a GUARANTEED gate failure,
+# an arbiter escalation, and a metered fix call against a problem that does
+# not exist.
+#
+# GLOB MAGIC, AND THE ALTERNATIVES WERE MEASURED RATHER THAN REASONED ABOUT.
+# On git 2.34.1 (box) and 2.43.0, 2026-08-26: a top-anchored exclude misses a
+# nested pkg/__pycache__, and SO DOES a bare `:(exclude)__pycache__` -- the
+# directory name alone does not recurse. Only the glob form covers both.
+#
+# AND A MISSPELLED PATH IS SILENT. `:(exclude,glob)**/__pycache_/**` -- one
+# missing underscore -- exits 0 and excludes NOTHING, while a malformed MAGIC
+# (`:(exclood)`) exits 128 and is loud. The two typo classes do not behave the
+# same, so no exit-code check and no grep over this file can catch the
+# dangerous one. That is why the anchor for this CD is behavioural.
+_EXCLUDE_PYCACHE = ":(exclude,glob)**/__pycache__/**"
+_EXCLUDE_GATE_RECORDS = ":(exclude,glob)**/ac-execution-*.json"
+_DIFF_EXCLUDES = (_EXCLUDE_CHECKPOINTS, _EXCLUDE_PYCACHE, _EXCLUDE_GATE_RECORDS)
+
 # Per-git-command wall clock. A diff is local work on a small tree; a command
 # that takes longer than this is wedged, not slow, and a wedged git under a
 # worker would burn the card's whole runtime budget silently.
@@ -412,7 +449,7 @@ def derive(workspace: str, *, runner=None) -> dict:
         return _park("graph_no_diff_source:intent_to_add_failed")
 
     try:
-        p = _git(workspace, ["diff", "--numstat", base, "--", _EXCLUDE_CHECKPOINTS], runner=runner)
+        p = _git(workspace, ["diff", "--numstat", base, "--", *_DIFF_EXCLUDES], runner=runner)
     except (OSError, subprocess.SubprocessError) as exc:
         return _park("graph_no_diff_source:numstat_error:%s" % type(exc).__name__)
     if p.returncode != 0:
@@ -420,7 +457,7 @@ def derive(workspace: str, *, runner=None) -> dict:
     files, added = _numstat(p.stdout or "")
 
     try:
-        p = _git(workspace, ["diff", base, "--", _EXCLUDE_CHECKPOINTS], runner=runner)
+        p = _git(workspace, ["diff", base, "--", *_DIFF_EXCLUDES], runner=runner)
     except (OSError, subprocess.SubprocessError) as exc:
         return _park("graph_no_diff_source:diff_error:%s" % type(exc).__name__)
     if p.returncode != 0:
@@ -433,7 +470,7 @@ def derive(workspace: str, *, runner=None) -> dict:
     # Rename detection reports the DESTINATION path, so a moved file is covered.
     changed = []
     try:
-        q = _git(workspace, ["diff", "--name-only", "-z", base, "--", _EXCLUDE_CHECKPOINTS], runner=runner)
+        q = _git(workspace, ["diff", "--name-only", "-z", base, "--", *_DIFF_EXCLUDES], runner=runner)
         if q.returncode == 0:
             changed = [x for x in (q.stdout or "").split("\0") if x]
     except (OSError, subprocess.SubprocessError):
