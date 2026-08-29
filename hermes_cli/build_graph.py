@@ -1091,32 +1091,136 @@ def build_review_prompt(state) -> str:
             % (state["component"], state["card_id"], state["plan"], state["diff"]))
 
 
+MAX_FAILED_CHECKS_IN_PROMPT = 6
+MAX_CHECK_OUTPUT_CHARS = 800
+
+
+def failing_checks(state) -> list:
+    """The gate's FAILING check verdicts, or []. Never raises.
+
+    WHY THIS EXISTS -- MEASURED, NOT SUPPOSED. A fix rung reached from a gate
+    `exception` has NEVER seen a cloud review, and `make_cloud_review` is the
+    only thing that writes `objections_current`. graph-trace.jsonl seq 7,
+    card t_ae6332d7, 2026-08-26:
+
+        node fix_rung1  objections_current_len 0  objections_prior_len 0
+                        gate {verdict: exception, checks_failed: 2}
+
+    with the control on the same file, seq 15, t_52340522: objections
+    3 and 2 on a card that DID review. So the zero is real and not a missing
+    field. build_fix_prompt rendered `OBJECTIONS: []` and the rung was asked to
+    repair something it was never told about. CD-051 fixed how a fix RETURNS;
+    this is the same rung's INPUT.
+
+    WHY THE RECORD AND NOT state["gate_summary"]. The summary carries COUNTS
+    only -- checks_failed, checks_passed, verdict -- because `gate()` returns
+    `summary` and discards the per-check `verdicts` list. The detail lives in
+    the durable record `persist_execution` writes, whose path CD-A (CD-027) put
+    into state as `ac_record_path` precisely so per-iteration records do not
+    overwrite each other. Confirmed as a live state channel in the same trace
+    line above, not inferred.
+
+    NO SCHEMA CHANGE. Nothing new is written to state; this only READS a channel
+    that has existed since CD-027, so SCHEMA_VERSION stays 2.
+
+    FAILS SOFT, DELIBERATELY. A missing or malformed record must not park a card
+    that has a real diff and a real objection to fix -- the caller renders a
+    short "detail unavailable" note instead. Same posture as CD-036's
+    changed_files best-effort: losing the detail narrows the prompt, it does not
+    invalidate it.
+    """
+    path = state.get("ac_record_path")
+    if not isinstance(path, str) or not path:
+        return []
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(rec, dict):
+        return []
+    out = []
+    for v in (rec.get("verdicts") or []):
+        if not isinstance(v, dict):
+            continue
+        if v.get("kind") != "check":
+            continue
+        # 'failed' AND 'unrunnable' both drive the gate to `exception`
+        # (run_ac_checks sets the verdict on either), so both are things the
+        # fixer needs to see. An unrunnable check is usually a BROKEN check
+        # rather than broken code, and saying so is what lets the model decline
+        # to "fix" it instead of inventing a change.
+        if v.get("status") in ("failed", "unrunnable"):
+            out.append(v)
+    return out
+
+
+def render_failing_checks(verdicts) -> str:
+    """Render failing verdicts for the fix prompt. Pure; no I/O."""
+    if not verdicts:
+        return ""
+    shown = verdicts[:MAX_FAILED_CHECKS_IN_PROMPT]
+    lines = ["FAILING ACCEPTANCE CHECKS (from the gate that escalated this "
+             "card):"]
+    for v in shown:
+        tail = v.get("stdout_tail") or ""
+        if len(tail) > MAX_CHECK_OUTPUT_CHARS:
+            tail = tail[-MAX_CHECK_OUTPUT_CHARS:]
+        lines.append("")
+        lines.append("  check %s: %s" % (v.get("index"), v.get("status")))
+        lines.append("    command:   %s" % (v.get("command"),))
+        lines.append("    expected:  %s:%s" % (v.get("expect_kind"),
+                                               v.get("expect_value")))
+        lines.append("    exit code: %s" % (v.get("exit_code"),))
+        if v.get("run_error"):
+            lines.append("    run error: %s" % (v.get("run_error"),))
+        lines.append("    output:    %s" % (tail.strip() or "(none)",))
+    dropped = len(verdicts) - len(shown)
+    if dropped > 0:
+        # NEVER A SILENT CAP. CD-036's lesson: a gate that quietly stopped
+        # covering things reads as "covered everything" in the record.
+        lines.append("")
+        lines.append("  [%d further failing check(s) not shown]" % dropped)
+    return "\n".join(lines) + "\n"
+
+
 def build_fix_prompt(state) -> str:
-    """Objections + the diff, plus the response contract.
+    """Objections + the diff + the gate's failing checks, plus the contract.
 
-    CD-051 APPENDS THE RESPONSE CONTRACT HERE, IN THIS REPO, and the choice
-    was made against the obvious alternative. core.py appends its verdict
-    contract to every review prompt inside the primitive because -- its own
-    comment -- "five
+    THE RESPONSE CONTRACT LIVES HERE, IN THIS REPO, and the choice was made
+    against the obvious alternative. core.py appends its verdict contract to
+    every review prompt inside the primitive because -- its own comment -- "five
     live cards produced six verdict vocabularies ... worker prompt discipline
-    cannot pin the contract, so the primitive does". That argument is about
-    MANY authors writing prompts. This is ONE code-authored function, and the
-    parser that reads the response is twelve lines above it.
+    cannot pin the contract, so the primitive does". That argument is about MANY
+    authors writing prompts. This is ONE code-authored function, and the parser
+    that reads the response sits just above it. Decisively: the agent venv
+    CANNOT import model_call (CD-045 measured ModuleNotFoundError on the box,
+    and the sys.path workaround was rejected on CD-034 grounds), so a contract
+    in core.py with a parser here would put ONE format under TWO owners across a
+    subprocess boundary -- the CD-036/037 marker defect.
 
-    THE DECIDING FACT IS MEASURED, NOT stylistic: the agent venv CANNOT import
-    model_call. CD-045 recorded `import model_call.policy` raising
-    ModuleNotFoundError on the box, and the sys.path workaround was rejected on
-    CD-034 grounds. So a contract in core.py and a parser here would put ONE
-    format under TWO owners across a subprocess boundary -- the CD-036/037
-    marker defect, where a value edited on one side can never match the other
-    and the gate refuses everything while looking correct. Contract and parser
-    stay adjacent.
+    CD-052 ADDS THE FAILING CHECKS, AND THE REASON IS MEASURED. A rung reached
+    from a gate `exception` has never seen a cloud review, so
+    `objections_current` is EMPTY and this prompt used to say `OBJECTIONS: []`
+    and nothing else. graph-trace.jsonl seq 7 (t_ae6332d7, 2026-08-26):
+    objections_current_len 0 with gate verdict `exception`, checks_failed 2 --
+    against the control at seq 15 (t_52340522) showing 3 and 2 on a card that
+    DID review. The rung was being asked to repair something it was never told
+    about. CD-051 fixed how a fix RETURNS; this fixes what it is GIVEN.
+
+    KEYED ON THE RECORD HAVING FAILURES, NOT ON OBJECTIONS BEING EMPTY. Two
+    unrelated conditions should not be coupled: on the review route the gate
+    passed, so there are no failing verdicts and the section is naturally empty.
+    One rule, no hidden dependency between the two halves of the prompt.
     """
     return ("Address the following review objections for component %r.\n\n"
             "OBJECTIONS:\n%s\n\nDIFF:\n%s\n"
             % (state["component"],
                json.dumps(state["objections_current"], indent=2, sort_keys=True),
-               state["diff"])) + FIX_CONTRACT
+               state["diff"])) + render_failing_checks(
+                   failing_checks(state)) + FIX_CONTRACT
 
 
 def extract_objections(result: dict) -> list:
