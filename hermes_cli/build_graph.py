@@ -747,8 +747,210 @@ def make_classify_failure(deps: Deps):
     return _node
 
 
+FIX_CONTRACT = (
+    "\n\n=== RESPONSE CONTRACT (mandatory) ===\n"
+    "Do NOT edit any file yourself. You have no write access and no working "
+    "directory; the harness applies your answer on the machine that owns the "
+    "worktree.\n"
+    "Your FINAL message must be EXACTLY ONE JSON object and nothing else - no "
+    "prose before or after it.\n"
+    'The object MUST have a "files" key whose value is a NON-EMPTY array. '
+    "Each element MUST be an object with exactly two keys:\n"
+    '  "path"    - the file\'s path exactly as it appears in the DIFF above\n'
+    '  "content" - that file\'s COMPLETE new contents. NOT a patch, NOT an '
+    "excerpt, NOT an elision such as \"... unchanged ...\". The harness "
+    "replaces the whole file with this string.\n"
+    "Return ONLY the files you are changing. A path that does not appear in "
+    "the DIFF above is REFUSED and the card parks unfixed.\n")
+
+
+def _parse_fix(text):
+    """Extract the fix envelope from a model's free-form final message.
+
+    TWO CANDIDATES, deliberately: the whole stripped text, then the span from
+    the first '{' to the last '}'. The second covers a fenced ```json block
+    and any preamble the model adds, without needing `re`.
+
+    Fails closed: anything that is not a dict returns None, and the caller
+    parks. lib/model_call/core.py's _parse_verdict does the same job for
+    reviews; it is NOT reused because the agent venv cannot import model_call
+    (measured, CD-045: ModuleNotFoundError, and the sys.path workaround was
+    rejected on CD-034 grounds).
+    """
+    if not isinstance(text, str):
+        return None
+    cands = [text.strip()]
+    i, j = text.find("{"), text.rfind("}")
+    if 0 <= i < j:
+        cands.append(text[i:j + 1])
+    for c in cands:
+        if not c:
+            continue
+        try:
+            d = json.loads(c)
+        except ValueError:
+            continue
+        if isinstance(d, dict):
+            return d
+    return None
+
+
+def apply_fix(workspace, text, allowed):
+    """Apply a fix response to the card's worktree. Returns (written, reason).
+
+    `reason` is None on success and a CLOSED, CODE-AUTHORED terminal reason
+    otherwise. NEVER RAISES, and NO MODEL PAYLOAD EVER REACHES IT -- same
+    posture as make_implement, because terminal_reason goes to the board via
+    block_task(reason=...).
+
+    THIS IS THE GRAPH'S SECOND WRITE INTO THE CARD'S WORKTREE AND THE ONLY ONE
+    THAT WRITES FILE CONTENTS. build_graph_diff holds the first -- `git add -A
+    -N`, pinned by an AST guard to exactly that argv, with a docstring saying
+    the exception must stay one command wide rather than become a precedent.
+    This earns the same narrowness:
+
+      * A returned path must ALREADY BE IN THE CARD'S WORK PRODUCT (`allowed`
+        is deps.changed_files, which comes from derive()). A fix that wants to
+        create a NEW file is REFUSED and parks visibly. This rung exists to
+        address objections about the change under review; a cloud model that
+        can create arbitrary paths in a git worktree is a different capability
+        needing a different ruling.
+      * The realpath must stay inside the workspace, so a symlink already in
+        the work product cannot be used to write outside it.
+      * WHOLE FILES, never patches. A model-authored diff that does not apply
+        is an ambiguity, and ambiguity while holding a write bit means
+        guessing. A whole file is written or refused.
+
+    ALL-OR-NOTHING. Every path is validated, then every original is read into
+    memory, and only then is anything written; a failure part-way restores
+    every file already written. A half-applied fix is worse than a refused one
+    -- the gate would then run against a state no one authored.
+    """
+    payload = _parse_fix(text)
+    if payload is None:
+        return 0, "fix_unparseable"
+    files = payload.get("files")
+    if not isinstance(files, list):
+        return 0, "fix_no_files"
+    if not files:
+        # An empty array is a well-formed way of saying "I changed nothing",
+        # which is not a fix. Distinguished from fix_no_files so the parked
+        # card says which one happened.
+        return 0, "fix_empty_files"
+    allowed_set = set(allowed or ())
+    if not allowed_set:
+        # Nothing is in scope, so nothing can be legally written. Fail closed
+        # rather than widen the scope to "anything in the workspace".
+        return 0, "fix_no_work_product"
+
+    root = os.path.realpath(workspace)
+    planned = []
+    seen = set()
+    for item in files:
+        if not isinstance(item, dict):
+            return 0, "fix_bad_item"
+        rel = item.get("path")
+        content = item.get("content")
+        if not isinstance(rel, str) or not rel:
+            return 0, "fix_bad_path"
+        if not isinstance(content, str):
+            return 0, "fix_content_not_text"
+        if rel in seen:
+            # Two entries for one path: the later would silently win.
+            return 0, "fix_duplicate_path"
+        seen.add(rel)
+        if os.path.isabs(rel) or ".." in rel.replace("\\", "/").split("/"):
+            return 0, "fix_unsafe_path"
+        if rel not in allowed_set:
+            return 0, "fix_path_not_in_work_product"
+        full = os.path.realpath(os.path.join(root, rel))
+        if full != root and not full.startswith(root + os.sep):
+            return 0, "fix_path_outside_workspace"
+        if not os.path.isfile(full):
+            return 0, "fix_path_not_a_file"
+        planned.append((full, content))
+
+    originals = []
+    changed = 0
+    for full, content in planned:
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                before = fh.read()
+        except OSError:
+            return 0, "fix_read_failed"
+        originals.append((full, before))
+        if before != content:
+            changed += 1
+    if not changed:
+        # The model returned the file unchanged. Writing would produce an
+        # identical diff, the gate would fail identically, and the next rung
+        # would fire -- burning the ladder on a no-op. Park instead.
+        return 0, "fix_no_change"
+
+    done = []
+    for full, content in planned:
+        try:
+            with open(full, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        except OSError:
+            for prev_full, prev_text in originals:
+                if prev_full in done:
+                    try:
+                        with open(prev_full, "w", encoding="utf-8") as fh:
+                            fh.write(prev_text)
+                    except OSError:
+                        # Restoration itself failed. Say so distinctly: the
+                        # worktree is now in a state nobody authored and a
+                        # human must look.
+                        return 0, "fix_restore_failed"
+            return 0, "fix_write_failed"
+        done.append(full)
+    return changed, None
+
+
 def make_fix(deps: Deps, *, rung: str, activity: str):
-    """fix_rung1 / fix_rung2. --mode write, --cwd the worktree (note 2)."""
+    """fix_rung1 / fix_rung2. PROMPT-ONLY; the harness applies the answer.
+
+    CD-051. THIS NODE USED TO SEND A LOCAL PATH TO ANOTHER MACHINE. It passed
+    the card's Jetson worktree as the remote working directory, into a
+    parameter lib/model_call/cli.py documents as "remote working dir for
+    lane_a (a disposable worktree)". `cd` therefore failed on
+    coder@10.10.40.2, no model ran, and every rung died at
+    model_call_failed:<activity> for $0.00. Measured 2026-08-26 on
+    t_ae6332d7: rc 5, which is _STAGE_RC["invoke"], retryable False.
+
+    THE D5.1 DESIGN'S NOTE 2 SAID SO, AND THIS FUNCTION CITED IT WHILE
+    BREAKING IT: "--cwd is a remote worktree path, never a local one, and is
+    passed only on write-mode nodes. Review nodes take their source in the
+    prompt and pass no --cwd." The remote worktree was never built. Ruled
+    2026-08-26: do not build it -- shipping files to the other host invents a
+    SECOND EGRESS PATH the sanitizer never sees (it runs on prompts, in
+    core.model_call, not on transferred files), which is the objection that
+    also keeps LangSmith disabled. Note 2's second sentence is generalized to
+    fix nodes instead; its first is retired, in the D5.1 rulings addendum.
+
+    THE ANSWER WAS ALREADY ARRIVING HOME AND THIS NODE THREW IT AWAY.
+    lanes.lane_a_call writes the envelope to
+    <workspace>/<card_id>-<run_id>-result.json -- `workspace` is a SEPARATE
+    PARAMETER from `cwd` and it is the Jetson path -- and core.model_call
+    returns that envelope's .result as ModelResult.text. call_model parks the
+    whole as_dict() in out["result"]. So res["text"] was in this node's hands
+    the entire time; it read only res["model"]. Option A needed no transport
+    built, which is why it was ruled over shipping the worktree.
+
+    THE RE-DERIVE IS NOT HOUSEKEEPING. make_implement's docstring makes the
+    identical argument for the identical reason: cloud_review's prompt reads
+    state["diff"], so a node that writes the worktree and does not re-derive
+    hands the next reviewer the PREVIOUS work product. Without it the ladder
+    would gate unchanged code and burn every remaining rung against it -- the
+    silent failure that made repairing --cwd alone the wrong fix.
+
+    NO SCHEMA CHANGE. Every field written here already exists in
+    WorkflowState -- the same set make_implement writes -- so SCHEMA_VERSION
+    stays 2 and every checkpoint since CD-032 still resumes. The count of
+    files written is deliberately NOT recorded in state; it would have forced
+    a bump and the trace already carries the node's span.
+    """
 
     def _node(state):
         refusal = spend_gate(deps, state)
@@ -758,12 +960,48 @@ def make_fix(deps: Deps, *, rung: str, activity: str):
             activity=activity, prompt=build_fix_prompt(state),
             workspace=deps.workspace, card_id=state["card_id"],
             component=state["component"], directive=state["directive"],
-            signals=selection_signals(state), mode="write", cwd=deps.workspace)
+            signals=selection_signals(state))
         res = out.get("result") or {}
         update = {"rung": rung, "rung_attempts": bump_rung(state, rung),
                   "implementer_model": res.get("model")}
         if out["klass"] != "ok":
             update["terminal_reason"] = "model_call_%s:%s" % (out["klass"], activity)
+            return guard(update, state)
+
+        # The attempt is already recorded above, so a refusal here still burns
+        # the rung. An attempt that is not recorded is an attempt that repeats.
+        written, reason = apply_fix(deps.workspace, res.get("text"),
+                                    deps.changed_files)
+        if reason:
+            update["terminal_reason"] = reason
+            return guard(update, state)
+
+        # Same lazy seam, same reason, as make_implement: binding derive in
+        # resolve_real() would make importing this module require the diff
+        # module for every offline test that injects a gate double.
+        derive = deps.derive
+        if derive is None:
+            try:
+                from hermes_cli import build_graph_diff as _bgd
+            except Exception:
+                update["terminal_reason"] = "fix_derive_unavailable"
+                return guard(update, state)
+            derive = _bgd.derive
+
+        verdict = derive(deps.workspace)
+        if not isinstance(verdict, dict) or not verdict.get("ok"):
+            why = (verdict or {}).get("reason") if isinstance(verdict, dict) else None
+            update["terminal_reason"] = why or "graph_no_diff_source:unknown"
+            return guard(update, state)
+
+        # changed_files lives on Deps, NOT in state, so this is a Deps mutation
+        # and is easy to miss -- make_implement's comment says the same. Without
+        # it the next cheap_gate builds its D5.5 synthetic check specs over the
+        # PRE-fix file list, and apply_fix's scope set would be stale too.
+        deps.changed_files = list(verdict.get("changed_files") or [])
+        update["diff"] = verdict["diff"]
+        update["diff_files"] = verdict["diff_files"]
+        update["diff_added_lines"] = verdict["diff_added_lines"]
         return guard(update, state)
 
     _node.__name__ = "fix_%s" % rung
@@ -854,11 +1092,31 @@ def build_review_prompt(state) -> str:
 
 
 def build_fix_prompt(state) -> str:
+    """Objections + the diff, plus the response contract.
+
+    CD-051 APPENDS THE RESPONSE CONTRACT HERE, IN THIS REPO, and the choice
+    was made against the obvious alternative. core.py appends its verdict
+    contract to every review prompt inside the primitive because -- its own
+    comment -- "five
+    live cards produced six verdict vocabularies ... worker prompt discipline
+    cannot pin the contract, so the primitive does". That argument is about
+    MANY authors writing prompts. This is ONE code-authored function, and the
+    parser that reads the response is twelve lines above it.
+
+    THE DECIDING FACT IS MEASURED, NOT stylistic: the agent venv CANNOT import
+    model_call. CD-045 recorded `import model_call.policy` raising
+    ModuleNotFoundError on the box, and the sys.path workaround was rejected on
+    CD-034 grounds. So a contract in core.py and a parser here would put ONE
+    format under TWO owners across a subprocess boundary -- the CD-036/037
+    marker defect, where a value edited on one side can never match the other
+    and the gate refuses everything while looking correct. Contract and parser
+    stay adjacent.
+    """
     return ("Address the following review objections for component %r.\n\n"
             "OBJECTIONS:\n%s\n\nDIFF:\n%s\n"
             % (state["component"],
                json.dumps(state["objections_current"], indent=2, sort_keys=True),
-               state["diff"]))
+               state["diff"])) + FIX_CONTRACT
 
 
 def extract_objections(result: dict) -> list:
