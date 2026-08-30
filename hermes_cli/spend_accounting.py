@@ -24,7 +24,7 @@ import subprocess
 # about card authorship, NOT containment: this name is not in the set
 # scrub_kanban_env removes, so a delegated child's subprocess inherits it, and
 # any process holding a `terminal` tool can set it for a subprocess it spawns.
-# See docs/root-causes-v1.1.md RC-005 -- OPEN.
+# See docs/root-causes-v1.2.md RC-005 -- OPEN.
 _DEFAULT_CAP_ENV = "HERMES_KANBAN_MAX_CARD_SPEND"
 _DEFAULT_CAP_USD = 5.0
 

@@ -180,7 +180,7 @@ def _assert_not_delegated_child_mutation() -> None:
     widest seam, not as the invariant. Containment requires an ambient,
     process-level boundary that does not exist yet.
 
-    See docs/root-causes-v1.1.md RC-005 -- OPEN.
+    See docs/root-causes-v1.2.md RC-005 -- OPEN.
     """
     try:
         from agent.delegation_context import is_delegated_child_process_context

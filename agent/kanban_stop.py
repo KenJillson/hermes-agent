@@ -32,7 +32,7 @@ def kanban_stop_nudge_enabled() -> bool:
     parent's ``HERMES_KANBAN_TASK`` is visible to it and the env var alone
     cannot tell them apart. It never could: this docstring previously said
     "(dispatcher-spawned worker)" as though the variable carried lineage.
-    See docs/root-causes-v1.1.md RC-005.
+    See docs/root-causes-v1.2.md RC-005.
 
     The process-context predicate is used deliberately, not the ContextVar-only
     one. Its env term is clearable by a child -- but doing so only re-enables
