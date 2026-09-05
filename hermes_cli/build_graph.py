@@ -14,14 +14,11 @@ primitive has been READ AT SOURCE this session:
   interim C implement -- BUILT AND REGISTERED, but unreachable from START.
             Empty and whitespace-only diffs park at human; see route_entry().
 
-The line is not arbitrary. `plan` and `local_review` wrap `delegate_task`
-and fix_rung3's real body wraps `terminal()`. CD-041 READ `delegate_task`
-at source and built `implement` on it, so that primitive is no longer
-unread; `plan` and `local_review` stay unbuilt because each needs a work
-product `delegate_task` does not return -- a plan, and a verdict, the
-latter being `local_review`'s own deliverable. `terminal()` is still
-unread, and writing a node on an unread primitive would mean guessing a
-signature, which rule 1 forbids.
+The line is not arbitrary. `plan` and `local_review` still need work-product
+contracts that do not exist -- a plan and a verdict -- and fix_rung3's real
+body wraps the still-unread `terminal()` primitive. A1 replaces implement's
+former in-process `delegate_task` call with an owned subprocess, but does not
+invent either missing deliverable or widen fix_rung3.
 
 The unbuilt nodes are present in the topology with their edges wired.
 
@@ -103,30 +100,12 @@ LADDER = ("rung1", "rung2", "rung3")
 # deviation from section 2.1 rather than left as an accident.
 GATE_PASS_TARGET = "cloud_review"
 
-# CD-041a CORRECTION. CD-041 shipped ("ok", "error", "timeout", "failed").
-# THAT SET WAS WRONG IN BOTH DIRECTIONS and the node could never succeed:
-# "ok" is NEVER a task status, and "completed" -- the SUCCESS value -- was
-# absent, so every successful child parked as implement_unknown_status.
-# "interrupted" was missing too. It failed closed, which is why nothing
-# broke visibly; it was simply inert.
-#
-# The error was reading a grep instead of the assignment site. "ok" appears
-# at delegate_tool.py:2360 inside result_meta for TOOL_TRACE entries -- a
-# per-tool-call status, not the task status. The two dict families are
-# told apart by a sibling key: a per-task result carries "task_index" and
-# a tool_trace entry does not.
-#
-# DERIVED BY AST from the two functions that actually produce task results
-# (_run_single_child, _execute_and_aggregate), not transcribed:
-#   status = "..."   -> interrupted / completed / failed   (2324/2329/2331)
-#   dict literals    -> timeout / error                    (2279/2532/3040/3052/3077)
-# `unknown` is excluded deliberately: it lives only in
-# _subagent_stop_tool_call_history, which is tool_trace, not a task result.
-#
-# The driver now RE-DERIVES this set from the installed delegate_tool.py by
-# AST and asserts equality, so this constant can never again be a claim
-# about the contract rather than a reading of it.
-IMPLEMENT_STATUSES = ("completed", "failed", "interrupted", "timeout", "error")
+# Closed A1 parent-runner vocabulary. Unknown values park without copying any
+# child-controlled payload into the board reason.
+IMPLEMENT_STATUSES = (
+    "completed", "failed", "timeout", "interrupted", "protocol_error",
+    "exec_error",
+)
 
 # The ONE value that means the child did the work. summary present, not
 # interrupted, and not the "(empty)" sentinel run_agent.py emits when it
@@ -148,6 +127,11 @@ IMPLEMENT_OK = "completed"
 # since CD-032 still resumes. LADDER does not contain "implement", so
 # next_available_rung ignores the key and the fix ladder is unaffected.
 IMPLEMENT_ATTEMPT_CAP = 1
+
+# A1 owns both budgets at the graph boundary.  These do not consult the
+# delegation config and therefore cannot be widened by a card or child.
+IMPLEMENT_MAX_ITERATIONS = 50
+IMPLEMENT_TIMEOUT_SECONDS = 900
 
 # model-call staged exit codes, from lib/model_call/cli.py (read 2026-08-18).
 RC_OK = 0
@@ -362,7 +346,7 @@ class Deps:
     """
 
     def __init__(self, *, gate=None, arbiter=None, model=None, parse_ac=None,
-                 agent=None, delegate=None, derive=None, over_cap=None,
+                 agent=None, implement_runner=None, derive=None, over_cap=None,
                  conn=None, task_id="", workspace="", body="",
                  changed_files=None):
         self.gate = gate
@@ -377,10 +361,9 @@ class Deps:
         # specs. Empty is the honest default -- it narrows coverage to the
         # AI-instruction carve-out rather than silently passing.
         self.changed_files = list(changed_files or [])
-        # CD-041 (D5.2b-iv). `agent` is the LIVE AIAgent the worker already
-        # holds; delegate_task REFUSES without one (tools/delegate_tool.py:
-        # "delegate_task requires a parent agent context"). `delegate` and
-        # `derive` are injection seams for the offline driver.
+        # A1. `agent` is retained only as an interrupt source for the owned
+        # subprocess. `implement_runner` and `derive` are injection seams for
+        # offline behavior tests.
         #
         # resolve_real() deliberately does NOT bind these two. Binding
         # `delegate` there would make run() import tools.delegate_tool --
@@ -390,7 +373,7 @@ class Deps:
         # inside the node, so a test that injects them never touches the
         # agent and a run that never reaches `implement` never imports it.
         self.agent = agent
-        self.delegate = delegate
+        self.implement_runner = implement_runner
         self.derive = derive
         # CD-045: the per-card dollar ceiling predicate. Same seam shape and
         # same reason as the two above -- bound LAZILY inside the gate helper
@@ -425,33 +408,17 @@ def unbuilt(name: str):
 
 
 def make_implement(deps: Deps):
-    """Design section 1: `implement` wraps delegate_task -> local, worktree write.
+    """Design section 1: run one owned local subprocess, then derive its diff.
 
     UNREACHABLE UNDER INTERIM C. build() registers this node with its design section
     1 OUTBOUND edge (implement -> cheap_gate) and NO inbound edge, so it cannot
     be entered from START. A1 replaces this in-process body before a separate
     enable change restores inbound reachability.
 
-    FOUR THINGS READ AT SOURCE, each of which would be wrong if recalled:
-
-      * `parent_agent` is MANDATORY. Without it delegate_task returns
-        tool_error() immediately. That is what deps.agent carries.
-      * A CALLER-SUPPLIED `max_iterations` IS IGNORED -- delegate_task logs it
-        at debug and substitutes delegation.max_iterations from config. This
-        node therefore CANNOT bound its child's iteration budget from the call
-        site, and passing the argument would only look like it could. The child
-        timeout is config-side too (_get_child_timeout).
-      * `background=True` IS NOT AVAILABLE HERE. async_delivery_supported() is
-        false for one-shot runners -- delegate_tool names Kanban workers
-        explicitly -- and the call silently falls back to synchronous execution
-        with a note appended. Passing background=False states that rather than
-        depending on a fallback.
-      * THE CHILD DOES NOT INHERIT THE WORKTREE. _resolve_workspace_hint is
-        best-effort and PROMPT-ONLY: it reads TERMINAL_CWD or parent-agent
-        attributes and injects a path into the child's prompt. So the goal
-        NAMES deps.workspace explicitly. Relying on inheritance would have the
-        child edit some other tree, derive() return an empty diff, and the card
-        park with a reason pointing at git rather than at the real cause.
+    The runner owns PID/PGID, cwd, prompt-file transport, iteration and wall
+    budgets, provider-locality checks, interrupt propagation, and mandatory
+    reap. The graph accepts only its closed status vocabulary and never copies
+    child output or exception text into terminal_reason.
 
     THE DIFF IS RE-DERIVED HERE, AND THAT IS NOT HOUSEKEEPING. cloud_review's
     prompt reads state["diff"] and this node writes the worktree. Without the
@@ -472,9 +439,6 @@ def make_implement(deps: Deps):
     """
 
     def _node(state):
-        if deps.agent is None:
-            return {"terminal_reason": "implement_no_agent"}
-
         # CD-044: FAIL CLOSED ON AN EMPTY SPECIFICATION.
         #
         # A child given no statement of intent does NOT no-op. Measured on
@@ -493,15 +457,12 @@ def make_implement(deps: Deps):
         if not spec:
             return {"terminal_reason": "implement_no_spec"}
 
-        delegate = deps.delegate
-        if delegate is None:
+        runner = deps.implement_runner
+        if runner is None:
             try:
-                from tools.delegate_tool import delegate_task as delegate
+                from hermes_cli.build_graph_implementer import run_implementer as runner
             except Exception:
-                # An import failure must PARK, not raise. A raise inside a node
-                # kills the run and, under a checkpointer, can re-spend cloud
-                # calls already paid for (CD-031 posture).
-                return {"terminal_reason": "implement_delegate_unavailable"}
+                return {"terminal_reason": "implement_runner_unavailable"}
 
         # CD-042 THE ATTEMPT CAP, checked HERE rather than in route_entry so
         # the refusal carries a REASON. A router cannot write state, so a cap
@@ -519,38 +480,32 @@ def make_implement(deps: Deps):
         def _park(reason):
             return {"terminal_reason": reason, "rung_attempts": attempts}
 
-        raw = delegate(
+        def _interrupted():
+            agent = deps.agent
+            if agent is None:
+                return False
+            if getattr(agent, "_interrupt_requested", False) is True:
+                return True
+            event = getattr(agent, "_hard_interrupt_requested", None)
+            return bool(event is not None and hasattr(event, "is_set") and event.is_set())
+
+        raw = runner(
             goal=build_implement_goal(state, deps.workspace, spec),
-            context=build_implement_context(state),
-            role="leaf",
-            background=False,
-            parent_agent=deps.agent,
+            workspace=deps.workspace,
+            max_iterations=IMPLEMENT_MAX_ITERATIONS,
+            timeout_seconds=IMPLEMENT_TIMEOUT_SECONDS,
+            interrupt_check=_interrupted,
         )
-
-        try:
-            payload = json.loads(raw) if isinstance(raw, str) else None
-        except ValueError:
-            payload = None
-        if not isinstance(payload, dict):
-            return _park("implement_unparseable")
-
-        # A REFUSAL IS ALSO VALID JSON. tool_error() returns
-        # {"error": "..."} with NO `results` key, so "it parsed" is not "it
-        # ran". The absence of `results` is the discriminator.
-        results = payload.get("results")
-        if not isinstance(results, list):
-            return _park("implement_refused")
-        if not results or not isinstance(results[0], dict):
-            return _park("implement_no_result")
-
-        first = results[0]
-        status = first.get("status")
+        if not isinstance(raw, dict):
+            return _park("implement_protocol_error")
+        status = raw.get("status")
         if status not in IMPLEMENT_STATUSES:
             return _park("implement_unknown_status")
         if status != IMPLEMENT_OK:
             return _park("implement_%s" % status)
 
-        model = first.get("model")
+        identity = raw.get("identity")
+        model = identity.get("model") if isinstance(identity, dict) else None
         update = {"implementer_model": model if isinstance(model, str) else None,
                   "rung_attempts": attempts}
 
