@@ -11,8 +11,8 @@ primitive has been READ AT SOURCE this session:
             classify_failure, fix_rung1, fix_rung2 (all model-call), assemble,
             human, and fix_rung3 as an auth-deferred node (section 8 deferral 6)
   unbuilt   plan, plan_review, local_review
-  CD-042    implement -- BUILT AND REACHABLE. START routes to it when the
-            card has no work product yet; see route_entry().
+  interim C implement -- BUILT AND REGISTERED, but unreachable from START.
+            Empty and whitespace-only diffs park at human; see route_entry().
 
 The line is not arbitrary. `plan` and `local_review` wrap `delegate_task`
 and fix_rung3's real body wraps `terminal()`. CD-041 READ `delegate_task`
@@ -25,19 +25,10 @@ signature, which rule 1 forbids.
 
 The unbuilt nodes are present in the topology with their edges wired.
 
-CD-042 REWIRED THE ENTRY. START is no longer a static edge to cheap_gate;
-it is a conditional edge that reads whether the card already HAS a work
-product. A card with a diff goes straight to cheap_gate, which is exactly
-the CD-033/034/035 path and is unchanged. A card with an EMPTY diff goes
-to `implement` first.
-
-That second branch is the point of the CD, and it is a SPEND REDUCTION
-rather than a new cost. Before it, a from-scratch card ran its AC checks
-against an unimplemented workspace, failed them, and the arbiter returned
-ESCALATE -- so `fix_rung1`, a METERED CLOUD CALL, was doing the
-implementing. Routing through `implement` puts a free local child in front
-of that. Measured claim, not a hope: verify it on the ledger after the
-first live card.
+INTERIM C TEMPORARILY DISABLES CD-042'S EMPTY-DIFF ENTRY. START remains a
+conditional edge: a card with a diff goes straight to cheap_gate, while an
+empty or whitespace-only diff parks at human. `implement` remains registered
+for the separately reviewed A1 replacement but has no inbound START mapping.
 
 AN UNBUILT NODE ROUTES TO `human`. IT DOES NOT RAISE.
 A raise inside a node kills the run, and under the in-memory checkpointer that
@@ -146,8 +137,8 @@ IMPLEMENT_OK = "completed"
 # DISPATCHES. Separate from RUNG_ATTEMPT_CAP, which governs the fix ladder
 # and does not apply here.
 #
-# Without a cap the loop is UNBOUNDED: a failed child leaves the diff
-# empty, so the next dispatch routes to `implement` again, forever. The
+# When `implement` is reachable, without a cap the loop is UNBOUNDED: a failed
+# child leaves the diff empty, so the next dispatch routes to it again. The
 # board's BLOCK_RECURRENCE_LIMIT breaker would eventually send the card to
 # triage, but that is a backstop for a misbehaving card, not a budget for
 # this node.
@@ -436,11 +427,10 @@ def unbuilt(name: str):
 def make_implement(deps: Deps):
     """Design section 1: `implement` wraps delegate_task -> local, worktree write.
 
-    UNREACHABLE AT THIS CD. build() registers this node with its design section
+    UNREACHABLE UNDER INTERIM C. build() registers this node with its design section
     1 OUTBOUND edge (implement -> cheap_gate) and NO inbound edge, so it cannot
-    be entered from START. Wiring the inbound side is the topology rewire, and
-    that is where the first spend happens: delegate_task spawns a child agent
-    and there is no CD-034-style free-path split for it.
+    be entered from START. A1 replaces this in-process body before a separate
+    enable change restores inbound reachability.
 
     FOUR THINGS READ AT SOURCE, each of which would be wrong if recalled:
 
@@ -1314,32 +1304,18 @@ def route_after_classify(state):
 
 
 def route_entry(state):
-    """START. CD-042: does this card already HAVE a work product?
+    """START. Interim C disables the in-process implementation path.
 
-    THE PREDICATE IS THE DIFF, AND IT IS A PROXY -- say so rather than pretend
-    otherwise. "diff is empty" is not identical to "nothing has been built". A
-    card whose change already exists upstream routes to `implement` and asks a
-    child to build something already built; the child no-ops, the diff stays
-    empty, and the attempt cap bounds it. That is the accepted cost of a
-    predicate that is cheap, has no schema footprint, and is correct on the two
-    cases that matter:
-
-      * A FRESH card has no diff -> implement. Before CD-042 this card ran its
-        AC checks against an unimplemented workspace, failed, and the arbiter
-        escalated to fix_rung1 -- a METERED CLOUD CALL doing the implementing.
-      * A RESUMED card HAS a diff, because run() re-derives it from the
-        worktree and passes it in the partial input. So it re-enters at
-        cheap_gate and does NOT re-implement. Resume correctness falls out of
-        the predicate rather than needing its own flag.
-
-    The CD-033/034/035 path -- a card created to review an EXISTING change --
-    is byte-for-byte unchanged: non-empty diff, straight to cheap_gate.
+    A prior terminal reason still parks at human. A non-empty diff still enters
+    cheap_gate. An empty or whitespace-only diff now parks at human instead of
+    entering make_implement; that node remains registered and source-present
+    for the separately reviewed A1 replacement.
     """
     if state.get("terminal_reason"):
         return "human"
     if (state.get("diff") or "").strip():
         return "cheap_gate"
-    return "implement"
+    return "human"
 
 
 def route_after_implement(state):
@@ -1416,31 +1392,20 @@ def build(deps: Deps, *, checkpointer=None):
         _add(name, unbuilt(name))
         g.add_edge(name, "human")
 
-    # CD-041: `implement` is BUILT. Its OUTBOUND edge is the design section 1
-    # edge (implement -> cheap_gate). Its INBOUND edge is DELIBERATELY ABSENT:
-    # START goes to cheap_gate, and the only router that could name this node
-    # is route_after_gate, whose path_map does not contain it and whose four
-    # arbiter values are pass / escalate / over_cap / no_arbiter. So the node
-    # is unreachable from START and this CD is INERT IN PRODUCTION -- a
-    # property of the compiled graph, asserted by the driver rather than
-    # claimed here.
-    #
-    # The outbound edge is cheap_gate rather than human because whether
-    # langgraph compiles a node with NO outgoing edge is not something this CD
-    # needs to find out by guessing. Giving it the edge it will keep removes
-    # the question and leaves the rewire as inbound-side work only.
+    # Interim C keeps `implement` registered for the A1 replacement, with its
+    # existing outbound routes intact. No START path-map value names it, so it
+    # is unreachable from START while interim C is active.
     _add("implement", make_implement(deps))
     _cond("implement", route_after_implement,
           {"cheap_gate": "cheap_gate", "human": "human"})
 
-    # CD-042: conditional entry. NOTE FOR ANY FUTURE TOPOLOGY ASSERTION --
+    # Interim C: conditional entry. NOTE FOR ANY FUTURE TOPOLOGY ASSERTION --
     # a START branch registers under builder.branches["__start__"] and does
     # NOT appear in builder.edges. An assertion that looks only at
     # builder.edges will report START as unwired. Verified against
     # langgraph 1.2.10.
     _cond(START, route_entry,
-          {"implement": "implement", "cheap_gate": "cheap_gate",
-           "human": "human"})
+          {"cheap_gate": "cheap_gate", "human": "human"})
 
     _cond(
         "cheap_gate", lambda s: route_after_gate(s, deps),
