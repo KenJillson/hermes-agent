@@ -70,6 +70,12 @@ new locking.
 
 from __future__ import annotations
 
+# Michael maintenance: fail closed before runtime imports or run admission.
+from hermes_cli.maintenance_gate import admitted as _maintenance_admitted
+from hermes_cli.maintenance_gate import hold_runtime_for_process as _hold_maintenance_runtime
+_hold_maintenance_runtime()
+
+
 import contextlib
 import hashlib
 import json
@@ -4516,6 +4522,7 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+@_maintenance_admitted
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4638,6 +4645,7 @@ def claim_task(
     return claimed
 
 
+@_maintenance_admitted
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9343,6 +9351,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+@_maintenance_admitted
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -10103,6 +10112,7 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+@_maintenance_admitted
 def _default_spawn(
     task: Task,
     workspace: str,

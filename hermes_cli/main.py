@@ -43,6 +43,11 @@ Usage:
     hermes claw migrate --dry-run  # Preview migration without changes
 """
 
+# Michael maintenance: retain the runtime lock before loading mutable modules.
+from hermes_cli.maintenance_gate import hold_runtime_for_process as _hold_maintenance_runtime
+_hold_maintenance_runtime()
+
+
 # IMPORTANT: hermes_bootstrap must be the very first import — it sets up
 # UTF-8 stdio on Windows so print()/subprocess children don't hit
 # UnicodeEncodeError with non-ASCII characters.  No-op on POSIX.
