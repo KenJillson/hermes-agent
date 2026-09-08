@@ -31,7 +31,7 @@ _DEFAULT_CAP_USD = 5.0
 # Same env contract reconcile uses (ONE way to reach the ledger).
 _LEDGER_SSH = os.environ.get(
     "ROUTER_LEDGER_SSH",
-    "ssh -o BatchMode=yes -o ConnectTimeout=10 coder@10.10.40.2")
+    "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o HostKeyAlias=10.10.40.2 coder@10.10.100.2")
 _LEDGER_PATH = os.environ.get("ROUTER_LEDGER_PATH", "/work/coder/router-usage.log")
 
 _LANE_A = "lane_a"
