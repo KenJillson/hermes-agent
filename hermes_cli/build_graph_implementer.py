@@ -155,7 +155,8 @@ def _parse_result(data: bytes, expected_identity: dict[str, str],
 
 
 def _terminate_group(proc: subprocess.Popen[Any], grace_seconds: float) -> None:
-    """TERM, bounded grace, KILL, and mandatory wait for an owned POSIX PGID."""
+    """Terminate the owned group even if its leader exits before descendants."""
+    pgid = None
     if os.name != "posix" or not hasattr(os, "killpg"):
         proc.terminate()
     else:
@@ -164,13 +165,20 @@ def _terminate_group(proc: subprocess.Popen[Any], grace_seconds: float) -> None:
             raise RuntimeError("child_process_group_not_owned")
         os.killpg(pgid, signal.SIGTERM)
     deadline = time.monotonic() + max(0.0, grace_seconds)
-    while proc.poll() is None and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        # Keep a POSIX leader unreaped until group signalling is complete,
+        # reserving its PID/PGID throughout the grace period.
+        if pgid is None and proc.poll() is not None:
+            break
+        # Preserve the grace period for descendants after the leader exits.
         time.sleep(min(DEFAULT_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
-    if proc.poll() is None:
-        if os.name == "posix" and hasattr(os, "killpg"):
-            os.killpg(proc.pid, signal.SIGKILL)
-        else:
-            proc.kill()
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # The whole group exited during the grace period.
+    elif proc.poll() is None:
+        proc.kill()
     proc.wait()
 
 

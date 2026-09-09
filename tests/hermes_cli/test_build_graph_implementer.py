@@ -202,3 +202,31 @@ def test_request_validation_is_strict(tmp_path):
     for request in bad:
         with pytest.raises(impl.ProtocolError):
             impl._validate_request(request)
+
+
+# The fixture grandchild is reparented when its leader exits; real signals are required.
+@pytest.mark.live_system_guard_bypass
+def test_cleanup_kills_group_after_leader_exits():
+    import signal
+    import subprocess
+    child_code = "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print('READY',flush=True); time.sleep(5)"
+    leader_code = ("import subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c',sys.argv[1]],stdout=subprocess.PIPE,text=True); "
+                   "assert p.stdout.readline().strip()=='READY'; print(p.pid,flush=True); time.sleep(5)")
+    proc = subprocess.Popen([sys.executable, '-c', leader_code, child_code],
+                            start_new_session=True, stdout=subprocess.PIPE, text=True)
+    pid = None
+    try:
+        pid = int(proc.stdout.readline())
+        impl._terminate_group(proc, 0.05)
+        assert proc.poll() is not None
+        deadline = time.monotonic() + 2
+        while _alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _alive(pid), 'TERM-ignoring descendant survived its group leader'
+    finally:
+        if pid is not None:
+            try: os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+        if proc.poll() is None: proc.kill()
+        proc.wait()
+        proc.stdout.close()
