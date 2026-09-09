@@ -11,8 +11,8 @@ primitive has been READ AT SOURCE this session:
             classify_failure, fix_rung1, fix_rung2 (all model-call), assemble,
             human, and fix_rung3 as an auth-deferred node (section 8 deferral 6)
   unbuilt   plan, plan_review, local_review
-  interim C implement -- BUILT AND REGISTERED, but unreachable from START.
-            Empty and whitespace-only diffs park at human; see route_entry().
+  built     implement -- owned local subprocess for empty/whitespace diffs;
+            existing terminal reasons still park at human; see route_entry().
 
 The line is not arbitrary. `plan` and `local_review` still need work-product
 contracts that do not exist -- a plan and a verdict -- and fix_rung3's real
@@ -22,10 +22,11 @@ invent either missing deliverable or widen fix_rung3.
 
 The unbuilt nodes are present in the topology with their edges wired.
 
-INTERIM C TEMPORARILY DISABLES CD-042'S EMPTY-DIFF ENTRY. START remains a
+A1 ENABLES THE OWNED IMPLEMENTER AT EMPTY-DIFF ENTRY. START remains a
 conditional edge: a card with a diff goes straight to cheap_gate, while an
-empty or whitespace-only diff parks at human. `implement` remains registered
-for the separately reviewed A1 replacement but has no inbound START mapping.
+empty or whitespace-only diff enters implement. A prior terminal reason
+always parks at human. Successful implementation re-derives the work product
+before the cheap gate; failed implementation parks without entering the gate.
 
 AN UNBUILT NODE ROUTES TO `human`. IT DOES NOT RAISE.
 A raise inside a node kills the run, and under the in-memory checkpointer that
@@ -410,10 +411,9 @@ def unbuilt(name: str):
 def make_implement(deps: Deps):
     """Design section 1: run one owned local subprocess, then derive its diff.
 
-    UNREACHABLE UNDER INTERIM C. build() registers this node with its design section
-    1 OUTBOUND edge (implement -> cheap_gate) and NO inbound edge, so it cannot
-    be entered from START. A1 replaces this in-process body before a separate
-    enable change restores inbound reachability.
+    START enters this node for empty or whitespace-only diffs without a prior
+    terminal reason. Its outbound conditional route enters cheap_gate only
+    after successful implementation and diff derivation; failures park at human.
 
     The runner owns PID/PGID, cwd, prompt-file transport, iteration and wall
     budgets, provider-locality checks, interrupt propagation, and mandatory
@@ -1259,18 +1259,17 @@ def route_after_classify(state):
 
 
 def route_entry(state):
-    """START. Interim C disables the in-process implementation path.
+    """START. Empty work products enter the owned local implementer.
 
-    A prior terminal reason still parks at human. A non-empty diff still enters
-    cheap_gate. An empty or whitespace-only diff now parks at human instead of
-    entering make_implement; that node remains registered and source-present
-    for the separately reviewed A1 replacement.
+    A prior terminal reason parks at human. A non-empty diff enters cheap_gate.
+    Empty and whitespace-only diffs enter make_implement, which enforces the
+    specification and persistent attempt cap before spawning its child.
     """
     if state.get("terminal_reason"):
         return "human"
     if (state.get("diff") or "").strip():
         return "cheap_gate"
-    return "human"
+    return "implement"
 
 
 def route_after_implement(state):
@@ -1347,20 +1346,19 @@ def build(deps: Deps, *, checkpointer=None):
         _add(name, unbuilt(name))
         g.add_edge(name, "human")
 
-    # Interim C keeps `implement` registered for the A1 replacement, with its
-    # existing outbound routes intact. No START path-map value names it, so it
-    # is unreachable from START while interim C is active.
+    # The owned implementer is reachable from START; terminal failures park
+    # before the cheap gate can evaluate an absent or stale work product.
     _add("implement", make_implement(deps))
     _cond("implement", route_after_implement,
           {"cheap_gate": "cheap_gate", "human": "human"})
 
-    # Interim C: conditional entry. NOTE FOR ANY FUTURE TOPOLOGY ASSERTION --
+    # A1: conditional entry. NOTE FOR ANY FUTURE TOPOLOGY ASSERTION --
     # a START branch registers under builder.branches["__start__"] and does
     # NOT appear in builder.edges. An assertion that looks only at
     # builder.edges will report START as unwired. Verified against
     # langgraph 1.2.10.
     _cond(START, route_entry,
-          {"cheap_gate": "cheap_gate", "human": "human"})
+          {"implement": "implement", "cheap_gate": "cheap_gate", "human": "human"})
 
     _cond(
         "cheap_gate", lambda s: route_after_gate(s, deps),
