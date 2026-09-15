@@ -17957,6 +17957,8 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
         # `plan` is deliberately NOT derived. Producing a plan is the `plan`
         # node's job and that node is unbuilt; CD-035 is diff derivation only.
         reason = None
+        from hermes_cli.build_graph_implementer import make_a2_runner, A2ReconciliationRequired
+        a2_runner = make_a2_runner(task, workspace, dict(_os.environ))
         if _kb.parse_ac_text(task.body or "")[3]:
             kind = (getattr(task, "workspace_kind", None) or "scratch")
             if kind != "worktree":
@@ -17995,16 +17997,22 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
                 # reaches a priced node with an empty diff, and the implementer
                 # attempt cap -- counted in checkpointed state -- bounds
                 # re-dispatch.
-                verdict = _bgd.derive(workspace)
+                try:
+                    verdict = a2_runner.derive(workspace)
+                except A2ReconciliationRequired:
+                    logger.error("A2 parent binding lost for %s", task_id)
+                    return 1
                 if verdict["ok"]:
                     derived = verdict
                 elif verdict["reason"] != _bgd.EMPTY_DIFF_REASON:
                     reason = verdict["reason"]
 
         if reason is None:
+            a2_failure_type = ()
             try:
                 from hermes_cli import build_graph as _bg
-
+                from hermes_cli.build_graph_implementer import make_a2_runner, A2ReconciliationRequired
+                a2_failure_type = A2ReconciliationRequired
                 gc = _kb.connect()
                 try:
                     state = _bg.run(gc, task_id, workspace,
@@ -18014,6 +18022,7 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
                                     diff_added_lines=derived["diff_added_lines"],
                                     changed_files=derived.get("changed_files"),
                                     agent=cli.agent,
+                                    deps=_bg.Deps(implement_runner=a2_runner, derive=a2_runner.derive),
                                     checkpoint="workspace",
                                     resume="auto")
                 finally:
@@ -18023,6 +18032,12 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
                         pass
                 reason = "graph_terminal:%s" % (
                     (state or {}).get("terminal_reason") or "unknown")
+            except a2_failure_type:
+                # The controller may still own a payload/inhibit. Do not call
+                # block_task, complete_task or retry. The existing dispatcher
+                # observes worker exit; protected reconciliation remains required.
+                logger.error("A2 reconciliation required for %s", task_id)
+                return 1
             except Exception as exc:
                 # A crash here would leave the card `running` and earn a
                 # protocol violation. Park with the exception TYPE only -- its

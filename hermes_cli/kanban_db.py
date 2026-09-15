@@ -7666,6 +7666,11 @@ def _resolve_worktree_workspace(
     launched from, e.g. the Hermes checkout). If no anchor is configured
     anywhere, we fail loudly rather than guess.
     """
+    if task.graph_executor:
+        if task.graph_executor not in GRAPH_EXECUTORS:
+            raise ValueError("unknown graph executor")
+        from hermes_cli.build_graph_parent_git import precreated
+        return precreated(task, board=board or get_current_board())
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
@@ -9207,6 +9212,19 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     reset the task to ``ready`` only after verifying the lock is
     genuinely dead (no live PID on this host).
     """
+    # A caller can lose the final reply after protected import committed.
+    # Existing crash/timeout/reclaim accounting may close that dead run, but
+    # it must not turn transport uncertainty into a fresh automatic attempt.
+    # The normal blocked outcome retains the existing cross-run resume path.
+    graph_row = conn.execute("SELECT graph_executor FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if graph_row is not None and graph_row["graph_executor"]:
+        uncertain = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+            "AND (outcome IS NULL OR outcome NOT IN ('blocked', 'completed')) LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if uncertain is not None:
+            return "a2_prior_run_requires_reconciliation"
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
         (task_id,),

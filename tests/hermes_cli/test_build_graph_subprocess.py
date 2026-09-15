@@ -224,10 +224,21 @@ def test_dispatcher_clean_worktree_reaches_owned_implementation(monkeypatch, wor
             assert kwargs["parse_fn"](body)[3]
             return {"verdict": "all_pass", "results": []}
         deps.gate = passing_gate
+    # The CLI now supplies the A2 adapter. Isolate its protected controller
+    # boundary here while retaining the actual graph, diff and spend gates.
+    from hermes_cli import build_graph_implementer
+    adapter = deps.implement_runner
+    adapter.payload_workspace = '/workspace'
+    adapter.derive = build_graph_diff.derive
+    monkeypatch.setattr(build_graph_implementer, 'make_a2_runner', lambda *args: adapter)
     run = graph.run
     observed = {}
     def injected_run(*args, **kwargs):
         assert kwargs["diff"] == ""
+        supplied = kwargs.pop('deps')
+        assert supplied.implement_runner is adapter
+        assert supplied.derive is adapter.derive
+        deps.derive = supplied.derive
         result = run(*args, deps=deps, **kwargs)
         observed.update(result)
         return result

@@ -490,7 +490,7 @@ def make_implement(deps: Deps):
             return bool(event is not None and hasattr(event, "is_set") and event.is_set())
 
         raw = runner(
-            goal=build_implement_goal(state, deps.workspace, spec),
+            goal=build_implement_goal(state, getattr(runner, "payload_workspace", deps.workspace), spec),
             workspace=deps.workspace,
             max_iterations=IMPLEMENT_MAX_ITERATIONS,
             timeout_seconds=IMPLEMENT_TIMEOUT_SECONDS,

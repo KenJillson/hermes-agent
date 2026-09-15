@@ -210,6 +210,138 @@ def _persist_evidence(root: Path, record: dict[str, Any]) -> str:
     return str(path)
 
 
+# Production graph dispatch uses the protected A2 executor. The older A1
+# subprocess implementation remains below for its historical fixtures only.
+class A2ReconciliationRequired(RuntimeError):
+    """The client could have sent a request; do not park/end/retry this run here."""
+
+
+def _a2_client():
+    """Load the existing client in this assigned worker, never a subprocess.
+
+    This is owner-side request construction, not authority. The protected server
+    independently authenticates SO_PEERCRED and the sole live run. No request or
+    environment variable chooses a module directory or an endpoint.
+    """
+    import importlib.util
+    root = Path('/home/jetson/.hermes/scripts/michael-worker')
+    for name in ('workspace_transfer', 'launch_protocol', 'launch_client'):
+        path = root / (name + '.py')
+        module = sys.modules.get(name)
+        if module is not None:
+            if Path(getattr(module, '__file__', '')).resolve() != path:
+                raise ProtocolError('a2_client_module_collision')
+            continue
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise ProtocolError('a2_client_unavailable')
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            if sys.modules.get(name) is module:
+                del sys.modules[name]
+            raise
+    return sys.modules['launch_client']
+
+
+def _a2_files(body):
+    """One explicit JSON array in a level-2 A2 Files section; never infer paths."""
+    import re
+    headings = list(re.finditer(r'^##[ \t]+A2 Files[ \t]*$', body, re.MULTILINE))
+    if len(headings) != 1:
+        raise ProtocolError('a2_file_declaration_required')
+    text = body[headings[0].end():]
+    text = re.split(r'^##[ \t]+', text, maxsplit=1, flags=re.MULTILINE)[0].strip()
+    match = re.fullmatch(r'```json[ \t]*\n(.*?)\n```', text, re.DOTALL)
+    if match is None:
+        raise ProtocolError('a2_file_declaration_shape')
+    try:
+        files = json.loads(match.group(1))
+    except (ValueError, RecursionError) as exc:
+        raise ProtocolError('a2_file_declaration_json') from exc
+    if type(files) is not list:
+        raise ProtocolError('a2_file_declaration_list')
+    # The existing wire parser validates all path/count/conflict bounds below.
+    return files
+
+
+def make_a2_runner(task, workspace, environment):
+    """Bind dispatcher context before entering the graph; server revalidates it.
+
+    The sole successful result is the client's validated committed receipt. Any
+    transport failure may conceal a protected attempt and escapes to the CLI's
+    no-park path. No model identity is fabricated from the receipt.
+    """
+    # Capture only selector text here. Validation is lazy so a resumed graph
+    # that never enters implement does not require a new artifact declaration.
+    environment = dict(environment)
+    assigned_workspace = workspace
+    def prepare():
+        task_id = environment.get('HERMES_KANBAN_TASK', '')
+        board = environment.get('HERMES_KANBAN_BOARD', '')
+        run_text = environment.get('HERMES_KANBAN_RUN_ID', '')
+        if (task_id != task.id or workspace != environment.get('HERMES_KANBAN_WORKSPACE')
+                or not workspace or not Path(workspace).is_absolute()
+                or type(run_text) is not str or not run_text.isascii() or not run_text.isdecimal()
+                or str(int(run_text)) != run_text or int(run_text) != task.current_run_id
+                or task.status != 'running' or task.worker_pid != os.getpid()):
+            raise ProtocolError('a2_dispatch_assignment_mismatch')
+        client = _a2_client()
+        request = {'version': 1, 'operation': 'implement', 'board': board,
+                   'task_id': task_id, 'run_id': int(run_text), 'goal': task.body or '',
+                   'files': _a2_files(task.body or '')}
+        def validate(value):
+            raw=(json.dumps(value,ensure_ascii=True,allow_nan=False,separators=(',', ':'))+'\n').encode()
+            client.launch_protocol.parse_frame(raw)
+        validate(request)
+        return client, request, validate
+
+    parent = None
+    def parent_context():
+        nonlocal parent
+        from hermes_cli.build_graph_parent_git import ParentGit
+        if parent is None:
+            parent = ParentGit(task, assigned_workspace, environment.get('HERMES_KANBAN_BOARD', ''))
+        return parent
+
+    def derive(workspace):
+        try:
+            return parent_context().derive(workspace)
+        except Exception as exc:
+            raise A2ReconciliationRequired('a2_parent_git_binding_requires_reconciliation') from exc
+
+    used = False
+    def runner(*, goal, workspace: str, max_iterations, timeout_seconds, interrupt_check=None):
+        nonlocal used
+        if used:
+            raise A2ReconciliationRequired('a2_no_automatic_retry')
+        client, request, validate = prepare()
+        if workspace != assigned_workspace:
+            raise ProtocolError('a2_workspace_changed')
+        # Do not silently promise a shorter deadline than this fixed client.
+        # Iteration/model/resource policy belongs exclusively to root startup.
+        if workspace != environment.get('HERMES_KANBAN_WORKSPACE') or timeout_seconds != client.DEADLINE_SECONDS:
+            raise ProtocolError('a2_caller_budget_or_workspace_mismatch')
+        current = dict(request, goal=goal, files=list(request['files']))
+        validate(current)
+        if interrupt_check is not None and interrupt_check():
+            return _closed('interrupted')  # No channel has been opened.
+        used = True
+        try:
+            context = parent_context()
+            context.launch()
+            client.launch(current, interrupt_check=interrupt_check)
+            context.committed()
+        except Exception as exc:
+            raise A2ReconciliationRequired('a2_transport_requires_reconciliation') from exc
+        return _closed('completed')
+    runner.payload_workspace = '/workspace'
+    runner.derive = derive
+    return runner
+
+
 def run_implementer(*, goal: str, workspace: str, max_iterations: int,
                     timeout_seconds: float, interrupt_check: Optional[Callable[[], bool]] = None,
                     python_exe: Optional[str] = None, child_argv: Optional[list[str]] = None,
