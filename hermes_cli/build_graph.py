@@ -57,6 +57,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import stat
 import tempfile
 from typing import Any, Callable, Optional
 
@@ -165,6 +166,24 @@ def rc_class(rc: int) -> str:
 # model-call invocation (design section 0.1: the node invokes ONE CLI command)
 # --------------------------------------------------------------------------
 
+def _model_artifact_directory(workspace: str) -> str:
+    """Keep retained provider output in the graph's reserved metadata tree."""
+    from hermes_cli.build_graph_checkpoint import checkpoint_root
+
+    if not os.path.isdir(workspace):
+        raise OSError("model-call workspace is not a directory")
+    root = checkpoint_root(os.path.realpath(workspace))
+    try:
+        os.mkdir(root, 0o700)
+    except FileExistsError:
+        pass
+    info = os.lstat(root)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o022):
+        raise OSError("unsafe graph metadata directory")
+    return tempfile.mkdtemp(prefix="model-call-", dir=root)
+
+
 def call_model(
     *,
     activity: str,
@@ -197,14 +216,26 @@ def call_model(
     crosses the rc-9 case double-spends. Retry policy is a D5.4 question.
     """
     exe = exe or MODEL_CALL_EXE
-    fd, path = tempfile.mkstemp(prefix="graph-prompt-", suffix=".txt",
-                                dir=workspace if os.path.isdir(workspace) else None)
+    artifacts = None
+    try:
+        artifacts = _model_artifact_directory(workspace)
+        fd, path = tempfile.mkstemp(prefix="graph-prompt-", suffix=".txt",
+                                    dir=artifacts)
+    except OSError as exc:
+        if artifacts is not None:
+            try:
+                os.rmdir(artifacts)
+            except OSError:
+                pass
+        return {"rc": None, "klass": "failed",
+                "result": {"ok": False,
+                           "error": {"stage": "prepare", "detail": str(exc)}}}
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(prompt)
         argv = [exe, "--activity", activity, "--prompt-file", path,
                 "--card-id", card_id, "--task", task, "--component", component,
-                "--task-class", task_class, "--workspace", workspace,
+                "--task-class", task_class, "--workspace", artifacts,
                 "--mode", mode]
         if directive:
             argv += ["--directive", directive]
@@ -236,6 +267,11 @@ def call_model(
     finally:
         try:
             os.unlink(path)
+        except OSError:
+            pass
+        # Retain provider envelopes; remove only an empty per-call directory.
+        try:
+            os.rmdir(artifacts)
         except OSError:
             pass
 
