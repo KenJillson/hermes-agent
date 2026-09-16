@@ -128,6 +128,8 @@ import base64
 import json
 import os
 import tempfile
+import threading
+from functools import wraps
 from typing import Any, Iterable, Optional
 
 from langgraph.checkpoint.memory import InMemorySaver
@@ -242,6 +244,15 @@ def _dec_typed(item) -> Optional[tuple]:
     return (typ, base64.b64decode(b64.encode("ascii")))
 
 
+def _synchronized(method):
+    """Keep each checkpoint mutation and its persisted snapshot consistent."""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._checkpoint_lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
 class WorkspaceSaver(InMemorySaver):
     """InMemorySaver whose three stores are persisted to the card workspace.
 
@@ -258,6 +269,7 @@ class WorkspaceSaver(InMemorySaver):
                  max_checkpoints_per_thread: int = MAX_CHECKPOINTS_PER_THREAD,
                  max_envelope_bytes: int = MAX_ENVELOPE_BYTES,
                  hydrate: bool = True):
+        self._checkpoint_lock = threading.RLock()
         super().__init__(serde=serde)
         self._assert_shape()
         self.root = os.path.abspath(root)
@@ -272,6 +284,20 @@ class WorkspaceSaver(InMemorySaver):
         self.refused_reason = None
         if hydrate:
             self.hydrate()
+
+    @_synchronized
+    def get_tuple(self, config):
+        return super().get_tuple(config)
+
+    def list(self, config, *, filter=None, before=None, limit=None):
+        # Materialize under the lock; never hold it while yielding to a caller.
+        with self._checkpoint_lock:
+            rows = tuple(super().list(config, filter=filter, before=before, limit=limit))
+        yield from rows
+
+    @_synchronized
+    def delete_thread(self, thread_id):
+        return super().delete_thread(thread_id)
 
     # -- the private-attribute coupling, made loud -------------------------
 
@@ -303,6 +329,7 @@ class WorkspaceSaver(InMemorySaver):
 
     # -- write path --------------------------------------------------------
 
+    @_synchronized
     def put(self, config, checkpoint, metadata, new_versions):
         # Attribute BEFORE serialization, while channel names still exist.
         self.redacted_fields |= _redaction_fields(checkpoint.get("channel_values"))
@@ -310,33 +337,57 @@ class WorkspaceSaver(InMemorySaver):
         self.flush()
         return out
 
+    @_synchronized
     def put_writes(self, config, writes, task_id, task_path=""):
         out = super().put_writes(config, writes, task_id, task_path)
         self.flush()
         return out
 
+    @_synchronized
     def _prune(self) -> None:
-        """Drop the oldest checkpoints per (thread, ns) beyond the cap.
+        """Retain channel versions and writes only for retained checkpoints.
 
-        Blobs are keyed by (thread, ns, channel, version) and are not
-        reference-counted here. Dropping old checkpoints can therefore orphan
-        a few blobs, which wastes a little space and corrupts nothing. Building
-        reference tracking would mean parsing checkpoint msgpack to find live
-        channel versions -- a second authority on what a checkpoint references,
-        for a few KB. Recorded rather than solved.
+        Plan reference collection before mutation so a malformed checkpoint
+        fails without partially deleting history. Shared versions remain live
+        while any retained checkpoint references them, including other namespaces.
         """
         cap = self.max_checkpoints_per_thread
         if cap <= 0:
             return
-        for _thread_id, by_ns in self.storage.items():
-            for _ns, by_cp in by_ns.items():
-                if len(by_cp) <= cap:
-                    continue
-                # Checkpoint ids are uuid6: lexicographic order IS time order,
-                # which is why the base class's own list() sorts on them.
-                for stale in sorted(by_cp)[:len(by_cp) - cap]:
-                    by_cp.pop(stale, None)
+        retained = set()
+        versions = set()
+        stale = []
+        namespaces = set()
+        oldest = {}
+        for thread, by_ns in self.storage.items():
+            for ns, checkpoints in by_ns.items():
+                namespaces.add((thread, ns))
+                keep = sorted(checkpoints)[-cap:]
+                if keep:
+                    oldest[(thread, ns)] = keep[0]
+                for checkpoint_id in keep:
+                    checkpoint, _, _ = checkpoints[checkpoint_id]
+                    values = self.serde.loads_typed(checkpoint)
+                    if not isinstance(values, dict) or not isinstance(values.get("channel_versions"), dict):
+                        raise CheckpointShapeError("checkpoint channel_versions missing")
+                    retained.add((thread, ns, checkpoint_id))
+                    versions.update((thread, ns, channel, version)
+                                    for channel, version in values["channel_versions"].items())
+                stale.extend((thread, ns, checkpoint_id)
+                             for checkpoint_id in checkpoints if checkpoint_id not in keep)
+        for thread, ns, checkpoint_id in stale:
+            del self.storage[thread][ns][checkpoint_id]
+        for key in list(self.writes):
+            # LangGraph can publish pending writes before their checkpoint.
+            # Keep future IDs; only IDs older than retained history are stale.
+            if key[:2] in oldest and key[2] < oldest[key[:2]]:
+                del self.writes[key]
+        for key in list(self.blobs):
+            if key[:2] in namespaces and key not in versions:
+                del self.blobs[key]
 
+
+    @_synchronized
     def envelope(self) -> dict:
         """The full on-disk structure, as data.
 
@@ -400,6 +451,7 @@ class WorkspaceSaver(InMemorySaver):
         """
         return set(self.redacted_fields) | set(self.hydrated_redacted_fields or ())
 
+    @_synchronized
     def flush(self) -> None:
         """Write the envelope atomically. Never partially observable.
 
@@ -437,6 +489,7 @@ class WorkspaceSaver(InMemorySaver):
 
     # -- read path ---------------------------------------------------------
 
+    @_synchronized
     def hydrate(self) -> bool:
         """Load a previous envelope into the three stores. True if one existed.
 
