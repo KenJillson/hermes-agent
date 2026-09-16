@@ -2154,6 +2154,8 @@ def run_conversation(
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
+        # Request-scoped compatibility state: never mutate agent/provider defaults.
+        _thinking_prefill_recovery_binding = None
 
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
@@ -2242,6 +2244,22 @@ def run_conversation(
                         api_messages,
                         tools_for_api=tools_for_api,
                     )
+                # Only replay the exact failed custom-provider prefill with
+                # thinking disabled. Rebuilding kwargs must preserve this one
+                # request's recovery without leaking it across provider fallback.
+                if (
+                    _thinking_prefill_recovery_binding is not None
+                    and _thinking_prefill_recovery_binding == (
+                        agent.provider, agent.base_url, agent.model
+                    )
+                ):
+                    _prefill_extra = dict(api_kwargs.get("extra_body") or {})
+                    _prefill_template = dict(
+                        _prefill_extra.get("chat_template_kwargs") or {}
+                    )
+                    _prefill_template["enable_thinking"] = False
+                    _prefill_extra["chat_template_kwargs"] = _prefill_template
+                    api_kwargs["extra_body"] = _prefill_extra
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -4211,6 +4229,43 @@ def run_conversation(
                     )
 
                 retry_count += 1
+                # llama.cpp refuses assistant-prefill continuation while
+                # thinking is enabled. React only to its exact HTTP 400 on
+                # Hermes' marked recovery turn; consume the ordinary retry
+                # budget and allow at most one compatibility retry per request.
+                _prefill_error = getattr(api_error, "body", None)
+                if isinstance(_prefill_error, dict):
+                    _prefill_error = _prefill_error.get("error", _prefill_error)
+                _prefill_extra = (api_kwargs or {}).get("extra_body") or {}
+                _prefill_wire_messages = (api_kwargs or {}).get("messages") or []
+                if (
+                    status_code == 400
+                    and agent.provider == "custom"
+                    and agent.api_mode == "chat_completions"
+                    and _thinking_prefill_recovery_binding is None
+                    and retry_count < max_retries
+                    and isinstance(_prefill_error, dict)
+                    and _prefill_error.get("message") == (
+                        "Assistant response prefill is incompatible with enable_thinking."
+                    )
+                    and messages and messages[-1].get("_thinking_prefill") is True
+                    and _prefill_wire_messages
+                    and _prefill_wire_messages[-1].get("role") == "assistant"
+                    and isinstance(_prefill_extra, dict)
+                    and isinstance(_prefill_extra.get("chat_template_kwargs", {}), dict)
+                    and _prefill_extra.get("chat_template_kwargs", {}).get(
+                        "enable_thinking"
+                    ) is not False
+                ):
+                    _thinking_prefill_recovery_binding = (
+                        agent.provider, agent.base_url, agent.model
+                    )
+                    logger.warning(
+                        "Custom provider rejected thinking prefill; retrying this "
+                        "continuation with thinking disabled (%d/%d)",
+                        retry_count, max_retries,
+                    )
+                    continue
                 elapsed_time = time.time() - api_start_time
                 agent._touch_activity(
                     f"API error recovery (attempt {retry_count}/{max_retries})"
