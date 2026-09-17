@@ -1126,7 +1126,7 @@ def failing_checks(state) -> list:
     for v in (rec.get("verdicts") or []):
         if not isinstance(v, dict):
             continue
-        if v.get("kind") != "check":
+        if v.get("kind") != "check" or v.get("observation_only") is True:
             continue
         # 'failed' AND 'unrunnable' both drive the gate to `exception`
         # (run_ac_checks sets the verdict on either), so both are things the

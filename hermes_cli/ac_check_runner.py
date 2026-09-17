@@ -234,6 +234,11 @@ def run_ac_checks(ac_results, workspace, *, timeout=_DEFAULT_TIMEOUT,
     verdicts = []
     for r in (ac_results or []):
         base = {"index": r.get("index"), "kind": r.get("kind")}
+        # Only code-generated synthetic specs may request observation-only
+        # execution. Author AC parsing does not produce either marker.
+        if (r.get("kind") == "check" and r.get("synthetic") is True
+                and r.get("observation_only") is True):
+            base["observation_only"] = True
         if r.get("kind") == "judgment":
             verdicts.append({**base, "status": "needs_human",
                              "judgment": r.get("judgment")})
@@ -242,6 +247,33 @@ def run_ac_checks(ac_results, workspace, *, timeout=_DEFAULT_TIMEOUT,
                         timeout=timeout, isolation=isolation,
                         extra_ro_binds=extra_ro_binds)
         status = evaluate(r["check"], run)
+        if base.get("observation_only") is True:
+            # Ruff: 0 clean, 1 findings, 2 abnormal termination. Keep the
+            # ordinary authored-check exit contract unchanged.
+            if run.get("exit_code") not in (0, 1):
+                status = "unrunnable"
+            if status != "unrunnable":
+                try:
+                    findings = json.loads(run.get("stdout", ""))
+                    if (not isinstance(findings, list)
+                            or bool(findings) != (run.get("exit_code") == 1)
+                            or any(not isinstance(f, dict)
+                                   or not isinstance(f.get("code"), str)
+                                   or len(f["code"]) > 32 for f in findings)):
+                        raise ValueError("invalid Ruff findings envelope")
+                    counts = {}
+                    for finding in findings:
+                        code = finding["code"]
+                        counts[code] = counts.get(code, 0) + 1
+                    if len(counts) > 100:
+                        raise ValueError("unexpected Ruff rule count")
+                    base["finding_count"] = len(findings)
+                    base["rule_counts"] = counts
+                except (ValueError, TypeError):
+                    status = "unrunnable"
+                    base["observation_error"] = "invalid Ruff findings envelope"
+            base["stderr_tail"] = run.get("stderr", "")[-2000:]
+            base["stdout_truncated"] = len(run.get("stdout", "")) > 2000
         verdicts.append({**base, "status": status,
                          "command": r["check"]["command"],
                          "expect_kind": r["check"]["expect_kind"],
@@ -251,19 +283,21 @@ def run_ac_checks(ac_results, workspace, *, timeout=_DEFAULT_TIMEOUT,
                          "run_error": run["run_error"],
                          "isolation_used": run["isolation_used"],
                          "stdout_tail": run["stdout"][-2000:]})
-    checks = [v for v in verdicts if v["kind"] == "check"]
+    observations = [v for v in verdicts if v.get("observation_only") is True]
+    enforcing = [v for v in verdicts if v.get("observation_only") is not True]
+    checks = [v for v in enforcing if v["kind"] == "check"]
     passed = sum(1 for v in checks if v["status"] == "passed")
     summary = {
-        "ac_total": len(verdicts),
+        "ac_total": len(enforcing),
         "checks_total": len(checks),
         "checks_passed": passed,
         "checks_failed": sum(1 for v in checks if v["status"] == "failed"),
         "checks_unrunnable": sum(1 for v in checks if v["status"] == "unrunnable"),
-        "judgment_count": sum(1 for v in verdicts if v["kind"] == "judgment"),
+        "judgment_count": sum(1 for v in enforcing if v["kind"] == "judgment"),
         # "clean" = every check passed AND nothing needs a human (judgment/unrunnable)
         "all_clean": (len(checks) > 0
                       and passed == len(checks)
-                      and not any(v["kind"] == "judgment" for v in verdicts)),
+                      and not any(v["kind"] == "judgment" for v in enforcing)),
         "verdict": None,   # set below
     }
     if summary["checks_unrunnable"] or summary["checks_failed"]:
@@ -274,6 +308,14 @@ def run_ac_checks(ac_results, workspace, *, timeout=_DEFAULT_TIMEOUT,
         summary["verdict"] = "all_pass"            # candidate auto-accept (D4.4)
     else:
         summary["verdict"] = "no_checks"           # no runnable ACs at all
+    if observations:
+        summary["lint_observations"] = {
+            "total": len(observations),
+            "passed": sum(v["status"] == "passed" for v in observations),
+            "failed": sum(v["status"] == "failed" for v in observations),
+            "unrunnable": sum(v["status"] == "unrunnable" for v in observations),
+            "affects_routing": False,
+        }
     return verdicts, summary
 
 
@@ -339,7 +381,7 @@ def gate(card_id, body, workspace, *, parse_fn, isolation="auto",
         summary["persist_error"] = str(e)     # verdict still returned to caller
     if evidence_hook:
         for v in verdicts:
-            if v.get("kind") == "check":
+            if v.get("kind") == "check" and not v.get("observation_only"):
                 try:
                     evidence_hook(v.get("command"), str(workspace),
                                   v.get("exit_code"), v.get("stdout_tail", ""))

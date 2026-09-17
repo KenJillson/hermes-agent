@@ -111,6 +111,9 @@ import shlex
 # widened; staging into /usr is what makes tirith reachable without touching it.
 TIRITH = "/usr/local/bin/tirith"
 
+# D5.5 observation only; staging/version qualification precedes deployment.
+RUFF = "/usr/local/bin/ruff"
+
 TIRITH_PROFILE = "ai-agent-repo"
 
 # The clean predicate, applied to ONE per-file envelope arriving on stdin.
@@ -265,6 +268,37 @@ def tirith_ai_instruction_spec(index) -> dict:
                  _tirith_loop(quoted))
 
 
+def lint_observation_spec(workspace, files, index):
+    """Observe changed Python files without changing the authored gate verdict.
+
+    Ignore project/user configuration; never fix files or create a cache. Prefix
+    relative names so Ruff cannot interpret @response-file or option names.
+    Files outside the workspace (including escaping symlinks) are excluded and
+    counted. Existing syntax/tirith scope remains unchanged.
+    """
+    root = os.path.realpath(workspace)
+    safe = []
+    excluded = 0
+    for rel in files:
+        target = os.path.realpath(os.path.join(root, rel))
+        if (os.path.isabs(rel) or ".." in rel.split(os.sep)
+                or os.path.commonpath((root, target)) != root):
+            excluded += 1
+            continue
+        safe.append("./" + rel)
+    if not safe:
+        return None
+    argv = [RUFF, "check", "--isolated", "--no-cache", "--no-fix",
+            "--output-format", "json", "--select", "E4,E7,E9,F",
+            "--target-version", "py311", "--", *safe]
+    spec = _spec(index,
+                 "lint observation only: %d changed Python file(s); "
+                 "%d unsafe path(s) excluded" % (len(safe), excluded),
+                 " ".join(shlex.quote(arg) for arg in argv))
+    spec["observation_only"] = True
+    return spec
+
+
 def synthetic_specs(workspace: str, changed_files, *,
                     base_index: int = SYNTHETIC_INDEX_BASE) -> list:
     """The specs to append to a card's authored ac_results.
@@ -294,6 +328,11 @@ def synthetic_specs(workspace: str, changed_files, *,
         idx += 1
 
     specs.append(tirith_ai_instruction_spec(idx))
+    idx += 1
+    if py:
+        lint = lint_observation_spec(workspace, py, idx)
+        if lint is not None:
+            specs.append(lint)
     return specs
 
 
@@ -311,6 +350,8 @@ def wrap_parse_fn(parse_fn, workspace: str, changed_files):
         if not results:
             return count, passed, source, results
         extra = synthetic_specs(workspace, changed_files)
-        return (count or 0) + len(extra), passed, source, list(results) + extra
+        # Observation is persisted but must not inflate the enforcing AC count.
+        enforcing = sum(not s.get("observation_only", False) for s in extra)
+        return (count or 0) + enforcing, passed, source, list(results) + extra
 
     return _wrapped
