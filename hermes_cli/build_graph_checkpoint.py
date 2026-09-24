@@ -594,8 +594,7 @@ def make_workspace_checkpointer(workspace: str, *, schema_version=None,
     root = checkpoint_root(workspace)
     if schema_version is None:
         schema_version = _default_schema_version()
-    probe = InMemorySaver()
-    serde = sz.SanitizingSerde(probe.serde)
+    serde = sz.make_serde()
     saver = WorkspaceSaver(root, serde=serde, schema_version=schema_version,
                            hydrate=hydrate)
     return saver, serde

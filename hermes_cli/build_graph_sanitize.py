@@ -348,6 +348,20 @@ class SanitizingSerde:
         return self.inner.loads(data)
 
 
+def make_serde():
+    """Redaction plus explicit strict deserialization, independent of worker env.
+
+    Both checkpoint factories use this same boundary. Preserve the installed
+    serializer format and safe built-in types; do not revive arbitrary msgpack
+    constructor extensions or enable pickle fallback. Postgres remains D5.3.
+    """
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    return SanitizingSerde(JsonPlusSerializer(
+        pickle_fallback=False, allowed_json_modules=None,
+        allowed_msgpack_modules=None))
+
+
 def make_checkpointer():
     """InMemorySaver with checkpoint sanitation installed.
 
@@ -358,5 +372,5 @@ def make_checkpointer():
     """
     from langgraph.checkpoint.memory import InMemorySaver
 
-    serde = SanitizingSerde(InMemorySaver().serde)
+    serde = make_serde()
     return InMemorySaver(serde=serde), serde
