@@ -324,12 +324,16 @@ web = ["fastapi==0.133.1", "uvicorn[standard]==0.41.0", "starlette==1.3.1", "pyt
 # exclude-newer. Being in both [all] and LAZY_DEPS is also forbidden by
 # tests/test_project_metadata.py.
 #
-# langgraph-checkpoint (base) arrives transitively and carries the in-memory
-# saver D5.1 uses. langgraph-checkpoint-sqlite and langgraph-checkpoint-redis
-# are deliberately NOT declared: they are the packages the unverified CVE
-# claim names (d5.1-build-harness-graph-v2.md 8.2), and pinning the real CVE
-# identifiers is a blocking gate on D5.3.
-graph = ["langgraph==1.2.10"]
+# The workspace backend uses the dedicated local Postgres peer route. Keep the
+# pure-Python adapter and pool pinned to the qualified, quarantine-eligible set.
+# SQLite/Redis checkpoint backends are not part of this deployment; the corrected
+# security rationale is owned by the system architecture's checkpoint section.
+graph = [
+  "langgraph==1.2.10",
+  "langgraph-checkpoint-postgres==3.1.2",
+  "psycopg==3.3.5",
+  "psycopg-pool==3.3.1",
+]
 all = [
   # Policy (2026-05-12): `[all]` includes only extras that genuinely
   # CAN'T be lazy-installed via `tools/lazy_deps.py` — i.e. things every

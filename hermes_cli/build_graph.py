@@ -1437,42 +1437,58 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
         directive=None, deps=None, thread_id=None, recursion_limit=40,
         agent=None,
         checkpoint="memory", resume=False):
-    """Entry point (fork ruling 1: worker-side, offline-testable).
+    """Run the graph with memory state or the fixed Postgres workspace backend.
 
-    NO HTTP SURFACE, structurally (section 4.1). This module exposes none.
-
-    checkpoint="memory"     D5.1 behaviour. InMemorySaver, no durability. This
-                            is the DEFAULT, so nothing that calls run() today
-                            changes behaviour.
-              "workspace"   CD-032. Persisted under the card workspace.
-
-    resume=True adopts an existing checkpoint for this thread. It requires
-    checkpoint="workspace", and it is OPT-IN rather than automatic: thread_id
-    defaults to "<task_id>:<component>", which is STABLE ACROSS DISPATCHES, so
-    an automatic resume would silently re-enter a card that already finished.
-    Explicit opt-in is the same posture as CD-028's Ken-only routing column.
-
-    RESUME SEMANTICS -- verified on the box 2026-08-19, and the two cases are
-    not the same:
-
-      * INTERRUPTED thread (a node raised): invoke(None) CONTINUES at the
-        crashed node; completed supersteps are not repeated.
-      * TERMINAL thread (reached END): a PARTIAL input RE-ENTERS FROM START
-        with the named channels merged over the restored ones, and channels
-        not named survive untouched.
-
-    This function takes the SECOND form deliberately. `plan` and `diff` are
-    RE-DERIVED by the caller, which holds the worktree, and passed as the
-    partial input; control state (rung, rung_attempts, cloud_review_calls, the
-    objection sets, the recurrence fields) comes off the checkpoint. That is
-    correct independently of the sanitizer being lossy: the worktree is the
-    truth and a checkpoint is a stale copy of it, so restoring a diff from a
-    checkpoint older than the worktree is wrong even with perfect fidelity.
-
-    Re-entering at cheap_gate with rung_attempts preserved is precisely what
-    makes the section 2.2 rung caps bind ACROSS dispatches instead of resetting
-    on every one.
+    Workspace mode binds the authoritative board/card/workspace identity to a
+    durable scope. It never imports legacy state implicitly or falls back to a
+    fresh memory graph after a storage refusal. Connection ownership covers
+    construction, resume refusal, invocation and every exceptional exit.
     """
+    options = dict(
+        body=body,
+        component=component,
+        plan=plan,
+        diff=diff,
+        diff_files=diff_files,
+        diff_added_lines=diff_added_lines,
+        changed_files=changed_files,
+        directive=directive,
+        deps=deps,
+        thread_id=thread_id,
+        recursion_limit=recursion_limit,
+        agent=agent,
+        checkpoint=checkpoint,
+        resume=resume)
+    if checkpoint != "workspace":
+        return _run_with_checkpointer(conn, task_id, workspace, **options)
+    try:
+        from psycopg import Error as PostgresError
+        from hermes_cli.build_graph_pg.workspace_postgres import open_workspace_checkpointer
+        from hermes_cli.build_graph_pg.workspace_identity import IdentityRefused
+        from hermes_cli.build_graph_pg.scope_registry import RegistrationRefused
+        from hermes_cli.build_graph_pg.scoped_postgres_saver import ScopeRefused
+    except ImportError:
+        refused = "checkpoint_storage_refused:adapter_unavailable"
+    else:
+        try:
+            with open_workspace_checkpointer(conn, task_id, workspace) as pair:
+                return _run_with_checkpointer(conn, task_id, workspace,
+                                              _workspace_pair=pair, **options)
+        except (PostgresError, IdentityRefused, RegistrationRefused, ScopeRefused) as exc:
+            refused = "checkpoint_storage_refused:" + type(exc).__name__
+    parked = new_workflow_state(task_id, component, plan=plan, diff=diff,
+                               diff_files=diff_files, diff_added_lines=diff_added_lines,
+                               directive=directive)
+    parked["terminal_reason"] = refused
+    return parked
+
+
+def _run_with_checkpointer(conn, task_id, workspace, *, body="", component="main", plan="", diff="",
+        diff_files=0, diff_added_lines=0, changed_files=None,
+        directive=None, deps=None, thread_id=None, recursion_limit=40,
+        agent=None,
+        checkpoint="memory", resume=False, _workspace_pair=None):
+    """Execute with a caller-owned durable saver, or the existing memory saver."""
     deps = deps or Deps(conn=conn, task_id=task_id, workspace=workspace, body=body)
     deps.conn, deps.task_id, deps.workspace, deps.body = conn, task_id, workspace, body
     # CD-041: default None, so every existing caller -- cli.py included --
@@ -1505,7 +1521,9 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
     if checkpoint == "workspace":
         from hermes_cli import build_graph_checkpoint as _ck
         ckmod = _ck
-        pair = ckmod.make_workspace_checkpointer(workspace)
+        if _workspace_pair is None:
+            raise ValueError("Workspace checkpointer must be opened by run()")
+        pair = _workspace_pair
 
     app, serde = build(deps, checkpointer=pair)
 
@@ -1549,13 +1567,9 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
         # look, so the presence of a checkpoint for THIS thread is the
         # whole decision, and run() already holds the saver.
         #
-        # This cannot re-enter a finished card. complete_task removes the
-        # workspace, and checkpoint_root is a managed descendant of it, so
-        # the checkpoint goes with it (checkpoint_root docstring). A card
-        # that finished has nothing to resume from; a card that PARKED
-        # keeps both, and is exactly the card whose rung_attempts must
-        # carry. RUNG_ATTEMPT_CAP is 1 -- without this the ladder resets
-        # every dispatch and the cap does almost no work.
+        # The assigned caller requests auto-resume. Worktree/dir checkpoints
+        # are retained, while eligible scratch cleanup removes its registered
+        # state. Preserve control counters whenever this thread still exists.
         resume = bool(pair[0].has_thread(tid))
 
     if resume:

@@ -6429,6 +6429,13 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
+def _cleanup_checkpoint_workspace(conn, task_id, workspace):
+    """Coordinate scratch deletion with its registered Postgres checkpoints."""
+    import shutil
+    from hermes_cli.build_graph_pg.scope_lifecycle import cleanup_scratch
+    return cleanup_scratch(conn, task_id, str(workspace), remove=shutil.rmtree)
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
@@ -6478,7 +6485,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # completion would unconditionally ``shutil.rmtree`` that path
             # and silently delete the user's source data.
             if _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
+                _cleanup_checkpoint_workspace(conn, task_id, wp)
                 _log.debug("Removed scratch workspace: %s", wp)
             else:
                 _log.warning(
@@ -6495,7 +6502,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         # proceed (#33774).
         _try_cleanup_parent_workspaces(conn, task_id)
     except Exception:
-        pass  # best-effort — never block completion
+        _log.warning("Checkpoint-aware scratch cleanup deferred for task %s", task_id, exc_info=True)
 
 
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
@@ -6532,10 +6539,10 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             import shutil
             wp = Path(row["workspace_path"])
             if wp.is_dir() and _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
+                _cleanup_checkpoint_workspace(conn, parent_id, wp)
                 _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
-        pass  # best-effort
+        _log.warning("Checkpoint-aware parent scratch cleanup deferred after task %s", task_id, exc_info=True)
 
 
 def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
