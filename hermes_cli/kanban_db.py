@@ -735,6 +735,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
     return meta
 
 
+@_maintenance_admitted
 def write_board_metadata(
     board: Optional[str],
     *,
@@ -787,6 +788,7 @@ def write_board_metadata(
     return meta
 
 
+@_maintenance_admitted
 def create_board(
     slug: str,
     *,
@@ -2190,6 +2192,7 @@ def repair_db(
         )
 
 
+@_maintenance_admitted
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -2337,6 +2340,7 @@ def connect_closing(
             pass
 
 
+@_maintenance_admitted
 def init_db(
     db_path: Optional[Path] = None,
     *,
