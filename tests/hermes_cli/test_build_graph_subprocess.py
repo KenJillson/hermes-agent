@@ -1,4 +1,4 @@
-"""Behavior tests for build_graph's enabled A1 entry and owned runner seam."""
+"""Behavior tests for stage-gated entry and the retained owned runner seam."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def _write_fixture(**kwargs):
 
 
 @pytest.mark.parametrize("diff,reason,expected", [
-    ("", None, "implement"), (" \n\t", None, "implement"),
+    ("", None, "plan"), (" \n\t", None, "plan"),
     ("+x\n", None, "cheap_gate"), ("", "prior", "human"),
     ("+x\n", "prior", "human"),
 ])
@@ -77,7 +77,7 @@ def test_enabled_entry_and_compiled_destination(worktree, diff, reason, expected
 
 
 @pytest.mark.parametrize("diff", ["", " \n\t"])
-def test_full_run_implements_derives_then_real_no_checks_gate(worktree, diff):
+def test_full_run_empty_diff_parks_without_consuming_payload(worktree, diff):
     deps, calls = _full_deps(worktree, _write_fixture)
     conn = sqlite3.connect(":memory:")
     try:
@@ -85,14 +85,11 @@ def test_full_run_implements_derives_then_real_no_checks_gate(worktree, diff):
                           body="Change fixture.txt to after. No acceptance block.")
     finally:
         conn.close()
-    assert state["terminal_reason"] == "human_review"
-    assert state["gate_summary"]["verdict"] == "no_checks"
-    assert "+after" in state["diff"] and "-before" in state["diff"]
-    assert state["diff_files"] == 1 and state["diff_added_lines"] == 1
-    assert deps.changed_files == ["fixture.txt"]
-    assert state["rung_attempts"]["implement"] == 1
-    assert state["implementer_model"] == "fixture-local-model"
-    assert calls == {"runner": 1, "gate": 1, "model": 0}
+    assert state["terminal_reason"] == "node_not_implemented:plan"
+    assert not state["rung_attempts"].get("implement")
+    assert state["cloud_review_calls"] == 0
+    assert (worktree / "fixture.txt").read_text() == "before\n"
+    assert calls == {"runner": 0, "gate": 0, "model": 0}
 
 
 def test_nonempty_diff_bypasses_implementer(worktree):
@@ -126,52 +123,55 @@ def test_prior_terminal_reason_skips_child_and_gate(worktree):
     ({"status": "invented"}, "implement_unknown_status"),
     ("completed", "implement_protocol_error"),
 ])
-def test_full_run_failure_never_reaches_gate(worktree, raw, reason):
+def test_retained_node_failure_never_routes_to_gate(worktree, raw, reason):
     deps, calls = _full_deps(worktree, lambda **kw: raw)
-    conn = sqlite3.connect(":memory:")
-    try:
-        state = graph.run(conn, "t_a1", str(worktree), deps=deps,
-                          body="Change fixture.txt to after")
-    finally:
-        conn.close()
+    deps.body = "Change fixture.txt to after"
+    state = _state()
+    state.update(graph.make_implement(deps)(state))
+    assert graph.route_after_implement(state) == "human"
     assert state["terminal_reason"] == reason
     assert state["rung_attempts"]["implement"] == 1
     assert calls == {"runner": 1, "gate": 0, "model": 0}
 
 
-def test_full_run_noop_parks_before_gate(worktree):
+def test_retained_node_noop_parks_before_gate(worktree):
     from hermes_cli.build_graph_diff import EMPTY_DIFF_REASON
     deps, calls = _full_deps(worktree, lambda **kw: {
         "status": "completed", "identity": {"model": "fixture-local-model"}})
-    conn = sqlite3.connect(":memory:")
-    try:
-        state = graph.run(conn, "t_a1", str(worktree), deps=deps,
-                          body="Change fixture.txt to after")
-    finally:
-        conn.close()
+    deps.body = "Change fixture.txt to after"
+    state = _state()
+    state.update(graph.make_implement(deps)(state))
+    assert graph.route_after_implement(state) == "human"
     assert state["terminal_reason"] == EMPTY_DIFF_REASON
     assert calls == {"runner": 1, "gate": 0, "model": 0}
 
 
-def test_resume_preserves_consumed_attempt(worktree):
-    deps, calls = _full_deps(worktree, lambda **kw: {"status": "failed"})
+def test_repeated_memory_entry_preserves_legacy_attempt_without_invocation(worktree):
+    deps, calls = _full_deps(worktree, lambda **kw: pytest.fail("runner called"))
+    app, _ = graph.build(deps)
+    state = _state()
+    state["rung_attempts"]["implement"] = 1
+    config = {"configurable": {"thread_id": "legacy-entry"}}
+    first = app.invoke(state, config)
+    second = app.invoke({"terminal_reason": None, "diff": ""}, config)
+    assert first["terminal_reason"] == second["terminal_reason"] == "node_not_implemented:plan"
+    assert first["rung_attempts"]["implement"] == second["rung_attempts"]["implement"] == 1
+    assert calls == {"runner": 0, "gate": 0, "model": 0}
+
+
+def test_workspace_adapter_refuses_unregistered_identity(worktree):
+    deps, calls = _full_deps(worktree, lambda **kw: pytest.fail("runner called"))
     conn = sqlite3.connect(":memory:")
     try:
-        first = graph.run(conn, "t_a1", str(worktree), deps=deps,
-                          body="Change fixture.txt to after", checkpoint="workspace",
-                          resume="auto")
-        second = graph.run(conn, "t_a1", str(worktree), deps=deps,
-                           body="Change fixture.txt to after", checkpoint="workspace",
-                           resume="auto")
+        state = graph.run(conn, "t_a1", str(worktree), deps=deps,
+                          body="A specification", checkpoint="workspace", resume="auto")
     finally:
         conn.close()
-    assert first["terminal_reason"] == "implement_failed"
-    assert second["terminal_reason"] == "implement_attempt_cap"
-    assert second["rung_attempts"]["implement"] == 1
-    assert calls == {"runner": 1, "gate": 0, "model": 0}
+    assert state["terminal_reason"] == "checkpoint_storage_refused:IdentityRefused"
+    assert calls == {"runner": 0, "gate": 0, "model": 0}
 
 
-def test_zero_cap_refuses_paid_review_after_implementation(worktree):
+def test_zero_cap_refuses_paid_review_on_existing_work(worktree):
     from hermes_cli import kanban_db
     deps, calls = _full_deps(worktree, _write_fixture)
     # Keep the real arbiter and cap predicate; isolate the AC subprocess here.
@@ -184,15 +184,15 @@ def test_zero_cap_refuses_paid_review_after_implementation(worktree):
         task_id = kanban_db.create_task(conn, title="A1 zero-cap fixture")
         assert kanban_db.set_max_card_spend(conn, task_id, 0.0)
         state = graph.run(conn, task_id, str(worktree), deps=deps,
-                          body="Change fixture.txt to after")
+                          body="Review existing work", diff="+existing\n")
     finally:
         conn.close()
     assert state["terminal_reason"] == "over_spend_cap"
-    assert calls == {"runner": 1, "gate": 1, "model": 0}
+    assert calls == {"runner": 0, "gate": 1, "model": 0}
 
 
 @pytest.mark.parametrize("with_ac", [False, True])
-def test_dispatcher_clean_worktree_reaches_owned_implementation(monkeypatch, worktree, with_ac):
+def test_dispatcher_clean_worktree_parks_at_unbuilt_plan(monkeypatch, worktree, with_ac):
     """Exercise the imported dispatcher entry, including the empty-diff exemption."""
     from types import SimpleNamespace
     import cli
@@ -218,7 +218,7 @@ def test_dispatcher_clean_worktree_reaches_owned_implementation(monkeypatch, wor
     deps, calls = _full_deps(worktree, _write_fixture)
     if with_ac:
         # AC transport is a separate integration; this case proves the
-        # dispatcher exemption, then the real graph's per-node spend refusal.
+        # dispatcher exemption, followed by the unbuilt planning park.
         def passing_gate(*args, **kwargs):
             calls["gate"] += 1
             assert kwargs["parse_fn"](body)[3]
@@ -249,11 +249,12 @@ def test_dispatcher_clean_worktree_reaches_owned_implementation(monkeypatch, wor
         return True
     monkeypatch.setattr(kanban_db, "block_task", block)
     assert cli._run_build_graph_q(SimpleNamespace(agent=None)) == 0
-    expected = "over_spend_cap" if with_ac else "human_review"
+    expected = "node_not_implemented:plan"
     assert parked == [(task_id, "graph_terminal:" + expected, "needs_input")]
     assert observed["terminal_reason"] == expected
-    assert "+after" in observed["diff"]
-    assert calls == {"runner": 1, "gate": 1, "model": 0}
+    assert observed["diff"] == ""
+    assert not observed["rung_attempts"].get("implement")
+    assert calls == {"runner": 0, "gate": 0, "model": 0}
 
 
 def test_full_run_empty_spec_never_spawns(worktree):
@@ -263,7 +264,7 @@ def test_full_run_empty_spec_never_spawns(worktree):
         state = graph.run(conn, "t_a1", str(worktree), deps=deps, body=" \n\t")
     finally:
         conn.close()
-    assert state["terminal_reason"] == "implement_no_spec"
+    assert state["terminal_reason"] == "node_not_implemented:plan"
     assert not state["rung_attempts"].get("implement")
     assert calls == {"runner": 0, "gate": 0, "model": 0}
 
@@ -273,12 +274,10 @@ def test_missing_runner_import_parks(monkeypatch, worktree):
     deps, calls = _full_deps(worktree, lambda **kw: pytest.fail("runner called"))
     deps.implement_runner = None
     monkeypatch.setitem(sys.modules, "hermes_cli.build_graph_implementer", None)
-    conn = sqlite3.connect(":memory:")
-    try:
-        state = graph.run(conn, "t_a1", str(worktree), deps=deps,
-                          body="Change fixture.txt to after")
-    finally:
-        conn.close()
+    deps.body = "Change fixture.txt to after"
+    state = _state()
+    state.update(graph.make_implement(deps)(state))
+    assert graph.route_after_implement(state) == "human"
     assert state["terminal_reason"] == "implement_runner_unavailable"
     assert calls == {"runner": 0, "gate": 0, "model": 0}
 

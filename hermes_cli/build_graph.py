@@ -11,8 +11,8 @@ primitive has been READ AT SOURCE this session:
             classify_failure, fix_rung1, fix_rung2 (all model-call), assemble,
             human, and fix_rung3 through the separate prompt-only Codex CLI
   unbuilt   plan, plan_review, local_review
-  built     implement -- owned local subprocess for empty/whitespace diffs;
-            existing terminal reasons still park at human; see route_entry().
+  built     implement -- retained owned local subprocess node; fresh empty
+            work products park at unbuilt plan pending the stage protocol.
 
 The line is not arbitrary. `plan` and `local_review` still need work-product
 contracts that do not exist -- a plan and a verdict. A1 supplies the owned
@@ -21,11 +21,12 @@ local application, durable request accounting and independent rung/review caps.
 
 The unbuilt nodes are present in the topology with their edges wired.
 
-A1 ENABLES THE OWNED IMPLEMENTER AT EMPTY-DIFF ENTRY. START remains a
-conditional edge: a card with a diff goes straight to cheap_gate, while an
-empty or whitespace-only diff enters implement. A prior terminal reason
-always parks at human. Successful implementation re-derives the work product
-before the cheap gate; failed implementation parks without entering the gate.
+STAGE CONTRACT RULING 2026-09-27. START remains conditional: an existing diff
+enters cheap_gate; an empty or whitespace-only diff enters the explicitly
+unbuilt plan node and parks. Planning cannot consume the one-use implement
+payload or bypass A2. Real planning/review edges wait for qualified stage receipts.
+A prior terminal reason still parks at human. Existing checkpoint resume remains
+separate from fresh START routing.
 
 AN UNBUILT NODE ROUTES TO `human`. IT DOES NOT RAISE.
 A raise inside a node kills the run, and under the in-memory checkpointer that
@@ -470,9 +471,9 @@ def unbuilt(name: str):
 def make_implement(deps: Deps):
     """Design section 1: run one owned local subprocess, then derive its diff.
 
-    START enters this node for empty or whitespace-only diffs without a prior
-    terminal reason. Its outbound conditional route enters cheap_gate only
-    after successful implementation and diff derivation; failures park at human.
+    Fresh START no longer enters this node while the stage protocol is absent.
+    The retained node's outbound route enters cheap_gate only after successful
+    implementation and diff derivation; failures park at human.
 
     The runner owns PID/PGID, cwd, prompt-file transport, iteration and wall
     budgets, provider-locality checks, interrupt propagation, and mandatory
@@ -1380,17 +1381,17 @@ def route_after_classify(state):
 
 
 def route_entry(state):
-    """START. Empty work products enter the owned local implementer.
+    """Fresh empty work products wait for the approved stage protocol.
 
-    A prior terminal reason parks at human. A non-empty diff enters cheap_gate.
-    Empty and whitespace-only diffs enter make_implement, which enforces the
-    specification and persistent attempt cap before spawning its child.
+    The unbuilt plan node parks with an explicit reason. Never consume the
+    legacy one-use implement payload to work around missing planning stages.
+    Existing diffs retain cheap-gate routing; prior terminal reasons park.
     """
     if state.get("terminal_reason"):
         return "human"
     if (state.get("diff") or "").strip():
         return "cheap_gate"
-    return "implement"
+    return "plan"
 
 
 def route_after_implement(state):
@@ -1468,8 +1469,9 @@ def build(deps: Deps, *, checkpointer=None):
         _add(name, unbuilt(name))
         g.add_edge(name, "human")
 
-    # The owned implementer is reachable from START; terminal failures park
-    # before the cheap gate can evaluate an absent or stale work product.
+    # Retain the implementation node for existing checkpoint continuations.
+    # Fresh START parks at unbuilt plan until qualified stages are wired.
+    # Terminal failures park before cheap_gate can evaluate a stale product.
     _add("implement", make_implement(deps))
     _cond("implement", route_after_implement,
           {"cheap_gate": "cheap_gate", "human": "human"})
@@ -1480,7 +1482,7 @@ def build(deps: Deps, *, checkpointer=None):
     # builder.edges will report START as unwired. Verified against
     # langgraph 1.2.10.
     _cond(START, route_entry,
-          {"implement": "implement", "cheap_gate": "cheap_gate", "human": "human"})
+          {"plan": "plan", "cheap_gate": "cheap_gate", "human": "human"})
 
     _cond(
         "cheap_gate", lambda s: route_after_gate(s, deps),
