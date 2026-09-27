@@ -53,6 +53,37 @@ class GraphContract(unittest.TestCase):
             objection_recurred=True,dispute_class='approach_disputed',implementer_model='sonnet',reviewer_model='opus')
         return self.state
 
+    def test_both_review_rounds_receive_specification_without_inventing_plan(self):
+        self.state['plan'] = ''  # The actual production caller's current input.
+        before = copy.deepcopy(self.state)
+        seen = []
+        def reviewer(**kw):
+            seen.append(kw)
+            return dict(klass='ok', result=dict(model='opus', verdict={'passed': True}))
+        self.deps.model = reviewer
+        for activity in ('code_review', 're_review'):
+            update = bg.make_cloud_review(self.deps, activity=activity, node_name=activity)(self.state)
+            self.assertTrue(update['last_verdict_passed'])
+            self.assertEqual(update['cloud_review_calls'], 1)
+        self.assertEqual([v['activity'] for v in seen], ['code_review', 're_review'])
+        for request in seen:
+            self.assertIn('SPECIFICATION (task requirements):\n' + self.deps.body, request['prompt'])
+            self.assertIn('PLAN:\n\n\nDIFF:\n' + self.state['diff'], request['prompt'])
+            self.assertEqual(request['mode'], 'read_only')
+        self.assertEqual(self.state, before)
+        self.assertEqual(self.deps.body, 'Return the verified integer. Acceptance: answer is 2.')
+
+    def test_review_requirements_do_not_bypass_review_or_spend_caps(self):
+        def forbidden(**kw):
+            self.fail('A capped review reached the provider')
+        self.deps.model = forbidden
+        node = bg.make_cloud_review(self.deps, activity='re_review', node_name='cloud_re_review')
+        self.state['cloud_review_calls'] = bg.CLOUD_REVIEW_CAP
+        self.assertEqual(node(self.state)['terminal_reason'], 'cloud_review_cap')
+        self.state['cloud_review_calls'] = 0
+        self.deps.over_cap = lambda *args: True
+        self.assertEqual(node(self.state)['terminal_reason'], 'over_spend_cap')
+
     def test_rung3_uses_both_positions_applies_local_and_rederives(self):
         state=self.disputed();before=copy.deepcopy(state)
         update=bg.make_fix_rung3(self.deps)(state)

@@ -680,7 +680,7 @@ def make_cloud_review(deps: Deps, *, activity: str, node_name: str):
         refusal = spend_gate(deps, state)
         if refusal:
             return refusal
-        prompt = build_review_prompt(state)
+        prompt = build_review_prompt(state, task_body=deps.body)
         out = deps.model(
             activity=activity, prompt=prompt, workspace=deps.workspace,
             card_id=state["card_id"], component=state["component"],
@@ -1095,10 +1095,15 @@ def build_implement_context(state):
     return state.get("directive") or None
 
 
-def build_review_prompt(state) -> str:
+def build_review_prompt(state, *, task_body="") -> str:
+    # The production caller has no plan-node output yet. Preserve that empty
+    # plan honestly; give both review rounds the actual task requirements on
+    # the existing sanitized model-call path, without checkpointing the body.
     return ("Review the following change for component %r of card %s.\n\n"
+            "SPECIFICATION (task requirements):\n%s\n\n"
             "PLAN:\n%s\n\nDIFF:\n%s\n"
-            % (state["component"], state["card_id"], state["plan"], state["diff"]))
+            % (state["component"], state["card_id"], task_body,
+               state["plan"], state["diff"]))
 
 
 MAX_FAILED_CHECKS_IN_PROMPT = 6
