@@ -9,16 +9,15 @@ primitive has been READ AT SOURCE this session:
 
   built     cheap_gate (ac_check_runner.gate), cloud_review, cloud_re_review,
             classify_failure, fix_rung1, fix_rung2 (all model-call), assemble,
-            human, and fix_rung3 as an auth-deferred node (section 8 deferral 6)
+            human, and fix_rung3 through the separate prompt-only Codex CLI
   unbuilt   plan, plan_review, local_review
   built     implement -- owned local subprocess for empty/whitespace diffs;
             existing terminal reasons still park at human; see route_entry().
 
 The line is not arbitrary. `plan` and `local_review` still need work-product
-contracts that do not exist -- a plan and a verdict -- and fix_rung3's real
-body wraps the still-unread `terminal()` primitive. A1 replaces implement's
-former in-process `delegate_task` call with an owned subprocess, but does not
-invent either missing deliverable or widen fix_rung3.
+contracts that do not exist -- a plan and a verdict. A1 supplies the owned
+implementer subprocess. The authenticated third rung preserves prompt-only
+local application, durable request accounting and independent rung/review caps.
 
 The unbuilt nodes are present in the topology with their edges wired.
 
@@ -182,6 +181,27 @@ def _model_artifact_directory(workspace: str) -> str:
             or stat.S_IMODE(info.st_mode) & 0o022):
         raise OSError("unsafe graph metadata directory")
     return tempfile.mkdtemp(prefix="model-call-", dir=root)
+
+
+def call_codex(*, activity, prompt, card_id, component, directive=None, **_unused):
+    """One separate CLI; no user-selected provider, path or credentials."""
+    if activity != "fix_codex":
+        return {"klass": "failed", "rc": None, "result": {"ok": False}}
+    message = dict(card_id=card_id, component=component, prompt=prompt, directive=directive)
+    try:
+        result = subprocess.run(
+            ["/usr/bin/python3", "-I", "-B", "/home/jetson/.hermes/lib/model_call/bin/codex-call"],
+            input=json.dumps(message, allow_nan=False), text=True, capture_output=True, timeout=330)
+        if len(result.stdout.encode()) > 8 * 1024 * 1024:
+            raise ValueError("oversized Codex result")
+        reply = json.loads(result.stdout)
+        if not isinstance(reply, dict):
+            raise ValueError("invalid Codex result")
+        ok = result.returncode == 0 and reply.get("ok") is True
+        return {"klass": "ok" if ok else "failed", "rc": result.returncode, "result": reply}
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return {"klass": "failed", "rc": None,
+                "result": {"ok": False, "cost_usd": None, "collection_required": True}}
 
 
 def call_model(
@@ -383,12 +403,13 @@ class Deps:
     """
 
     def __init__(self, *, gate=None, arbiter=None, model=None, parse_ac=None,
-                 agent=None, implement_runner=None, derive=None, over_cap=None,
+                 agent=None, implement_runner=None, derive=None, over_cap=None, codex=None,
                  conn=None, task_id="", workspace="", body="",
                  changed_files=None):
         self.gate = gate
         self.arbiter = arbiter
         self.model = model or call_model
+        self.codex = codex or call_codex
         self.parse_ac = parse_ac
         self.conn = conn
         self.task_id = task_id
@@ -695,14 +716,19 @@ def make_classify_failure(deps: Deps):
     """
 
     def _node(state):
-        prompt = ev.build_classify_prompt(state["objections_prior"],
-                                          state["objections_current"])
-        out = deps.model(activity="classify", prompt=prompt,
-                         workspace=deps.workspace, card_id=state["card_id"],
-                         component=state["component"], mode="none")
-        res = out.get("result") or {}
-        answer = (ev.parse_classify_response(res.get("text"))
-                  if out["klass"] == "ok" else None)
+        res = {}
+        answer = None
+        if (state.get("rung") == "rung1"
+                and state.get("rung_attempts", {}).get("rung1", 0) == 1
+                and state.get("objections_prior") and state.get("objections_current")):
+            prompt = ev.build_classify_prompt(state["objections_prior"],
+                                              state["objections_current"])
+            out = deps.model(activity="classify", prompt=prompt,
+                             workspace=deps.workspace, card_id=state["card_id"],
+                             component=state["component"], mode="none")
+            res = out.get("result") or {}
+            answer = (ev.parse_classify_response(res.get("text"))
+                      if out["klass"] == "ok" else None)
         decided = ev.decide_recurrence(
             answer,
             implementer_model=state["implementer_model"],
@@ -889,7 +915,7 @@ def apply_fix(workspace, text, allowed):
     return changed, None
 
 
-def make_fix(deps: Deps, *, rung: str, activity: str):
+def make_fix(deps: Deps, *, rung: str, activity: str, model=None, prompt_builder=None):
     """fix_rung1 / fix_rung2. PROMPT-ONLY; the harness applies the answer.
 
     CD-051. THIS NODE USED TO SEND A LOCAL PATH TO ANOTHER MACHINE. It passed
@@ -937,11 +963,17 @@ def make_fix(deps: Deps, *, rung: str, activity: str):
         refusal = spend_gate(deps, state)
         if refusal:
             return refusal
-        out = deps.model(
-            activity=activity, prompt=build_fix_prompt(state),
+        if not rung_available(state, rung):
+            return {"terminal_reason": "fix_rung_cap"}
+        try:
+            prompt = (prompt_builder or build_fix_prompt)(state)
+        except Exception:
+            return {"terminal_reason": "fix_prompt_refused"}
+        out = (model or deps.model)(
+            activity=activity, prompt=prompt,
             workspace=deps.workspace, card_id=state["card_id"],
             component=state["component"], directive=state["directive"],
-            signals=selection_signals(state))
+            signals={})
         res = out.get("result") or {}
         update = {"rung": rung, "rung_attempts": bump_rung(state, rung),
                   "implementer_model": res.get("model")}
@@ -990,19 +1022,16 @@ def make_fix(deps: Deps, *, rung: str, activity: str):
 
 
 def make_fix_rung3(deps: Deps):
-    """Cross-provider tie-break. AUTH DEFERRED (section 8 deferral 6).
+    """Separate authenticated transport; existing scope/apply/derive contract."""
+    from hermes_cli.build_graph_dispute import build_dispute_prompt
 
-    Present in the topology so the graph does not need reshaping when
-    `codex login` is run as the sandbox account. Until then the ladder is
-    local -> rung1 -> rung2 -> human, and this node says so rather than
-    pretending to try.
-    """
+    def prompt(state):
+        return build_dispute_prompt(state, task_body=deps.body,
+                                    fix_prompt_builder=build_fix_prompt,
+                                    sanitize=sz._load_sanitizer().sanitize)
 
-    def _node(state):
-        return {"rung": "rung3", "rung_attempts": bump_rung(state, "rung3"),
-                "terminal_reason": "fix_rung3_auth_deferred"}
-
-    return _node
+    return make_fix(deps, rung="rung3", activity="fix_codex",
+                    model=deps.codex, prompt_builder=prompt)
 
 
 def node_assemble(state):
@@ -1248,6 +1277,8 @@ def route_after_gate(state, deps: Deps):
         return "human"
     decision, _reason = deps.arbiter(deps.conn, deps.task_id, state["gate_summary"])
     if decision == "pass":
+        if state.get("rung") == "rung1" and state.get("cloud_review_calls") == 1:
+            return "cloud_re_review"
         return GATE_PASS_TARGET
     if decision == "escalate":
         rung = next_available_rung(state)
@@ -1264,7 +1295,15 @@ def route_after_review(state):
     # to None and the graph must never re-call to chase a parseable verdict --
     # a reviewer produces new findings each pass, so a clean verdict is not
     # reachable by re-calling.
-    return "cloud_re_review"
+    if state.get("rung") == "rung3":
+        return "human"
+    if state.get("rung") == "rung2":
+        return "fix_rung3" if rung_available(state, "rung3") else "human"
+    if state.get("rung") == "rung1":
+        # Mechanical repair may precede the first review. Without a prior
+        # review the comparator defaults; it must not invent recurrence.
+        return "classify_failure"
+    return "fix_rung1" if rung_available(state, "rung1") else "human"
 
 
 def route_after_re_review(state):
@@ -1358,6 +1397,7 @@ def build(deps: Deps, *, checkpointer=None):
     tracer = tl.Tracer(thread_id=getattr(deps, "task_id", "") or "")
     deps.tracer = tracer
     deps.model = tracer.model(deps.model)
+    deps.codex = tracer.model(deps.codex)
 
     def _add(name, fn):
         g.add_node(name, tracer.node(name, fn))
@@ -1398,13 +1438,13 @@ def build(deps: Deps, *, checkpointer=None):
 
     _cond(
         "cheap_gate", lambda s: route_after_gate(s, deps),
-        {"cloud_review": "cloud_review", "local_review": "local_review",
+        {"cloud_review": "cloud_review", "cloud_re_review": "cloud_re_review", "local_review": "local_review",
          "fix_rung1": "fix_rung1", "fix_rung2": "fix_rung2",
          "fix_rung3": "fix_rung3", "human": "human"})
 
     _cond(
         "cloud_review", route_after_review,
-        {"assemble": "assemble", "cloud_re_review": "cloud_re_review",
+        {"assemble": "assemble", "fix_rung1": "fix_rung1", "fix_rung3": "fix_rung3", "classify_failure": "classify_failure",
          "human": "human"})
 
     _cond(
