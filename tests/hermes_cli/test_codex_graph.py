@@ -134,4 +134,167 @@ class GraphContract(unittest.TestCase):
         self.assertTrue(result['objection_recurred']);self.assertEqual(len(self.records),1)
         self.assertIn('integer is wrong: code_review',self.prompts[0]);self.assertIn('integer is wrong: re_review',self.prompts[0])
 
-if __name__=='__main__':unittest.main()
+
+
+"""Approved promotion boundaries and real graph repair-review behavior; no provider."""
+import copy
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from hermes_cli import build_graph as bg
+from hermes_cli import build_graph_state as state_module
+
+
+class PolicyGraphTests(unittest.TestCase):
+    def setUp(self):
+        bg.sz._load_sanitizer()
+        from model_call import policy
+        self.policy = policy
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.workspace = Path(self.tmp.name)
+        self.file = self.workspace / 'code.py'
+        self.file.write_text('answer = 0\n')
+        self.state = state_module.new_workflow_state('t_policy', 'main', diff='diff --git a/code.py b/code.py\n+answer = 0', diff_files=1, diff_added_lines=1)
+        self.state['implementer_model'] = 'fixture-local-author'
+        self.calls = []
+        self.first_gate_fails = False
+        self.gates = 0
+        self.deps = bg.Deps(workspace=str(self.workspace), body='Return a verified integer.', task_id='t_policy',
+                            gate=self.gate, arbiter=lambda c,t,s: ('escalate' if s['verdict']=='exception' else 'pass','fixture'),
+                            parse_ac=lambda *a: [], model=self.model, codex=self.codex,
+                            changed_files=['code.py'], derive=self.derive, over_cap=lambda *a: False)
+        self.deps.review_default = lambda: self.policy.resolve('re_review').model
+        self.addCleanup(patch.stopall)
+        patch.object(bg.ev, 'append_classify_line', return_value=True).start()
+        patch.object(bg.ev, 'is_holdout', return_value=False).start()
+        tracer = bg.tl.Tracer
+        patch.object(bg.tl, 'Tracer', side_effect=lambda **k: tracer(**k, sink=lambda r: None)).start()
+
+    def gate(self, *args, **kwargs):
+        self.gates += 1
+        return {'verdict': 'exception' if self.first_gate_fails and self.gates == 1 else 'all_pass'}
+
+    def derive(self, workspace):
+        return {'ok': True, 'diff': 'diff --git a/code.py b/code.py\n+' + self.file.read_text(), 'diff_files': 1, 'diff_added_lines': 1, 'changed_files': ['code.py']}
+
+    def model(self, **kw):
+        resolution = self.policy.resolve(kw['activity'], directive=kw.get('directive'), signals=kw.get('signals'))
+        self.calls.append((kw['activity'], resolution.model, kw.get('signals', {})))
+        if kw['activity'] in ('code_review', 're_review'):
+            result = {'model': resolution.model, 'verdict': {'passed': False, 'findings': ['Requirement remains unmet']}}
+        elif kw['activity'] == 'classify':
+            result = {'model': resolution.model, 'text': '{"same": true}'}
+        else:
+            result = {'model': resolution.model, 'text': json.dumps({'files': [{'path': 'code.py', 'content': 'answer = %s\n' % sum(x[0].startswith('fix_') for x in self.calls)}]})}
+        return {'klass': 'ok', 'result': result}
+
+    def codex(self, **kw):
+        self.calls.append((kw['activity'], self.policy.resolve(kw['activity']).model, kw.get('signals', {})))
+        return {'klass': 'ok', 'result': {'model': self.policy.resolve(kw['activity']).model, 'text': json.dumps({'files': [{'path': 'code.py', 'content': 'answer = 3\n'}]})}}
+
+    def test_documented_size_boundaries(self):
+        for files, lines, fired in [(1,1,False),(8,400,False),(9,400,True),(8,401,True)]:
+            with self.subTest(files=files, lines=lines):
+                self.state.update(diff_files=files, diff_added_lines=lines)
+                self.assertEqual(bool(state_module.selection_signals(self.state).get('large_diff')), fired)
+        for components, fired in [(1,False),(3,False),(4,True)]:
+            self.state['component_count'] = components
+            self.assertEqual(bool(state_module.selection_signals(self.state).get('many_components')), fired)
+
+    def test_first_review_does_not_inherit_planning_or_repair_signals(self):
+        self.state.update(component_count=4, novel_architecture=True, author_independence=True, re_review_after_severe=True)
+        bg.make_cloud_review(self.deps, activity='code_review', node_name='cloud_review')(self.state)
+        self.assertEqual(self.calls[-1], ('code_review', self.policy.resolve('code_review').model, {}))
+
+    def test_re_review_does_not_inherit_diff_or_planning_signals(self):
+        self.state.update(diff_files=9, diff_added_lines=401, component_count=4, novel_architecture=True, security_sensitive=True, financial_sensitive=True)
+        bg.make_cloud_review(self.deps, activity='re_review', node_name='cloud_re_review')(self.state)
+        self.assertEqual(self.calls[-1], ('re_review', self.policy.resolve('re_review').model, {}))
+
+    def test_repair_sets_and_clears_independence_from_actual_policy_identity(self):
+        first = bg.make_fix(self.deps, rung='rung1', activity='fix_sonnet')(self.state)
+        self.assertTrue(first['author_independence'])
+        self.state.update(first)
+        second = bg.make_fix(self.deps, rung='rung2', activity='fix_opus')(self.state)
+        self.assertFalse(second['author_independence'])
+        self.assertTrue(self.state['author_independence'])
+
+    def test_directive_priority_is_preserved(self):
+        self.state['directive'] = self.policy.resolve('fix_opus').model
+        update = bg.make_fix(self.deps, rung='rung1', activity='fix_sonnet')(self.state)
+        self.assertFalse(update['author_independence'])
+        self.state.update(update, author_independence=True)
+        bg.make_cloud_review(self.deps, activity='re_review', node_name='cloud_re_review')(self.state)
+        self.assertEqual(self.calls[-1][1], self.state['directive'])
+
+    def test_unknown_policy_refuses_before_spending_attempt_or_writing(self):
+        def unavailable():
+            raise OSError('fixture unavailable')
+        self.deps.review_default = unavailable
+        before = copy.deepcopy(self.state)
+        update = bg.make_fix(self.deps, rung='rung1', activity='fix_sonnet')(self.state)
+        self.assertEqual(update, {'terminal_reason': 'review_policy_unavailable'})
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.file.read_text(), 'answer = 0\n')
+        self.assertEqual(self.state, before)
+
+    def test_missing_response_identity_consumes_attempt_without_applying(self):
+        self.deps.model = lambda **kw: {'klass': 'ok', 'result': {'text': json.dumps({'files': [{'path':'code.py','content':'answer = 1\n'}]})}}
+        update = bg.make_fix(self.deps, rung='rung1', activity='fix_sonnet')(self.state)
+        self.assertEqual(update['terminal_reason'], 'fix_model_provenance_unavailable')
+        self.assertEqual(update['rung_attempts'], {'rung1': 1})
+        self.assertEqual(self.file.read_text(), 'answer = 0\n')
+
+    def test_failed_application_does_not_claim_new_independent_author(self):
+        self.deps.changed_files = []
+        update = bg.make_fix(self.deps, rung='rung1', activity='fix_sonnet')(self.state)
+        self.assertTrue(update['terminal_reason'])
+        self.assertNotIn('author_independence', update)
+        self.assertEqual(self.file.read_text(), 'answer = 0\n')
+
+    def test_actual_graph_default_first_review_then_independent_dispute(self):
+        app,_ = bg.build(self.deps)
+        result = app.invoke(self.state, {'configurable': {'thread_id': 'policy'}, 'recursion_limit':40})
+        self.assertEqual([x[0] for x in self.calls], ['code_review','fix_sonnet','re_review','classify','fix_codex'])
+        self.assertEqual(self.calls[0][1], self.policy.resolve('code_review').model)
+        self.assertNotEqual(self.calls[1][1], self.calls[2][1])
+        self.assertEqual(self.calls[2][2], {'author_independence': True})
+        self.assertTrue(result['objection_recurred'])
+        self.assertEqual(result['rung_attempts'], {'rung1':1,'rung3':1})
+        self.assertEqual(result['cloud_review_calls'], 2)
+        self.assertEqual(result['terminal_reason'], 'cloud_review_cap')
+
+    def test_mechanical_first_fix_has_independent_review_and_normal_climb(self):
+        self.first_gate_fails = True
+        app,_ = bg.build(self.deps)
+        result = app.invoke(self.state, {'configurable': {'thread_id':'mechanical'}, 'recursion_limit':40})
+        self.assertEqual([x[0] for x in self.calls], ['fix_sonnet','re_review','fix_opus','re_review','fix_codex'])
+        self.assertEqual(self.calls[1][2], {'author_independence': True})
+        self.assertEqual(self.calls[3][2], {})
+        self.assertNotEqual(self.calls[2][1], self.calls[3][1])
+        self.assertEqual(result['rung_attempts'], {'rung1':1,'rung2':1,'rung3':1})
+        self.assertEqual(result['cloud_review_calls'],2)
+        self.assertEqual(result['terminal_reason'],'cloud_review_cap')
+
+    def test_explicit_default_directive_keeps_confounded_comparison_and_caps(self):
+        self.state['directive'] = self.policy.resolve('re_review').model
+        app,_ = bg.build(self.deps)
+        result = app.invoke(self.state, {'configurable': {'thread_id':'directive'}, 'recursion_limit':40})
+        self.assertEqual([x[0] for x in self.calls], ['code_review','fix_sonnet','re_review','classify','fix_opus'])
+        self.assertEqual(self.calls[1][1], self.calls[2][1])
+        self.assertTrue(result['recurrence_confounded'])
+        self.assertFalse(result['objection_recurred'])
+        self.assertEqual(result['rung_attempts'], {'rung1':1,'rung2':1})
+        self.assertEqual(result['terminal_reason'],'cloud_review_cap')
+
+    def test_canonical_policy_loader_reads_the_same_default(self):
+        self.assertEqual(bg.normal_review_model(), self.policy.resolve('re_review').model)
+        with patch.object(self.policy, '__file__', '/fixture/wrong-policy.py'):
+            with self.assertRaises(RuntimeError): bg.normal_review_model()
+
+if __name__ == '__main__':
+    unittest.main()

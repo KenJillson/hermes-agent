@@ -231,7 +231,7 @@ def assert_serializable(state: WorkflowState) -> None:
             ) from exc
 
 
-def selection_signals(state: WorkflowState) -> dict:
+def selection_signals(state: WorkflowState, *, activity=None) -> dict:
     """The honest signal set a cloud node passes to model-call.
 
     Read off typed state, never re-derived per call (section 1, note 4).
@@ -240,15 +240,27 @@ def selection_signals(state: WorkflowState) -> dict:
     receiving end is ever truthy-tested, a silent over-promotion.
     """
     candidates = {
-        "many_components": state["component_count"] > 1,
+        "many_components": state["component_count"] > 3,
         "novel_architecture": state["novel_architecture"],
         "security_sensitive": state["security_sensitive"],
         "financial_sensitive": state["financial_sensitive"],
-        "large_diff": state["diff_files"] > 1 or state["diff_added_lines"] > 0,
+        "large_diff": state["diff_files"] > 8 or state["diff_added_lines"] > 400,
         "re_review_after_severe": state["re_review_after_severe"],
         "author_independence": state["author_independence"],
     }
-    return {k: True for k, v in candidates.items() if v}
+    # Approved D5.1 node table; keep activity-specific promotion inputs from
+    # leaking into another review's selection. None retains the aggregate
+    # inspection helper; graph callers always pass their actual activity.
+    allowed = {
+        "plan_review": {"many_components", "novel_architecture",
+                        "security_sensitive", "financial_sensitive"},
+        "code_review": {"security_sensitive", "financial_sensitive", "large_diff"},
+        "re_review": {"re_review_after_severe", "author_independence"},
+    }
+    if activity is not None and activity not in allowed:
+        raise ValueError("Selection signals require a review activity")
+    names = candidates if activity is None else allowed[activity]
+    return {k: True for k, v in candidates.items() if v and k in names}
 
 
 def validate(state: WorkflowState) -> None:

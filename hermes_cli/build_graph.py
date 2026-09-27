@@ -404,12 +404,14 @@ class Deps:
 
     def __init__(self, *, gate=None, arbiter=None, model=None, parse_ac=None,
                  agent=None, implement_runner=None, derive=None, over_cap=None, codex=None,
+                 review_default=None,
                  conn=None, task_id="", workspace="", body="",
                  changed_files=None):
         self.gate = gate
         self.arbiter = arbiter
         self.model = model or call_model
         self.codex = codex or call_codex
+        self.review_default = review_default or normal_review_model
         self.parse_ac = parse_ac
         self.conn = conn
         self.task_id = task_id
@@ -669,6 +671,25 @@ def spend_gate(deps: Deps, state):
     return None
 
 
+def normal_review_model():
+    """Read the default from the canonical resolver; never duplicate aliases.
+
+    The sanitizer loader establishes the existing config-root/package identity
+    contract. The policy module must come from that same canonical library.
+    Resolving a default is local metadata work: no transport, credentials or
+    provider invocation, and explicit directives still win at model-call time.
+    """
+    sz._load_sanitizer()
+    from model_call import policy
+    expected = os.path.realpath(os.path.join(sz.hermes_home(), "lib", "model_call", "policy.py"))
+    if os.path.realpath(getattr(policy, "__file__", "") or "") != expected:
+        raise RuntimeError("Canonical review policy identity differs")
+    value = policy.resolve("re_review", directive=None, signals={}).model
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("Review default has no model identity")
+    return value
+
+
 def make_cloud_review(deps: Deps, *, activity: str, node_name: str):
     """cloud_review / cloud_re_review. --mode read_only, no --cwd (note 2)."""
 
@@ -684,7 +705,7 @@ def make_cloud_review(deps: Deps, *, activity: str, node_name: str):
         out = deps.model(
             activity=activity, prompt=prompt, workspace=deps.workspace,
             card_id=state["card_id"], component=state["component"],
-            directive=state["directive"], signals=selection_signals(state),
+            directive=state["directive"], signals=selection_signals(state, activity=activity),
             mode="read_only")
         res = out.get("result") or {}
         update = {"cloud_review_calls": state["cloud_review_calls"] + 1,
@@ -969,6 +990,12 @@ def make_fix(deps: Deps, *, rung: str, activity: str, model=None, prompt_builder
             prompt = (prompt_builder or build_fix_prompt)(state)
         except Exception:
             return {"terminal_reason": "fix_prompt_refused"}
+        try:
+            review_model = deps.review_default()
+            if not isinstance(review_model, str) or not review_model.strip():
+                raise ValueError("Missing review model identity")
+        except Exception:
+            return {"terminal_reason": "review_policy_unavailable"}
         out = (model or deps.model)(
             activity=activity, prompt=prompt,
             workspace=deps.workspace, card_id=state["card_id"],
@@ -979,6 +1006,10 @@ def make_fix(deps: Deps, *, rung: str, activity: str, model=None, prompt_builder
                   "implementer_model": res.get("model")}
         if out["klass"] != "ok":
             update["terminal_reason"] = "model_call_%s:%s" % (out["klass"], activity)
+            return guard(update, state)
+
+        if not isinstance(res.get("model"), str) or not res["model"].strip():
+            update["terminal_reason"] = "fix_model_provenance_unavailable"
             return guard(update, state)
 
         # The attempt is already recorded above, so a refusal here still burns
@@ -1015,6 +1046,10 @@ def make_fix(deps: Deps, *, rung: str, activity: str, model=None, prompt_builder
         update["diff"] = verdict["diff"]
         update["diff_files"] = verdict["diff_files"]
         update["diff_added_lines"] = verdict["diff_added_lines"]
+        # Only a successfully applied, re-derived repair changes this signal.
+        # Compare recorded selected-model provenance with the policy default;
+        # a directive still overrides the heuristic in the primitive.
+        update["author_independence"] = res["model"] == review_model
         return guard(update, state)
 
     _node.__name__ = "fix_%s" % rung
@@ -1282,7 +1317,7 @@ def route_after_gate(state, deps: Deps):
         return "human"
     decision, _reason = deps.arbiter(deps.conn, deps.task_id, state["gate_summary"])
     if decision == "pass":
-        if state.get("rung") == "rung1" and state.get("cloud_review_calls") == 1:
+        if state.get("rung") in ("rung1", "rung2", "rung3"):
             return "cloud_re_review"
         return GATE_PASS_TARGET
     if decision == "escalate":
@@ -1314,7 +1349,13 @@ def route_after_review(state):
 def route_after_re_review(state):
     if state.get("terminal_reason"):
         return "human"
-    return "assemble" if state.get("last_verdict_passed") else "classify_failure"
+    if state.get("last_verdict_passed"):
+        return "assemble"
+    if state.get("rung") == "rung3":
+        return "human"
+    if state.get("rung") == "rung2":
+        return "fix_rung3" if rung_available(state, "rung3") else "human"
+    return "classify_failure"
 
 
 def route_after_classify(state):
@@ -1455,7 +1496,7 @@ def build(deps: Deps, *, checkpointer=None):
     _cond(
         "cloud_re_review", route_after_re_review,
         {"assemble": "assemble", "classify_failure": "classify_failure",
-         "human": "human"})
+         "fix_rung3": "fix_rung3", "human": "human"})
 
     _cond(
         "classify_failure", route_after_classify,
