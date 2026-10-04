@@ -17959,7 +17959,7 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
         reason = None
         from hermes_cli.build_graph_implementer import make_a2_runner, A2ReconciliationRequired
         a2_runner = make_a2_runner(task, workspace, dict(_os.environ))
-        if _kb.parse_ac_text(task.body or "")[3]:
+        if _kb.parse_ac_text(task.body or "")[3] or task.workspace_kind == 'worktree':
             kind = (getattr(task, "workspace_kind", None) or "scratch")
             if kind != "worktree":
                 # RULED 2026-08-20. kanban_db.resolve_workspace materialises a
@@ -18030,8 +18030,20 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
                         gc.close()
                     except Exception:
                         pass
-                reason = "graph_terminal:%s" % (
-                    (state or {}).get("terminal_reason") or "unknown")
+                terminal = (state or {}).get('terminal_reason') or 'unknown'
+                if terminal.startswith('a2_stage_ready:'):
+                    from hermes_cli.build_graph_stages import NEXT
+                    following = terminal.split(':', 1)[1]
+                    previous = next((k for k, v in NEXT.items() if v == following), None)
+                    runs = state['rung_attempts'].get('a2_runs', {})
+                    if previous is None or runs.get(previous) != task.current_run_id:
+                        raise ValueError('stage continuation receipt mismatch')
+                    with _kb.connect_closing() as stage_conn:
+                        if not _kb.finish_graph_stage(stage_conn, task_id, task.current_run_id,
+                                                      previous, following, _os.getpid()):
+                            return 1
+                    return 0
+                reason = "graph_terminal:%s" % terminal
             except a2_failure_type:
                 # The controller may still own a payload/inhibit. Do not call
                 # block_task, complete_task or retry. The existing dispatcher

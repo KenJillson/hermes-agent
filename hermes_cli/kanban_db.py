@@ -6729,6 +6729,94 @@ def edit_completed_task_result(
     return True
 
 
+def finish_graph_stage(conn, task_id, run_id, stage, following, worker_pid):
+    """Close a successful protected stage, without completing the card.
+
+    Only the dispatcher may promote this handoff after the old process exits.
+    Ordinary block/failure paths never acquire the continuation marker.
+    """
+    from hermes_cli.build_graph_stages import NEXT
+    if NEXT.get(stage) != following or worker_pid != os.getpid():
+        raise ValueError('invalid stage handoff')
+    reason = 'a2_stage_ready:' + following
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT t.claim_lock FROM tasks t JOIN task_runs r ON r.id=t.current_run_id "
+            "WHERE t.id=? AND t.graph_executor='build_graph' AND t.status='running' "
+            "AND t.current_run_id=? AND t.worker_pid=? AND r.worker_pid=t.worker_pid "
+            "AND r.task_id=t.id AND r.status='running' AND r.ended_at IS NULL "
+            "AND r.claim_lock=t.claim_lock AND t.claim_lock IS NOT NULL",
+            (task_id, run_id, worker_pid)).fetchone()
+        if row is None:
+            return False
+        metadata = {'a2_stage_handoff': {'stage': stage, 'next': following,
+                                       'worker_pid': worker_pid, 'run_id': run_id}}
+        ended = _end_run(conn, task_id, outcome='blocked', status='blocked',
+                         summary=reason, metadata=metadata)
+        if ended != run_id:
+            raise RuntimeError('stage run drift')
+        conn.execute("UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, "
+                     "worker_pid=NULL, last_failure_error=? WHERE id=?", (reason, task_id))
+        _append_event(conn, task_id, 'blocked',
+                      {'reason': reason, 'stage': stage, 'next': following}, run_id=run_id)
+    return True
+
+
+def promote_graph_stages(conn, *, idle_check=None, pid_exists=None):
+    """Consume each handoff once, after process exit and all-board quiescence."""
+    from hermes_cli.build_graph_stages import NEXT
+    if idle_check is None:
+        from hermes_cli.build_graph_parent_git import gate
+        idle_check = lambda: gate().no_active_runs()
+    if pid_exists is None:
+        # A retained zombie also waits for the dispatcher's reaper. Permission
+        # errors must not be interpreted as proof that an old worker exited.
+        def pid_exists(pid):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except (PermissionError, OSError):
+                return True
+            return True
+    rows = conn.execute(
+        "SELECT t.id,r.id AS run_id,r.metadata,r.summary FROM tasks t JOIN task_runs r "
+        "ON r.id=(SELECT MAX(id) FROM task_runs WHERE task_id=t.id) "
+        "WHERE t.graph_executor='build_graph' AND t.status='blocked' "
+        "AND t.current_run_id IS NULL AND r.ended_at IS NOT NULL AND r.outcome='blocked' "
+        "AND t.last_failure_error=r.summary AND r.summary LIKE 'a2_stage_ready:%'").fetchall()
+    promoted = []
+    for row in rows:
+        try:
+            handoff = json.loads(row['metadata'])['a2_stage_handoff']
+            if (set(handoff) != {'stage', 'next', 'worker_pid', 'run_id'}
+                    or NEXT.get(handoff['stage']) != handoff['next']
+                    or type(handoff['run_id']) is not int or handoff['run_id'] != row['run_id']
+                    or row['summary'] != 'a2_stage_ready:' + handoff['next']
+                    or type(handoff['worker_pid']) is not int or handoff['worker_pid'] <= 1
+                    or pid_exists(handoff['worker_pid'])):
+                continue
+            idle_check()
+            with write_txn(conn):
+                # Recheck lifecycle and quiescence at the mutation boundary.
+                idle_check()
+                cur = conn.execute(
+                    "UPDATE tasks SET status='ready',last_failure_error=NULL "
+                    "WHERE id=? AND status='blocked' AND current_run_id IS NULL "
+                    "AND last_failure_error=? AND NOT EXISTS "
+                    "(SELECT 1 FROM task_runs WHERE task_id=? AND id>?)",
+                    (row['id'], row['summary'], row['id'], row['run_id']))
+                if cur.rowcount == 1:
+                    _append_event(conn, row['id'], 'graph_stage_continued',
+                                  {'stage': handoff['next'], 'prior_run_id': row['run_id']})
+                    promoted.append(row['id'])
+        except (ValueError, TypeError, KeyError):
+            continue
+        except Exception:
+            _log.warning('graph stage continuation refused for %s', row['id'], exc_info=True)
+    return promoted
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9496,6 +9584,8 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+    if not dry_run:
+        promote_graph_stages(conn)
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)

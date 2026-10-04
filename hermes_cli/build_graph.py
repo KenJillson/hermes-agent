@@ -541,6 +541,13 @@ def make_implement(deps: Deps):
         # returns cleanly. EVERY return below carries it -- an attempt that is
         # not recorded is an attempt that repeats forever.
         attempts = bump_rung(state, "implement")
+        if callable(getattr(runner, 'stage', None)):
+            from hermes_cli.build_graph_stages import record_stage
+            try:
+                staged = record_stage(state, 'implement', runner.run_id)
+            except ValueError:
+                return {"terminal_reason": "a2_stage_run_mismatch"}
+            # Do not record success until import and real diff derivation succeed.
 
         def _park(reason):
             return {"terminal_reason": reason, "rung_attempts": attempts}
@@ -594,6 +601,9 @@ def make_implement(deps: Deps):
         update["diff"] = verdict["diff"]
         update["diff_files"] = verdict["diff_files"]
         update["diff_added_lines"] = verdict["diff_added_lines"]
+        if callable(getattr(runner, 'stage', None)):
+            update['rung_attempts'] = dict(attempts, a2_runs=staged['a2_runs'])
+            update['terminal_reason'] = 'a2_stage_ready:local_review'
         return guard(update, state)
 
     _node.__name__ = "implement"
@@ -1328,6 +1338,8 @@ def route_after_gate(state, deps: Deps):
             return "cloud_re_review"
         return GATE_PASS_TARGET
     if decision == "escalate":
+        if state['rung_attempts'].get('a2_runs'):
+            return 'human'
         rung = next_available_rung(state)
         return ("fix_%s" % rung) if rung else "human"
     return "human"          # over_cap and no_arbiter both terminate (section 2.2)
@@ -1338,6 +1350,8 @@ def route_after_review(state):
         return "human"
     if state.get("last_verdict_passed"):
         return "assemble"
+    if state['rung_attempts'].get('a2_runs'):
+        return 'human'
     # "revise" and verdict-is-None are the SAME edge. _parse_verdict fail-closes
     # to None and the graph must never re-call to chase a parseable verdict --
     # a reviewer produces new findings each pass, so a clean verdict is not
@@ -1395,6 +1409,13 @@ def route_entry(state):
     """
     if state.get("terminal_reason"):
         return "human"
+    from hermes_cli.build_graph_stages import next_stage
+    if state['rung_attempts'].get('a2_runs'):
+        try:
+            stage = next_stage(state)
+        except ValueError:
+            return 'human'
+        return stage or 'human'  # Completed stage receipts cannot replay review.
     if (state.get("diff") or "").strip():
         return "cheap_gate"
     return "plan"
@@ -1470,10 +1491,13 @@ def build(deps: Deps, *, checkpointer=None):
     _add("assemble", node_assemble)
     _add("human", node_human)
 
-    # Unbuilt: wired, honest, terminal-to-human.
+    from hermes_cli.build_graph_stages import make_stage
     for name in ("plan", "plan_review", "local_review"):
-        _add(name, unbuilt(name))
-        g.add_edge(name, "human")
+        _add(name, make_stage(deps, name, guard))
+    g.add_edge('plan', 'human')
+    g.add_edge('plan_review', 'human')
+    _cond('local_review', lambda s: 'human' if s.get('terminal_reason') else 'cheap_gate',
+          {'human': 'human', 'cheap_gate': 'cheap_gate'})
 
     # Retain the implementation node for existing checkpoint continuations.
     # Fresh START parks at unbuilt plan until qualified stages are wired.
@@ -1488,7 +1512,8 @@ def build(deps: Deps, *, checkpointer=None):
     # builder.edges will report START as unwired. Verified against
     # langgraph 1.2.10.
     _cond(START, route_entry,
-          {"plan": "plan", "cheap_gate": "cheap_gate", "human": "human"})
+          {"plan": "plan", "plan_review": "plan_review", "implement": "implement",
+           "local_review": "local_review", "cheap_gate": "cheap_gate", "human": "human"})
 
     _cond(
         "cheap_gate", lambda s: route_after_gate(s, deps),
@@ -1674,7 +1699,7 @@ def _run_with_checkpointer(conn, task_id, workspace, *, body="", component="main
             return _parked(refusal)
         # Partial input: re-derived work product only. Everything else is
         # restored from the checkpoint.
-        return _invoke({"plan": plan, "diff": diff,
+        return _invoke({**({"plan": plan} if plan else {}), "diff": diff,
                         "diff_files": diff_files,
                         "diff_added_lines": diff_added_lines,
                         "terminal_reason": None,

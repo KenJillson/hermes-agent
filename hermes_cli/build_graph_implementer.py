@@ -225,7 +225,7 @@ def _a2_client():
     """
     import importlib.util
     root = Path('/home/jetson/.hermes/scripts/michael-worker')
-    for name in ('workspace_transfer', 'launch_protocol', 'launch_client'):
+    for name in ('workspace_transfer', 'launch_protocol', 'artifact_export', 'launch_client'):
         path = root / (name + '.py')
         module = sys.modules.get(name)
         if module is not None:
@@ -278,7 +278,7 @@ def make_a2_runner(task, workspace, environment):
     # that never enters implement does not require a new artifact declaration.
     environment = dict(environment)
     assigned_workspace = workspace
-    def prepare():
+    def prepare(operation="implement"):
         task_id = environment.get('HERMES_KANBAN_TASK', '')
         board = environment.get('HERMES_KANBAN_BOARD', '')
         run_text = environment.get('HERMES_KANBAN_RUN_ID', '')
@@ -289,7 +289,7 @@ def make_a2_runner(task, workspace, environment):
                 or task.status != 'running' or task.worker_pid != os.getpid()):
             raise ProtocolError('a2_dispatch_assignment_mismatch')
         client = _a2_client()
-        request = {'version': 1, 'operation': 'implement', 'board': board,
+        request = {'version': 1, 'operation': operation, 'board': board,
                    'task_id': task_id, 'run_id': int(run_text), 'goal': task.body or '',
                    'files': _a2_files(task.body or '')}
         def validate(value):
@@ -337,7 +337,27 @@ def make_a2_runner(task, workspace, environment):
         except Exception as exc:
             raise A2ReconciliationRequired('a2_transport_requires_reconciliation') from exc
         return _closed('completed')
-    runner.payload_workspace = '/workspace'
+    def stage(*, operation, goal, workspace):
+        nonlocal used
+        if used:
+            raise A2ReconciliationRequired('a2_no_automatic_retry')
+        if operation not in ('plan', 'plan_review', 'local_review') or workspace != assigned_workspace:
+            raise ProtocolError('a2_stage_or_workspace_mismatch')
+        client, request, validate = prepare(operation)
+        request = dict(request, goal=goal)
+        validate(request)
+        used = True
+        try:
+            context = parent_context()
+            context.launch()
+            result = client.launch(request)
+            context.committed()
+            return result
+        except Exception as exc:
+            raise A2ReconciliationRequired('a2_transport_requires_reconciliation') from exc
+    runner.stage = stage
+    runner.run_id = task.current_run_id
+    runner.payload_workspace = '/workspace' 
     runner.derive = derive
     return runner
 
