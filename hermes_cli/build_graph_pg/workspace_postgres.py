@@ -27,13 +27,14 @@ def registered_guard(conn, marker):
 def open_workspace_checkpointer(board_connection, task_id, workspace):
     hold_runtime_for_process()
     admission=_protected_module()
-    with admission.admit():
-        def admitted_write():
-            with admission.admit():
-                pass
-        identity=identity_module.identity_from_task(board_connection,task_id,workspace)
-        # Connection context closes on every refusal, yield exception and normal exit.
-        with fixed_connection() as conn:
+    def admitted_write():
+        with admission.admit():
+            pass
+    # Retain the connection and process runtime lease during graph execution,
+    # but release setup admission before A2 acquires admission EX for launch.
+    with fixed_connection() as conn:
+        with admission.admit():
+            identity=identity_module.identity_from_task(board_connection,task_id,workspace)
             peer=conn.execute('SELECT current_user AS role,current_database() AS database').fetchone()
             registry.require(peer=={'role':'michael_checkpoint','database':'michael_checkpoints'},
                              'Unexpected checkpoint peer identity')
@@ -53,4 +54,4 @@ def open_workspace_checkpointer(board_connection, task_id, workspace):
                         registry.verify_association(row,marker,SCHEMA_VERSION)
             saver=ScopedPostgresSaver(conn,marker['scope_id'],schema_version=SCHEMA_VERSION,
                 scope_guard=lambda connection:registered_guard(connection,marker))
-            yield saver,saver.serde
+        yield saver,saver.serde
