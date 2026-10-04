@@ -231,20 +231,23 @@ def assert_serializable(state: WorkflowState) -> None:
             ) from exc
 
 
+def diff_signals(state: WorkflowState) -> dict:
+    """Forward the counts derived from the worktree; policy owns thresholds."""
+    return {name: state[name] for name in ("diff_files", "diff_added_lines")}
+
+
 def selection_signals(state: WorkflowState, *, activity=None) -> dict:
     """The honest signal set a cloud node passes to model-call.
 
     Read off typed state, never re-derived per call (section 1, note 4).
-    Returns only the signals that are TRUE, since policy.py promotes on any
-    fired signal -- passing False entries would be noise at best and, if the
-    receiving end is ever truthy-tested, a silent over-promotion.
+    Preserve numeric counts, including zero, alongside true boolean signals.
+    The canonical policy decides whether those counts constitute a large diff.
     """
     candidates = {
         "many_components": state["component_count"] > 3,
         "novel_architecture": state["novel_architecture"],
         "security_sensitive": state["security_sensitive"],
         "financial_sensitive": state["financial_sensitive"],
-        "large_diff": state["diff_files"] > 8 or state["diff_added_lines"] > 400,
         "re_review_after_severe": state["re_review_after_severe"],
         "author_independence": state["author_independence"],
     }
@@ -254,13 +257,14 @@ def selection_signals(state: WorkflowState, *, activity=None) -> dict:
     allowed = {
         "plan_review": {"many_components", "novel_architecture",
                         "security_sensitive", "financial_sensitive"},
-        "code_review": {"security_sensitive", "financial_sensitive", "large_diff"},
+        "code_review": {"security_sensitive", "financial_sensitive"},
         "re_review": {"re_review_after_severe", "author_independence"},
     }
     if activity is not None and activity not in allowed:
         raise ValueError("Selection signals require a review activity")
     names = candidates if activity is None else allowed[activity]
-    return {k: True for k, v in candidates.items() if v and k in names}
+    return {**diff_signals(state),
+            **{k: True for k, v in candidates.items() if v and k in names}}
 
 
 def validate(state: WorkflowState) -> None:

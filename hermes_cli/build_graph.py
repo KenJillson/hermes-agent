@@ -70,6 +70,7 @@ from hermes_cli.build_graph_state import (
     WorkflowState,
     new_workflow_state,
     selection_signals,
+    diff_signals,
     validate,
 )
 
@@ -263,7 +264,11 @@ def call_model(
         if cwd:
             argv += ["--cwd", cwd]
         for name, fired in (signals or {}).items():
-            if fired:
+            if name in ("diff_files", "diff_added_lines"):
+                if type(fired) is not int or fired < 0:
+                    raise ValueError("diff counts must be nonnegative integers")
+                argv += ["--" + name.replace("_", "-"), str(fired)]
+            elif fired:
                 argv += ["--signal", name]
         try:
             p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
@@ -747,7 +752,8 @@ def make_classify_failure(deps: Deps):
                                               state["objections_current"])
             out = deps.model(activity="classify", prompt=prompt,
                              workspace=deps.workspace, card_id=state["card_id"],
-                             component=state["component"], mode="none")
+                             component=state["component"], mode="none",
+                             signals=diff_signals(state))
             res = out.get("result") or {}
             answer = (ev.parse_classify_response(res.get("text"))
                       if out["klass"] == "ok" else None)
@@ -1001,7 +1007,7 @@ def make_fix(deps: Deps, *, rung: str, activity: str, model=None, prompt_builder
             activity=activity, prompt=prompt,
             workspace=deps.workspace, card_id=state["card_id"],
             component=state["component"], directive=state["directive"],
-            signals={})
+            signals=diff_signals(state))
         res = out.get("result") or {}
         update = {"rung": rung, "rung_attempts": bump_rung(state, rung),
                   "implementer_model": res.get("model")}
