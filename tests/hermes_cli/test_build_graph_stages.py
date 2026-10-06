@@ -7,9 +7,10 @@ from hermes_cli.build_graph_state import new_workflow_state
 
 class Runner:
     payload_workspace = '/workspace'
-    def __init__(self): self.run_id = 1; self.calls = []
+    def __init__(self): self.run_id = 1; self.calls = []; self.goals = []
     def stage(self, *, operation, goal, workspace):
         self.calls.append((operation, self.run_id))
+        self.goals.append(goal)
         result = ({'operation':operation,'plan':'Create the declared file.'} if operation == 'plan'
                   else {'operation':operation,'passed':True,'findings':[]})
         return {'result':result}
@@ -63,6 +64,33 @@ class GraphStages(unittest.TestCase):
         result=stages.make_stage(deps,'plan_review',bg.guard)(state)
         self.assertEqual(result['terminal_reason'],'a2_stage_run_mismatch')
         self.assertEqual(runner.calls,[('plan',1)])
+
+    def test_planning_keeps_spec_but_does_not_seed_from_old_plan_or_diff(self):
+        runner=Runner();deps=self.deps(runner,[])
+        state=new_workflow_state('t_fixture','main',plan='STALE_PLAN_COUNT_3')
+        state.update(diff='UNMEASURED_DIFF',diff_files=99,diff_added_lines=999)
+        out=stages.make_stage(deps,'plan',bg.guard)(state)
+        goal=runner.goals[0]
+        self.assertTrue(goal.endswith('SPECIFICATION:\n'+deps.body))
+        self.assertNotIn('STALE_PLAN_COUNT_3',goal)
+        self.assertNotIn('UNMEASURED_DIFF',goal)
+        self.assertNotIn('Reviews: passed',goal)
+        self.assertNotIn('diff_files',out)
+        self.assertNotIn('diff_added_lines',out)
+
+    def test_reviews_keep_full_spec_plan_and_actual_diff(self):
+        for operation,receipts in [('plan_review',{'plan':1}),
+                                  ('local_review',{'plan':1,'plan_review':2,'implement':3})]:
+            runner=Runner();runner.run_id=4;deps=self.deps(runner,[])
+            state=new_workflow_state('t_fixture','main',plan='Create a.py; validate value.')
+            state.update(diff='diff --git a/a.py b/a.py\n+value = 1\n',
+                         rung_attempts={'a2_runs':receipts})
+            stages.make_stage(deps,operation,bg.guard)(state)
+            goal=runner.goals[0]
+            self.assertIn('SPECIFICATION:\n'+deps.body,goal)
+            self.assertIn('PLAN:\n'+state['plan'],goal)
+            if operation=='local_review':
+                self.assertTrue(goal.endswith('ACTUAL DIFF:\n'+state['diff']))
 
     def test_failed_review_has_no_handoff(self):
         runner=Runner();runner.run_id=2;deps=self.deps(runner,[])

@@ -57,7 +57,20 @@ def make_stage(deps, operation, guard):
                     {'operation': operation, 'passed': True, 'findings': []})
         goal = ('Perform only the ' + operation + ' stage. Do not create, delete, or modify files. '
                 'Do not implement during planning or review. Return ONLY a JSON object in this shape: '
-                + json.dumps(contract) + '. Reviews: passed must be false if findings is nonempty; '
+                + json.dumps(contract) + '.')
+        if operation == 'plan':
+            # Keep the complete specification for product constraints, but do not
+            # ask the planner to restate dispatcher-owned execution mechanics.
+            goal += (' Write only the implementation changes to the declared files and how to '
+                     'validate those changes. Runtime execution constraints remain binding but '
+                     'are enforced by the graph; do not turn them into plan steps. '
+                     'Do not include diff_files, diff_added_lines, numerical diff estimates, '
+                     'or claims that a diff has been measured. The graph measures the actual '
+                     'Git diff after implementation. Do not include stage sequencing, run IDs, '
+                     'socket launches, model routing, spending caps, retries, or card completion '
+                     'in the implementation plan.\nSPECIFICATION:\n' + deps.body)
+        else:
+            goal += (' Reviews: passed must be false if findings is nonempty; '
                 'findings must contain concise strings. Evaluate the specification and supplied plan'
                 + (' against the supplied actual diff.' if operation == 'local_review' else '.')
                 + '\nSPECIFICATION:\n' + deps.body
