@@ -101,6 +101,20 @@ class GraphStages(unittest.TestCase):
         self.assertEqual(out['terminal_reason'],'a2_stage_review_required:plan_review')
         self.assertNotIn('a2_stage_ready',out['terminal_reason'])
 
+    def test_sealed_failure_stops_compiled_graph_before_checks_and_cloud(self):
+        runner=Runner();runner.run_id=4;calls=[];deps=self.deps(runner,calls)
+        runner.stage=lambda **kw: {'phase':'failed','operation':'local_review',
+            'failure':{'stage':'stage_result','reason':'json','exit_code':84}}
+        deps.gate=lambda *a,**kw: self.fail('acceptance must not run after failed stage')
+        state=new_workflow_state('t_fixture','main',plan='Create a.py')
+        state.update(diff='diff --git a/a.py b/a.py\n+value=1\n',diff_files=1,diff_added_lines=1,
+                     rung_attempts={'a2_runs':{'plan':1,'plan_review':2,'implement':3}})
+        app,_=bg.build(deps)
+        out=app.invoke(state,{'configurable':{'thread_id':'failure'}})
+        self.assertEqual(out['terminal_reason'],'a2_stage_failed:local_review:stage_result:json')
+        self.assertEqual(calls,[])
+        self.assertEqual(out['rung_attempts']['a2_runs']['local_review'],4)
+
     def test_out_of_order_receipts_refused(self):
         state=new_workflow_state('t_fixture','main')
         for runs in ({'implement':3},{'plan':1,'plan_review':1},{'plan':True}):

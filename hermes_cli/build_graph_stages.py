@@ -78,6 +78,10 @@ def make_stage(deps, operation, guard):
                 + ('\nACTUAL DIFF:\n' + state['diff'] if operation == 'local_review' else ''))
         raw = runner.stage(operation=operation, goal=goal, workspace=deps.workspace)
         # Runner validates the controller's bounded typed result before returning.
+        if raw.get('phase') == 'failed':
+            failure = raw['failure']
+            return guard({'terminal_reason': 'a2_stage_failed:' + operation + ':' + failure['stage'] + ':' + failure['reason'],
+                          'rung_attempts': attempts}, state)
         result = raw['result']
         update = {'rung_attempts': attempts}
         if operation == 'plan':

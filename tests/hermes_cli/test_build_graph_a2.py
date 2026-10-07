@@ -28,6 +28,17 @@ class AdapterTests(unittest.TestCase):
    self.assertEqual(set(request),client.launch_protocol.KEYS);self.assertEqual(request['files'],['input.txt','output.txt']);self.assertEqual(request['run_id'],7)
    with self.assertRaises(runner.A2ReconciliationRequired):invoke(fn)
    self.assertEqual(launch.call_count,1)
+ def test_sealed_failure_returns_failure_without_committing_or_retry(self):
+  value={'version':3,'phase':'failed','operation':'implement','token':'a'*32,
+         'failure':{'stage':'stage_result','reason':'shape','exit_code':84}}
+  parent=unittest.mock.Mock()
+  with patch.object(PARENT,'ParentGit',return_value=parent),patch.object(client,'launch',return_value=value) as launch:
+   fn=runner.make_a2_runner(task(),'/task',ENV)
+   self.assertEqual(invoke(fn)['status'],'failed')
+   parent.committed.assert_not_called()
+   with self.assertRaises(runner.A2ReconciliationRequired):invoke(fn)
+   launch.assert_called_once()
+
  def test_failure_never_retries(self):
   for error in (TimeoutError(),ConnectionError(),client.Refused('disconnect')):
    with self.subTest(error=type(error).__name__),patch.object(client,'launch',side_effect=error) as launch:
@@ -56,7 +67,7 @@ class AdapterTests(unittest.TestCase):
    self.assertEqual(invoke(runner.make_a2_runner(task(),'/task',ENV),interrupt_check=lambda:True)['status'],'interrupted');launch.assert_not_called()
  def test_lazy_binding_preserves_nonimplement_graph(self):
   with patch.object(runner,'_a2_client',side_effect=AssertionError('must not load')):
-   fn=runner.make_a2_runner(types.SimpleNamespace(),'',{});self.assertEqual(fn.payload_workspace,'/workspace')
+   fn=runner.make_a2_runner(types.SimpleNamespace(current_run_id=None),'',{});self.assertEqual(fn.payload_workspace,'/workspace')
 
 # The actual CLI function is compiled, not reproduced. Imports are replaced
 # only at the graph/database boundary; the installed dispatch wiring executes.
@@ -72,11 +83,22 @@ class CliPathTests(unittest.TestCase):
    if implemented:invoke(kw['deps'].implement_runner)
    return {'terminal_reason':'human_review'}
   bg.run=graph;pkg=types.ModuleType('hermes_cli');pkg.kanban_db=kb;pkg.build_graph=bg;pkg.build_graph_implementer=runner
-  return kb,{'hermes_cli':pkg,'hermes_cli.kanban_db':kb,'hermes_cli.build_graph':bg,'hermes_cli.build_graph_implementer':runner,'hermes_cli.build_graph_parent_git':PARENT}
+  bgd=types.ModuleType('hermes_cli.build_graph_diff');bgd.EMPTY_DIFF_REASON='empty';pkg.build_graph_diff=bgd
+  context=unittest.mock.Mock();context.derive.return_value={'ok':False,'reason':'empty'}
+  PARENT.ParentGit=unittest.mock.Mock(return_value=context)
+  return kb,{'hermes_cli':pkg,'hermes_cli.kanban_db':kb,'hermes_cli.build_graph':bg,'hermes_cli.build_graph_implementer':runner,'hermes_cli.build_graph_parent_git':PARENT,'hermes_cli.build_graph_diff':bgd}
  def test_actual_cli_success_uses_a2_then_parks(self):
   kb,modules=self.setup_path()
   with patch.dict(sys.modules,modules),patch.dict(os.environ,ENV,clear=True),patch.object(runner,'_a2_client',return_value=client),patch.object(client,'launch',return_value={}) as launch:
    self.assertEqual(cli_function()(types.SimpleNamespace(agent=None)),0);self.assertEqual(launch.call_count,1);kb.block_task.assert_called_once()
+ def test_actual_cli_sealed_failure_parks(self):
+  kb,modules=self.setup_path()
+  value={'version':3,'phase':'failed','operation':'implement','token':'a'*32,
+         'failure':{'stage':'stage_result','reason':'shape','exit_code':84}}
+  with patch.dict(sys.modules,modules),patch.dict(os.environ,ENV,clear=True),patch.object(runner,'_a2_client',return_value=client),patch.object(client,'launch',return_value=value) as launch:
+   self.assertEqual(cli_function()(types.SimpleNamespace(agent=None)),0)
+   kb.block_task.assert_called_once();launch.assert_called_once()
+
  def test_actual_cli_uncertain_transport_never_parks(self):
   kb,modules=self.setup_path()
   with patch.dict(sys.modules,modules),patch.dict(os.environ,ENV,clear=True),patch.object(runner,'_a2_client',return_value=client),patch.object(client,'launch',side_effect=TimeoutError()) as launch:

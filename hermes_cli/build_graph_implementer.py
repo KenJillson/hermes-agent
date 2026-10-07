@@ -332,7 +332,9 @@ def make_a2_runner(task, workspace, environment):
         try:
             context = parent_context()
             context.launch()
-            client.launch(current, interrupt_check=interrupt_check)
+            result = client.launch(current, interrupt_check=interrupt_check)
+            if result.get('phase') == 'failed':
+                return _closed('failed')
             context.committed()
         except Exception as exc:
             raise A2ReconciliationRequired('a2_transport_requires_reconciliation') from exc
@@ -351,6 +353,8 @@ def make_a2_runner(task, workspace, environment):
             context = parent_context()
             context.launch()
             result = client.launch(request)
+            if result.get('phase') == 'failed':
+                return result
             context.committed()
             return result
         except Exception as exc:
