@@ -21,7 +21,7 @@ def validate_denial(value, card, operation, run_id):
         raise Refused('denial_shape')
     if (value['task_id'] != card or value['operation'] != operation or value['run_id'] != run_id
             or type(value['run_id']) is not int or not 1 <= value['run_id'] < 2**63
-            or type(value['journal_version']) is not int or value['journal_version'] not in (1,2)):
+            or type(value['journal_version']) is not int or value['journal_version'] not in (1,2,3)):
         raise Refused('denial_binding')
     for key, pattern in (('board',r'[A-Za-z0-9_-]{1,64}'),('token',r'[0-9a-f]{32}'),
                          ('request_sha256',r'[0-9a-f]{64}'),('journal_sha256',r'[0-9a-f]{64}')):
