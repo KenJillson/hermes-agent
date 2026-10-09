@@ -338,7 +338,7 @@ def make_a2_runner(task, workspace, environment):
             context.committed()
         except Exception as exc:
             raise A2ReconciliationRequired('a2_transport_requires_reconciliation') from exc
-        return _closed('completed')
+        return dict(_closed('completed'), denial_evidence=result['denial_evidence'])
     def stage(*, operation, goal, workspace):
         nonlocal used
         if used:

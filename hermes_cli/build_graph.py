@@ -604,6 +604,12 @@ def make_implement(deps: Deps):
         update["diff_added_lines"] = verdict["diff_added_lines"]
         if callable(getattr(runner, 'stage', None)):
             update['rung_attempts'] = dict(attempts, a2_runs=staged['a2_runs'])
+            try:
+                update['rung_attempts'] = revidence.retain_denial(
+                    state, update['rung_attempts'], raw.get('denial_evidence'),
+                    'implement', runner.run_id, deps.workspace, deps.body)
+            except (revidence.Refused, TypeError, KeyError):
+                return _park('a2_denial_evidence_unavailable')
             update['terminal_reason'] = 'a2_stage_ready:local_review'
         return guard(update, state)
 
@@ -745,6 +751,10 @@ def make_cloud_review(deps: Deps, *, activity: str, node_name: str):
             evidence = revidence.render(state, deps.workspace, deps.body)
         except (revidence.Refused, TypeError, KeyError):
             return {"terminal_reason": "review_evidence_unavailable"}
+        try:
+            evidence += revidence.render_denials(state, deps.workspace, deps.body)
+        except (revidence.Refused, TypeError, KeyError, ValueError):
+            return {"terminal_reason": "protected_denial_evidence_unavailable"}
         if not review_diff_current(deps, state):
             return {"terminal_reason": "review_evidence_diff_changed"}
         prompt = build_review_prompt(state, task_body=deps.body) + evidence

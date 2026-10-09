@@ -83,6 +83,13 @@ def make_stage(deps, operation, guard):
             return guard({'terminal_reason': 'a2_stage_failed:' + operation + ':' + failure['stage'] + ':' + failure['reason'],
                           'rung_attempts': attempts}, state)
         result = raw['result']
+        from hermes_cli import build_graph_review_evidence as evidence
+        try:
+            attempts = evidence.retain_denial(state, attempts, raw.get('denial_evidence'),
+                                             operation, runner.run_id, deps.workspace, deps.body)
+        except (evidence.Refused, TypeError, KeyError):
+            return guard({'terminal_reason': 'a2_denial_evidence_unavailable',
+                          'rung_attempts': attempts}, state)
         update = {'rung_attempts': attempts}
         if operation == 'plan':
             update.update(plan=result['plan'], terminal_reason='a2_stage_ready:plan_review')
