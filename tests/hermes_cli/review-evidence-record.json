@@ -1,0 +1,108 @@
+{
+  "card_id": "t_4930df8d",
+  "executed_at": "2026-10-09T00:52:40Z",
+  "schema": "ac-execution/1",
+  "summary": {
+    "ac_total": 5,
+    "all_clean": true,
+    "checks_failed": 0,
+    "checks_passed": 5,
+    "checks_total": 5,
+    "checks_unrunnable": 0,
+    "judgment_count": 0,
+    "lint_observations": {
+      "affects_routing": false,
+      "failed": 0,
+      "passed": 1,
+      "total": 1,
+      "unrunnable": 0
+    },
+    "verdict": "all_pass"
+  },
+  "verdicts": [
+    {
+      "command": "python3 -B -c \"from a2_readiness_fixture import fixture_value; value=fixture_value(); assert type(value) is int and value==1\"",
+      "exit_code": 0,
+      "expect_kind": "exit",
+      "expect_value": "0",
+      "index": 1,
+      "isolation_used": "bwrap",
+      "kind": "check",
+      "run_error": null,
+      "status": "passed",
+      "stdout_tail": "",
+      "timed_out": false
+    },
+    {
+      "command": "python3 -B -c \"from pathlib import Path; expected=bytes.fromhex('64656620666978747572655f76616c756528293a0a2020202072657475726e20310a'); actual=Path('a2_readiness_fixture.py').read_bytes(); assert actual==expected, ('exact source mismatch', len(actual), actual.hex())\"",
+      "exit_code": 0,
+      "expect_kind": "exit",
+      "expect_value": "0",
+      "index": 2,
+      "isolation_used": "bwrap",
+      "kind": "check",
+      "run_error": null,
+      "status": "passed",
+      "stdout_tail": "",
+      "timed_out": false
+    },
+    {
+      "command": "python3 -c 'import ast,sys\nfor p in sys.argv[1:]:\n    ast.parse(open(p, encoding='\"'\"'utf-8'\"'\"', errors='\"'\"'replace'\"'\"').read(), p)\n' a2_readiness_fixture.py",
+      "exit_code": 0,
+      "expect_kind": "exit",
+      "expect_value": "0",
+      "index": 900,
+      "isolation_used": "bwrap",
+      "kind": "check",
+      "run_error": null,
+      "status": "passed",
+      "stdout_tail": "",
+      "timed_out": false
+    },
+    {
+      "command": "for f in a2_readiness_fixture.py; do [ -f \"$f\" ] || continue; /usr/local/bin/tirith scan --format json --profile ai-agent-repo --file \"$f\" | python3 -c 'import json,sys\ntry:\n    d=json.load(sys.stdin)\nexcept Exception:\n    sys.exit(1)\nf=d.get('\"'\"'findings'\"'\"')\nsys.exit(0 if isinstance(f,list) and not f else 1)\n' || exit 1; done",
+      "exit_code": 0,
+      "expect_kind": "exit",
+      "expect_value": "0",
+      "index": 901,
+      "isolation_used": "bwrap",
+      "kind": "check",
+      "run_error": null,
+      "status": "passed",
+      "stdout_tail": "",
+      "timed_out": false
+    },
+    {
+      "command": "for f in CLAUDE.md AGENTS.md .cursorrules; do [ -f \"$f\" ] || continue; /usr/local/bin/tirith scan --format json --profile ai-agent-repo --file \"$f\" | python3 -c 'import json,sys\ntry:\n    d=json.load(sys.stdin)\nexcept Exception:\n    sys.exit(1)\nf=d.get('\"'\"'findings'\"'\"')\nsys.exit(0 if isinstance(f,list) and not f else 1)\n' || exit 1; done",
+      "exit_code": 0,
+      "expect_kind": "exit",
+      "expect_value": "0",
+      "index": 902,
+      "isolation_used": "bwrap",
+      "kind": "check",
+      "run_error": null,
+      "status": "passed",
+      "stdout_tail": "",
+      "timed_out": false
+    },
+    {
+      "command": "/usr/local/bin/ruff check --isolated --no-cache --no-fix --output-format json --select E4,E7,E9,F --target-version py311 -- ./a2_readiness_fixture.py",
+      "exit_code": 0,
+      "expect_kind": "exit",
+      "expect_value": "0",
+      "finding_count": 0,
+      "index": 903,
+      "isolation_used": "bwrap",
+      "kind": "check",
+      "observation_only": true,
+      "rule_counts": {},
+      "run_error": null,
+      "status": "passed",
+      "stderr_tail": "",
+      "stdout_tail": "[]",
+      "stdout_truncated": false,
+      "timed_out": false
+    }
+  ],
+  "workspace": "/home/jetson/.hermes/kanban/boards/ops/workspaces/t_4930df8d"
+}

@@ -62,6 +62,7 @@ import tempfile
 from typing import Any, Callable, Optional
 
 from hermes_cli import build_graph_checks as ck
+from hermes_cli import build_graph_review_evidence as revidence
 from hermes_cli import build_graph_eval as ev
 from hermes_cli import build_graph_sanitize as sz
 from hermes_cli import build_graph_trace as tl
@@ -610,6 +611,20 @@ def make_implement(deps: Deps):
     return _node
 
 
+def review_diff_current(deps, state):
+    """Do not attach passing checks to a changed work product."""
+    try:
+        derive = deps.derive
+        if derive is None:
+            from hermes_cli import build_graph_diff
+            derive = build_graph_diff.derive
+        current = derive(deps.workspace)
+        return (type(current) is dict and current.get("ok") is True
+                and current.get("diff") == state["diff"])
+    except Exception:
+        return False
+
+
 def make_cheap_gate(deps: Deps):
     """ac_check_runner.gate alone (fork ruling 5).
 
@@ -628,12 +643,21 @@ def make_cheap_gate(deps: Deps):
             deps.workspace,
             "ac-execution-%s-%s-%d.json" % (state["card_id"], state["component"],
                                             state["iteration"]))
+        if not review_diff_current(deps, state):
+            return {"terminal_reason": "review_evidence_diff_changed"}
         summary = deps.gate(
             state["card_id"], deps.body, deps.workspace,
             parse_fn=ck.wrap_parse_fn(deps.parse_ac, deps.workspace,
                                       deps.changed_files),
             path=rec,
         )
+        if summary.get("all_clean") is True:
+            if not review_diff_current(deps, state):
+                return {"terminal_reason": "review_evidence_diff_changed"}
+            try:
+                summary = revidence.bind(state, deps.workspace, deps.body, rec, summary)
+            except revidence.Refused:
+                return {"terminal_reason": "review_evidence_unavailable"}
         return guard({"gate_summary": summary, "ac_record_path": rec,
                       "iteration": state["iteration"] + 1}, state)
 
@@ -717,7 +741,13 @@ def make_cloud_review(deps: Deps, *, activity: str, node_name: str):
         refusal = spend_gate(deps, state)
         if refusal:
             return refusal
-        prompt = build_review_prompt(state, task_body=deps.body)
+        try:
+            evidence = revidence.render(state, deps.workspace, deps.body)
+        except (revidence.Refused, TypeError, KeyError):
+            return {"terminal_reason": "review_evidence_unavailable"}
+        if not review_diff_current(deps, state):
+            return {"terminal_reason": "review_evidence_diff_changed"}
+        prompt = build_review_prompt(state, task_body=deps.body) + evidence
         out = deps.model(
             activity=activity, prompt=prompt, workspace=deps.workspace,
             card_id=state["card_id"], component=state["component"],
