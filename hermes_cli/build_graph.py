@@ -413,7 +413,7 @@ class Deps:
                  agent=None, implement_runner=None, derive=None, over_cap=None, codex=None,
                  review_default=None,
                  conn=None, task_id="", workspace="", body="",
-                 changed_files=None):
+                 changed_files=None, cloud_plan_review=False):
         self.gate = gate
         self.arbiter = arbiter
         self.model = model or call_model
@@ -424,6 +424,7 @@ class Deps:
         self.task_id = task_id
         self.workspace = workspace
         self.body = body
+        self.cloud_plan_review = cloud_plan_review
         # CD-036 (D5.5): the files this card changed, for the synthetic check
         # specs. Empty is the honest default -- it narrows coverage to the
         # AI-instruction carve-out rather than silently passing.
@@ -775,6 +776,45 @@ def make_cloud_review(deps: Deps, *, activity: str, node_name: str):
         return guard(update, state)
 
     _node.__name__ = node_name
+    return _node
+
+
+def make_cloud_plan_review(deps: Deps):
+    """One opt-in paid review after the protected local planning review."""
+    def _node(state):
+        if not deps.cloud_plan_review:
+            return {'terminal_reason': 'cloud_plan_review_not_enabled'}
+        if state['rung_attempts'].get('cloud_plan_review_calls', 0) != 0:
+            return {'terminal_reason': 'cloud_plan_review_cap'}
+        refusal = spend_gate(deps, state)
+        if refusal:
+            return refusal
+        try:
+            evidence = revidence.render_plan_denials(state, deps.workspace, deps.body)
+        except (revidence.Refused, TypeError, KeyError, ValueError):
+            return {'terminal_reason': 'protected_plan_evidence_unavailable'}
+        prompt = ('Review this implementation plan against the specification. '
+                  'This is a read-only planning review; do not implement. '
+                  'Give a verdict with concrete findings if changes are needed.\n'
+                  'SPECIFICATION:\n' + deps.body + '\nPLAN:\n' + state['plan'] + evidence)
+        if len(prompt.encode('utf-8')) > 128 * 1024:
+            return {'terminal_reason': 'cloud_plan_review_prompt_bounds'}
+        out = deps.model(
+            activity='plan_review', prompt=prompt, workspace=deps.workspace,
+            card_id=state['card_id'], component=state['component'],
+            directive=state['directive'],
+            signals=selection_signals(state, activity='plan_review'), mode='none')
+        attempts = dict(state['rung_attempts'])
+        attempts['cloud_plan_review_calls'] = 1
+        update = {'rung_attempts': attempts}
+        if out['klass'] != 'ok':
+            update['terminal_reason'] = 'model_call_%s:plan_review' % out['klass']
+            return guard(update, state)
+        result = out.get('result') or {}
+        update['objections_current'] = extract_objections(result)
+        update['terminal_reason'] = ('a2_stage_ready:implement' if verdict_passed(result.get('verdict'))
+                                     else 'cloud_plan_review_rejected')
+        return guard(update, state)
     return _node
 
 
@@ -1473,6 +1513,12 @@ def route_after_implement(state):
     return "cheap_gate"
 
 
+def route_after_plan_review(state):
+    if state.get('terminal_reason'):
+        return 'human'
+    return 'cloud_plan_review'
+
+
 def route_after_fix(state):
     """Post-fix verification, or `human` when the ladder is spent."""
     if state.get("terminal_reason"):
@@ -1522,6 +1568,7 @@ def build(deps: Deps, *, checkpointer=None):
     _add("cheap_gate", make_cheap_gate(deps))
     _add("cloud_review", make_cloud_review(
         deps, activity="code_review", node_name="cloud_review"))
+    _add("cloud_plan_review", make_cloud_plan_review(deps))
     _add("cloud_re_review", make_cloud_review(
         deps, activity="re_review", node_name="cloud_re_review"))
     _add("classify_failure", make_classify_failure(deps))
@@ -1535,7 +1582,9 @@ def build(deps: Deps, *, checkpointer=None):
     for name in ("plan", "plan_review", "local_review"):
         _add(name, make_stage(deps, name, guard))
     g.add_edge('plan', 'human')
-    g.add_edge('plan_review', 'human')
+    _cond('plan_review', route_after_plan_review,
+          {'cloud_plan_review': 'cloud_plan_review', 'human': 'human'})
+    g.add_edge('cloud_plan_review', 'human')
     _cond('local_review', lambda s: 'human' if s.get('terminal_reason') else 'cheap_gate',
           {'human': 'human', 'cheap_gate': 'cheap_gate'})
 
@@ -1595,6 +1644,7 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
         diff_files=0, diff_added_lines=0, changed_files=None,
         directive=None, deps=None, thread_id=None, recursion_limit=40,
         agent=None,
+        cloud_plan_review=False,
         checkpoint="memory", resume=False):
     """Run the graph with memory state or the fixed Postgres workspace backend.
 
@@ -1616,6 +1666,7 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
         thread_id=thread_id,
         recursion_limit=recursion_limit,
         agent=agent,
+        cloud_plan_review=cloud_plan_review,
         checkpoint=checkpoint,
         resume=resume)
     if checkpoint != "workspace":
@@ -1646,10 +1697,12 @@ def _run_with_checkpointer(conn, task_id, workspace, *, body="", component="main
         diff_files=0, diff_added_lines=0, changed_files=None,
         directive=None, deps=None, thread_id=None, recursion_limit=40,
         agent=None,
+        cloud_plan_review=False,
         checkpoint="memory", resume=False, _workspace_pair=None):
     """Execute with a caller-owned durable saver, or the existing memory saver."""
     deps = deps or Deps(conn=conn, task_id=task_id, workspace=workspace, body=body)
     deps.conn, deps.task_id, deps.workspace, deps.body = conn, task_id, workspace, body
+    deps.cloud_plan_review = cloud_plan_review
     # CD-041: default None, so every existing caller -- cli.py included --
     # is byte-for-byte unaffected. Only an explicit agent= populates it.
     if agent is not None:

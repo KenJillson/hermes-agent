@@ -18023,6 +18023,7 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
                                     changed_files=derived.get("changed_files"),
                                     agent=cli.agent,
                                     deps=_bg.Deps(implement_runner=a2_runner, derive=a2_runner.derive),
+                                    cloud_plan_review=(executor == 'build_graph_cloud_plan_review'),
                                     checkpoint="workspace",
                                     resume="auto")
                 finally:

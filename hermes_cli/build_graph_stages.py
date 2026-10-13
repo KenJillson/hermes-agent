@@ -98,7 +98,8 @@ def make_stage(deps, operation, guard):
                           objections_current=[{'text': text, 'raw': text, 'review_id': None}
                                               for text in result['findings']])
         elif operation == 'plan_review':
-            update['terminal_reason'] = 'a2_stage_ready:implement'
+            if not getattr(deps, 'cloud_plan_review', False):
+                update['terminal_reason'] = 'a2_stage_ready:implement'
         return guard(update, state)
     node.__name__ = operation
     return node

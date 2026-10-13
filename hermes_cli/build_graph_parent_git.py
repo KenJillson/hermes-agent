@@ -170,7 +170,7 @@ class ParentGit:
                 or not run['profile'] or task['assignee'] != run['profile']
                 or type(run['started_at']) is not int or run['started_at'] <= 0
                 or task['workspace_kind'] != 'worktree' or task['workspace_path'] != str(self.workspace)
-                or task['branch_name'] != self.branch or task['graph_executor'] != 'build_graph'
+                or task['branch_name'] != self.branch or task['graph_executor'] not in ('build_graph', 'build_graph_cloud_plan_review')
                 or any(type(x) is not int or x <= time.time() for x in (run['claim_expires'], task['claim_expires']))):
             raise Refused('parent assignment or claim mismatch')
         # Claim renewals may advance expiry, but cannot change identity.

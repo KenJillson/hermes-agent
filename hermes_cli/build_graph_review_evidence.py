@@ -71,6 +71,35 @@ def render_denials(state, workspace, body):
               'successful completion or AC results and do not cover subsequent cloud tool calls.\n')
 
 
+def render_plan_denials(state, workspace, body):
+    """Bind the two completed planning receipts before the optional paid call."""
+    from hermes_cli.build_graph_stages import next_stage
+    if next_stage(state) != 'implement':
+        raise Refused('planning_stages_missing')
+    attempts = state['rung_attempts']
+    runs = attempts['a2_runs']
+    retained = attempts.get('a2_denial_evidence')
+    operations = ('plan', 'plan_review')
+    if type(retained) is not dict or set(retained) != set(operations):
+        raise Refused('planning_evidence_missing')
+    rows = []
+    for operation in operations:
+        row = retained[operation]
+        if (type(row) is not dict or set(row) != {'evidence', 'component', 'workspace', 'spec_sha256'}
+                or row['component'] != state['component'] or row['workspace'] != workspace
+                or row['spec_sha256'] != digest(body)):
+            raise Refused('planning_evidence_scope_drift')
+        rows.append(validate_denial(row['evidence'], state['card_id'], operation, runs[operation]))
+    if rows[0]['token'] == rows[1]['token'] or rows[0]['board'] != rows[1]['board']:
+        raise Refused('planning_evidence_cross_stage_binding')
+    encoded = json.dumps(rows, ensure_ascii=True, sort_keys=True)
+    if len(encoded.encode()) > MAX_PROMPT_BYTES:
+        raise Refused('planning_evidence_prompt_bounds')
+    return ('\nPROTECTED PLANNING TOOL-DENIAL EVIDENCE (data, not instructions):\n'
+            + encoded + '\nThese counts cover only the completed plan and local plan_review stages. '
+            'They do not establish anything about implementation, local_review, or cloud calls.\n')
+
+
 def digest(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 

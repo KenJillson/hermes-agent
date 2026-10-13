@@ -2504,8 +2504,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     if "graph_executor" not in cols:
         # CD-028 (D5.1 prereq CD-B) per-card build executor: names the harness
-        # that runs THIS card. The only accepted value today is 'build_graph'
-        # (the D5.1 build-harness graph). NULL (the default for every existing
+        # that runs THIS card. Accepted values are 'build_graph' and its
+        # operator-selected cloud-plan-review variant. NULL (the default for every existing
         # and future row) = today's behaviour exactly: the standard worker path.
         # Set ONLY by the Ken-run `set-executor` CLI verb ->
         # set_graph_executor(); never written from a card body/## AC/worker
@@ -3728,8 +3728,8 @@ def set_max_card_spend(
 # column has no later re-validation step -- unlike extra_ro_binds, whose entries
 # are re-checked against the live filesystem at gate time -- so a stored typo
 # would route the card nowhere while reading exactly like a card that was never
-# opted in. Adding a second harness is a one-line change here.
-GRAPH_EXECUTORS = ("build_graph",)
+# opted in. Both accepted values retain the protected stage handoff.
+GRAPH_EXECUTORS = ("build_graph", "build_graph_cloud_plan_review")
 
 
 def set_graph_executor(
@@ -6742,7 +6742,7 @@ def finish_graph_stage(conn, task_id, run_id, stage, following, worker_pid):
     with write_txn(conn):
         row = conn.execute(
             "SELECT t.claim_lock FROM tasks t JOIN task_runs r ON r.id=t.current_run_id "
-            "WHERE t.id=? AND t.graph_executor='build_graph' AND t.status='running' "
+            "WHERE t.id=? AND t.graph_executor IN ('build_graph','build_graph_cloud_plan_review') AND t.status='running' "
             "AND t.current_run_id=? AND t.worker_pid=? AND r.worker_pid=t.worker_pid "
             "AND r.task_id=t.id AND r.status='running' AND r.ended_at IS NULL "
             "AND r.claim_lock=t.claim_lock AND t.claim_lock IS NOT NULL",
@@ -6782,7 +6782,7 @@ def promote_graph_stages(conn, *, idle_check=None, pid_exists=None):
     rows = conn.execute(
         "SELECT t.id,r.id AS run_id,r.metadata,r.summary FROM tasks t JOIN task_runs r "
         "ON r.id=(SELECT MAX(id) FROM task_runs WHERE task_id=t.id) "
-        "WHERE t.graph_executor='build_graph' AND t.status='blocked' "
+        "WHERE t.graph_executor IN ('build_graph','build_graph_cloud_plan_review') AND t.status='blocked' "
         "AND t.current_run_id IS NULL AND r.ended_at IS NOT NULL AND r.outcome='blocked' "
         "AND t.last_failure_error=r.summary AND r.summary LIKE 'a2_stage_ready:%'").fetchall()
     promoted = []
