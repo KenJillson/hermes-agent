@@ -3,6 +3,7 @@ import json
 import ast
 import logging
 import os
+import stat
 import sys
 import types
 from pathlib import Path
@@ -15,6 +16,30 @@ from hermes_cli.build_graph_state import SCHEMA_VERSION, new_workflow_state, val
 from tests.hermes_cli.expected_model_fixtures import contract_kwargs
 
 SONNET = {"schema": 1, "model": "sonnet", "lane": "lane_a", "invoke": "sonnet"}
+
+
+def test_registry_permission_contract_is_root_controlled_and_runtime_readable():
+    assert constraints.REGISTRY_OWNER == (0, 0)
+    assert constraints.REGISTRY_MODE == 0o644
+    assert constraints.REGISTRY_MODE & stat.S_IRUSR
+    assert constraints.REGISTRY_MODE & stat.S_IROTH
+    assert not constraints.REGISTRY_MODE & (stat.S_IWGRP | stat.S_IWOTH)
+    regular = stat.S_IFREG | constraints.REGISTRY_MODE
+    accepted = types.SimpleNamespace(st_mode=regular, st_nlink=1, st_uid=0,
+                                     st_gid=0, st_size=100)
+    assert constraints._supported_registry_file(accepted)
+    for change in ({"st_mode": stat.S_IFREG | 0o600},
+                   {"st_mode": stat.S_IFREG | 0o664},
+                   {"st_uid": 1000}, {"st_gid": 1000}, {"st_nlink": 2}):
+        values = vars(accepted) | change
+        assert not constraints._supported_registry_file(
+            types.SimpleNamespace(**values))
+    directory = types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+    assert constraints._supported_registry_directory(directory)
+    for change in ({"st_mode": stat.S_IFDIR | 0o700},
+                   {"st_mode": stat.S_IFDIR | 0o777}, {"st_uid": 1000}):
+        assert not constraints._supported_registry_directory(
+            types.SimpleNamespace(**(vars(directory) | change)))
 
 
 def test_registry_requires_explicit_classification_when_checkpoint_is_absent():

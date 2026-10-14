@@ -10,6 +10,8 @@ from pathlib import Path
 
 REGISTRY_PATH = Path("/etc/michael-maintenance/review-constraints.json")
 MAX_REGISTRY_BYTES = 1024 * 1024
+REGISTRY_OWNER = (0, 0)
+REGISTRY_MODE = 0o644
 ACTIVITIES = ("plan_review", "code_review", "re_review")
 ENTRY_KEYS = {"board_database", "task_id", "component",
               "workflow_classification", "contract_id", "contract_version",
@@ -123,6 +125,19 @@ def parse_registry(raw, *, board_database, task_id, component):
     return json.loads(canonical), hashlib.sha256(canonical).hexdigest()
 
 
+def _supported_registry_file(info):
+    return (stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+            and (info.st_uid, info.st_gid) == REGISTRY_OWNER
+            and stat.S_IMODE(info.st_mode) == REGISTRY_MODE
+            and info.st_size <= MAX_REGISTRY_BYTES)
+
+
+def _supported_registry_directory(info):
+    return (stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+            and info.st_uid == 0 and not info.st_mode & 0o022
+            and info.st_mode & stat.S_IXOTH)
+
+
 def _protected_bytes():
     path = REGISTRY_PATH
     require(path.is_absolute(), "Registry path must be fixed and absolute")
@@ -130,15 +145,15 @@ def _protected_bytes():
     for part in path.parts[1:-1]:
         current /= part
         info = current.lstat()
-        require(stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
-                and info.st_uid == 0 and not info.st_mode & 0o022,
+        require(_supported_registry_directory(info),
                 "Unprotected registry directory")
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as stream:
         info = os.fstat(stream.fileno())
-        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
-                and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600
-                and info.st_size <= MAX_REGISTRY_BYTES,
+        # The graph caller runs as the unprivileged jetson identity.  Exact
+        # root:root 0644 makes the registry runtime-readable while retaining
+        # root-only mutation authority.
+        require(_supported_registry_file(info),
                 "Unsupported registry file identity")
         raw = stream.read(MAX_REGISTRY_BYTES + 1)
         after = os.fstat(stream.fileno())
