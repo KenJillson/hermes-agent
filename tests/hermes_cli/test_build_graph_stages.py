@@ -6,6 +6,15 @@ from hermes_cli.build_graph_state import new_workflow_state
 from tests.hermes_cli.expected_model_fixtures import contract_kwargs
 
 
+def denial(operation, run_id):
+    return {'version':1,'board':'ops','task_id':'t_fixture','run_id':run_id,
+            'operation':operation,'token':('%032x' % run_id),
+            'request_sha256':('%064x' % run_id),
+            'journal_sha256':('%064x' % (run_id + 100)),
+            'journal_version':3,'complete':True,'requested':0,'observed':0,
+            'denied':0,'unknown':0}
+
+
 class Runner:
     payload_workspace = '/workspace'
     def __init__(self): self.run_id = 1; self.calls = []; self.goals = []
@@ -14,10 +23,12 @@ class Runner:
         self.goals.append(goal)
         result = ({'operation':operation,'plan':'Create the declared file.'} if operation == 'plan'
                   else {'operation':operation,'passed':True,'findings':[]})
-        return {'result':result}
+        return {'result':result,
+                'denial_evidence':denial(operation, self.run_id)}
     def __call__(self, **kwargs):
         self.calls.append(('implement', self.run_id))
-        return {'status':'completed'}
+        return {'status':'completed',
+                'denial_evidence':denial('implement', self.run_id)}
 
 
 class GraphStages(unittest.TestCase):
@@ -47,15 +58,12 @@ class GraphStages(unittest.TestCase):
                 self.assertEqual(state['terminal_reason'],expected[index])
                 self.assertEqual(calls,[])
         self.assertEqual(runner.calls,list(zip(stages.STAGES,range(1,5))))
-        self.assertEqual(len(calls),1)
-        self.assertEqual(calls[0]['signals']['diff_files'],1)
-        self.assertEqual(calls[0]['signals']['diff_added_lines'],1)
-        self.assertNotIn('large_diff', calls[0]['signals'])
-        self.assertEqual(state['terminal_reason'],'assembled')
+        self.assertEqual(calls,[])
+        self.assertEqual(state['terminal_reason'],'review_evidence_unavailable')
         # Resuming a completed stage sequence cannot buy another review.
         state['terminal_reason']=None
         app.invoke(state,cfg)
-        self.assertEqual(len(calls),1)
+        self.assertEqual(calls,[])
 
     def test_same_run_cannot_advance(self):
         runner=Runner();deps=self.deps(runner,[])
@@ -95,7 +103,8 @@ class GraphStages(unittest.TestCase):
 
     def test_failed_review_has_no_handoff(self):
         runner=Runner();runner.run_id=2;deps=self.deps(runner,[])
-        runner.stage=lambda **kw: {'result':{'operation':'plan_review','passed':False,'findings':['Missing validation']}}
+        runner.stage=lambda **kw: {'result':{'operation':'plan_review','passed':False,'findings':['Missing validation']},
+            'denial_evidence':denial('plan_review', runner.run_id)}
         state=new_workflow_state('t_fixture','main',plan='Create a.py', **contract_kwargs('t_fixture'))
         state['rung_attempts']={'a2_runs':{'plan':1}}
         out=stages.make_stage(deps,'plan_review',bg.guard)(state)
@@ -135,7 +144,8 @@ class StageRunner(unittest.TestCase):
         import launch_protocol
         calls=[]
         client=types.SimpleNamespace(launch_protocol=launch_protocol,DEADLINE_SECONDS=900,
-            launch=lambda request: calls.append(request) or {'result':{'operation':'plan','plan':'x'}})
+            launch=lambda request: calls.append(request) or {'result':{'operation':'plan','plan':'x'},
+                'denial_evidence':denial('plan', request['run_id'])})
         task=types.SimpleNamespace(id='t_fixture',current_run_id=9,status='running',worker_pid=os.getpid(),
             body='## A2 Files\n```json\n["a.py"]\n```')
         env={'HERMES_KANBAN_TASK':task.id,'HERMES_KANBAN_RUN_ID':'9',

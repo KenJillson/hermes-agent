@@ -27,6 +27,7 @@ class ReviewEvidence(unittest.TestCase):
   derived=diff.derive(str(self.ws));assert derived['ok']
   self.state=new_workflow_state('t_qa','main',diff=derived['diff'], **contract_kwargs('t_qa'));self.body='A test specification';self.sent=[]
   self.guard=patch.object(bg,'guard',lambda update,state:update);self.guard.start();self.addCleanup(self.guard.stop)
+  self.denials=patch.object(evidence,'render_denials',return_value='');self.denials.start();self.addCleanup(self.denials.stop)
   self.deps=bg.Deps(workspace=str(self.ws),body=self.body,over_cap=lambda *a:False,model=self.model,derive=diff.derive)
  def model(self,**kwargs):self.sent.append(kwargs);raise AtModel
  def install_record(self):
@@ -66,7 +67,8 @@ class ReviewEvidence(unittest.TestCase):
   path=self.install_record();rec=json.loads(path.read_text());rec['verdicts'][0]['stdout_tail']='x'*70000;path.write_text(json.dumps(rec));self.state['iteration']=0;self.state['gate_summary']=evidence.bind(self.state,str(self.ws),self.body,str(path),rec['summary']);self.state['iteration']=1
   self.assertEqual(self.review()['terminal_reason'],'review_evidence_unavailable');self.assertFalse(self.sent)
  def test_real_check_execution_to_review(self):
-  from hermes_cli.kanban_db import parse_ac_text
+  with patch('hermes_cli.maintenance_gate.hold_runtime_for_process'):
+   from hermes_cli.kanban_db import parse_ac_text
   self.deps.body='## AC\n- [ ] x is two\n```check expect=exit:0\npython3 -B -c "from file import x; assert x == 2"\n```\n';self.deps.gate=ac.gate;self.deps.parse_ac=parse_ac_text
   update=bg.make_cheap_gate(self.deps)(self.state);self.assertNotIn('terminal_reason',update);self.state.update(update)
   with self.assertRaises(AtModel):self.review()

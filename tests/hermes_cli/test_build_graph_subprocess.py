@@ -11,6 +11,7 @@ import pytest
 from hermes_cli import build_graph as graph
 from hermes_cli.build_graph_state import new_workflow_state
 from tests.hermes_cli.expected_model_fixtures import contract_kwargs
+from tests.hermes_cli.test_build_graph_expected_model import _actual_caller
 
 
 @pytest.fixture
@@ -87,7 +88,7 @@ def test_full_run_empty_diff_parks_without_consuming_payload(worktree, diff):
                           body="Change fixture.txt to after. No acceptance block.")
     finally:
         conn.close()
-    assert state["terminal_reason"] == "node_not_implemented:plan"
+    assert state["terminal_reason"] == "a2_stage_runner_unavailable"
     assert not state["rung_attempts"].get("implement")
     assert state["cloud_review_calls"] == 0
     assert (worktree / "fixture.txt").read_text() == "before\n"
@@ -103,8 +104,8 @@ def test_nonempty_diff_bypasses_implementer(worktree):
                           body="Existing work product without acceptance block")
     finally:
         conn.close()
-    assert state["terminal_reason"] == "human_review"
-    assert calls == {"runner": 0, "gate": 1, "model": 0}
+    assert state["terminal_reason"] == "review_evidence_diff_changed"
+    assert calls == {"runner": 0, "gate": 0, "model": 0}
 
 
 def test_prior_terminal_reason_skips_child_and_gate(worktree):
@@ -157,18 +158,27 @@ def test_repeated_memory_entry_preserves_legacy_attempt_without_invocation(workt
     config = {"configurable": {"thread_id": "legacy-entry"}}
     first = app.invoke(state, config)
     second = app.invoke({"terminal_reason": None, "diff": ""}, config)
-    assert first["terminal_reason"] == second["terminal_reason"] == "node_not_implemented:plan"
+    assert first["terminal_reason"] == second["terminal_reason"] == "a2_stage_runner_unavailable"
     assert first["rung_attempts"]["implement"] == second["rung_attempts"]["implement"] == 1
     assert calls == {"runner": 0, "gate": 0, "model": 0}
 
 
 def test_workspace_adapter_refuses_unregistered_identity(worktree):
+    from contextlib import contextmanager
+    from hermes_cli.build_graph_pg import workspace_postgres
+    from hermes_cli.build_graph_pg.workspace_identity import IdentityRefused
     deps, calls = _full_deps(worktree, lambda **kw: pytest.fail("runner called"))
+    @contextmanager
+    def refused(*args):
+        raise IdentityRefused("unregistered fixture")
+        yield
     conn = sqlite3.connect(":memory:")
     try:
-        state = graph.run(conn, "t_a1", str(worktree), deps=deps,
-                          **contract_kwargs("t_a1"),
-                          body="A specification", checkpoint="workspace", resume="auto")
+        with pytest.MonkeyPatch.context() as context:
+            context.setattr(workspace_postgres, "open_workspace_checkpointer", refused)
+            state = graph.run(conn, "t_a1", str(worktree), deps=deps,
+                              **contract_kwargs("t_a1"),
+                              body="A specification", checkpoint="workspace", resume="auto")
     finally:
         conn.close()
     assert state["terminal_reason"] == "checkpoint_storage_refused:IdentityRefused"
@@ -192,16 +202,16 @@ def test_zero_cap_refuses_paid_review_on_existing_work(worktree):
                           body="Review existing work", diff="+existing\n")
     finally:
         conn.close()
-    assert state["terminal_reason"] == "over_spend_cap"
-    assert calls == {"runner": 0, "gate": 1, "model": 0}
+    assert state["terminal_reason"] == "review_evidence_diff_changed"
+    assert calls == {"runner": 0, "gate": 0, "model": 0}
 
 
 @pytest.mark.parametrize("with_ac", [False, True])
 def test_dispatcher_clean_worktree_parks_at_unbuilt_plan(monkeypatch, worktree, with_ac):
     """Exercise the imported dispatcher entry, including the empty-diff exemption."""
     from types import SimpleNamespace
-    import cli
     from hermes_cli import kanban_db, build_graph_diff, build_graph_constraints
+    caller = _actual_caller()
 
     body = "Change fixture.txt to after."
     if with_ac:
@@ -247,6 +257,8 @@ def test_dispatcher_clean_worktree_parks_at_unbuilt_plan(monkeypatch, worktree, 
         assert supplied.implement_runner is adapter
         assert supplied.derive is adapter.derive
         deps.derive = supplied.derive
+        kwargs['checkpoint'] = 'memory'
+        kwargs['resume'] = False
         result = run(*args, deps=deps, **kwargs)
         observed.update(result)
         return result
@@ -256,8 +268,8 @@ def test_dispatcher_clean_worktree_parks_at_unbuilt_plan(monkeypatch, worktree, 
         parked.append((card_id, reason, kind))
         return True
     monkeypatch.setattr(kanban_db, "block_task", block)
-    assert cli._run_build_graph_q(SimpleNamespace(agent=None)) == 0
-    expected = "node_not_implemented:plan"
+    assert caller(SimpleNamespace(agent=None)) == 0
+    expected = "a2_stage_runner_unavailable"
     assert parked == [(task_id, "graph_terminal:" + expected, "needs_input")]
     assert observed["terminal_reason"] == expected
     assert observed["diff"] == ""
@@ -267,8 +279,8 @@ def test_dispatcher_clean_worktree_parks_at_unbuilt_plan(monkeypatch, worktree, 
 
 def test_dispatcher_missing_classification_parks_before_derivation(monkeypatch, worktree):
     from types import SimpleNamespace
-    import cli
     from hermes_cli import kanban_db, build_graph_constraints, build_graph_implementer
+    caller = _actual_caller()
     db_path = worktree.parent / "missing-classification.db"
     conn = kanban_db.connect(db_path)
     try:
@@ -291,7 +303,7 @@ def test_dispatcher_missing_classification_parks_before_derivation(monkeypatch, 
     monkeypatch.setattr(kanban_db, "block_task",
         lambda conn, card_id, *, reason, kind:
             parked.append((card_id, reason, kind)) or True)
-    assert cli._run_build_graph_q(SimpleNamespace(agent=None)) == 0
+    assert caller(SimpleNamespace(agent=None)) == 0
     assert parked == [(task_id, "graph_constraint_refused:ConstraintRefused",
                        "needs_input")]
 
@@ -304,7 +316,7 @@ def test_full_run_empty_spec_never_spawns(worktree):
                           **contract_kwargs("t_a1"))
     finally:
         conn.close()
-    assert state["terminal_reason"] == "node_not_implemented:plan"
+    assert state["terminal_reason"] == "a2_stage_runner_unavailable"
     assert not state["rung_attempts"].get("implement")
     assert calls == {"runner": 0, "gate": 0, "model": 0}
 

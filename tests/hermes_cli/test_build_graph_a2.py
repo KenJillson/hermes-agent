@@ -23,7 +23,7 @@ class AdapterTests(unittest.TestCase):
    p.start();self.addCleanup(p.stop)
  def test_success_exact_request_and_no_retry(self):
   fn=runner.make_a2_runner(task(),'/task',ENV)
-  with patch.object(client,'launch',return_value={'version':1,'phase':'committed','token':'1'*32}) as launch:
+  with patch.object(client,'launch',return_value={'version':1,'phase':'committed','token':'1'*32,'denial_evidence':{}}) as launch:
    self.assertEqual(invoke(fn)['status'],'completed');request=launch.call_args.args[0]
    self.assertEqual(set(request),client.launch_protocol.KEYS);self.assertEqual(request['files'],['input.txt','output.txt']);self.assertEqual(request['run_id'],7)
    with self.assertRaises(runner.A2ReconciliationRequired):invoke(fn)
@@ -93,7 +93,7 @@ class CliPathTests(unittest.TestCase):
   return kb,{'hermes_cli':pkg,'hermes_cli.kanban_db':kb,'hermes_cli.build_graph':bg,'hermes_cli.build_graph_implementer':runner,'hermes_cli.build_graph_parent_git':PARENT,'hermes_cli.build_graph_diff':bgd,'hermes_cli.build_graph_constraints':constraints}
  def test_actual_cli_success_uses_a2_then_parks(self):
   kb,modules=self.setup_path()
-  with patch.dict(sys.modules,modules),patch.dict(os.environ,ENV,clear=True),patch.object(runner,'_a2_client',return_value=client),patch.object(client,'launch',return_value={}) as launch:
+  with patch.dict(sys.modules,modules),patch.dict(os.environ,ENV,clear=True),patch.object(runner,'_a2_client',return_value=client),patch.object(client,'launch',return_value={'denial_evidence':{}}) as launch:
    self.assertEqual(cli_function()(types.SimpleNamespace(agent=None)),0);self.assertEqual(launch.call_count,1);kb.block_task.assert_called_once()
  def test_actual_cli_sealed_failure_parks(self):
   kb,modules=self.setup_path()
@@ -125,7 +125,7 @@ class CliPathTests(unittest.TestCase):
    kw['deps'].derive('/task')
    return {'terminal_reason':'human_review'}
   modules['hermes_cli.build_graph'].run=graph
-  with patch.dict(sys.modules,modules),patch.dict(os.environ,ENV,clear=True),patch.object(PARENT,'ParentGit',return_value=context) as constructor,patch.object(runner,'_a2_client',return_value=client),patch.object(client,'launch',return_value={}):
+  with patch.dict(sys.modules,modules),patch.dict(os.environ,ENV,clear=True),patch.object(PARENT,'ParentGit',return_value=context) as constructor,patch.object(runner,'_a2_client',return_value=client),patch.object(client,'launch',return_value={'denial_evidence':{}}):
    self.assertEqual(cli_function()(types.SimpleNamespace(agent=None)),0)
    constructor.assert_called_once();self.assertEqual(context.derive.call_count,2)
    self.assertEqual([c[0] for c in context.mock_calls],['derive','launch','committed','derive'])

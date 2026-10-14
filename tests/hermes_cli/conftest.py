@@ -2,7 +2,44 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from contextlib import contextmanager
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _canonical_graph_config_root(monkeypatch):
+    """Keep graph security modules bound to the colocated config checkout.
+
+    The repository-wide fixture deliberately replaces HERMES_HOME per test.
+    Graph tests require the separately authoritative config repository and must
+    name it explicitly, matching the production worker contract.
+    """
+    checkout = Path(__file__).resolve().parents[3]
+    for candidate in (checkout / "config", checkout):
+        if (candidate / "lib/model_call/sanitizer.py").is_file():
+            monkeypatch.setenv("HERMES_CONFIG_ROOT", str(candidate))
+            break
+    protected = Path("/usr/local/lib/michael-maintenance")
+    if not protected.exists():
+        from hermes_cli import maintenance_gate
+
+        @contextmanager
+        def admitted():
+            yield
+
+        class FixtureAdmission:
+            admit = staticmethod(admitted)
+
+            @staticmethod
+            @contextmanager
+            def runtime():
+                yield
+
+        monkeypatch.setattr(maintenance_gate, "_protected_module",
+                            lambda: FixtureAdmission)
+        monkeypatch.setattr(maintenance_gate, "hold_runtime_for_process",
+                            lambda: None)
 
 
 @pytest.fixture

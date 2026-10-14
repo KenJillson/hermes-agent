@@ -26,6 +26,9 @@ class GraphContract(unittest.TestCase):
         self.addCleanup(patch.stopall)
         patch.object(bg.ev,'append_classify_line',side_effect=lambda r:self.records.append(r) or True).start()
         patch.object(bg.ev,'is_holdout',return_value=False).start()
+        patch.object(bg.revidence,'render',return_value='AC evidence').start()
+        patch.object(bg.revidence,'render_denials',return_value='').start()
+        patch.object(bg,'review_diff_current',return_value=True).start()
         real=bg.tl.Tracer
         patch.object(bg.tl,'Tracer',side_effect=lambda **k:real(**k,sink=lambda r:None)).start()
 
@@ -39,7 +42,7 @@ class GraphContract(unittest.TestCase):
             result=dict(model='opus',verdict={'passed':False,'findings':['integer is wrong: '+activity]})
         elif activity=='classify':result=dict(model='qwen',text='{"same": true}')
         elif activity in ('fix_sonnet','fix_opus'):
-            self.assertEqual(kw['signals'],{})
+            self.assertEqual(kw['signals'],{'diff_files':1,'diff_added_lines':0})
             result=dict(model='sonnet' if activity=='fix_sonnet' else 'opus',text=json.dumps({'files':[{'path':'code.py','content':'answer = 1\n'}]}))
         else:raise AssertionError(activity)
         return dict(klass='ok',result=result)
@@ -172,6 +175,9 @@ class PolicyGraphTests(unittest.TestCase):
         self.addCleanup(patch.stopall)
         patch.object(bg.ev, 'append_classify_line', return_value=True).start()
         patch.object(bg.ev, 'is_holdout', return_value=False).start()
+        patch.object(bg.revidence, 'render', return_value='AC evidence').start()
+        patch.object(bg.revidence, 'render_denials', return_value='').start()
+        patch.object(bg, 'review_diff_current', return_value=True).start()
         tracer = bg.tl.Tracer
         patch.object(bg.tl, 'Tracer', side_effect=lambda **k: tracer(**k, sink=lambda r: None)).start()
 
@@ -198,10 +204,14 @@ class PolicyGraphTests(unittest.TestCase):
         return {'klass': 'ok', 'result': {'model': self.policy.resolve(kw['activity']).model, 'text': json.dumps({'files': [{'path': 'code.py', 'content': 'answer = 3\n'}]})}}
 
     def test_documented_size_boundaries(self):
-        for files, lines, fired in [(1,1,False),(8,400,False),(9,400,True),(8,401,True)]:
+        file_min = self.policy.LARGE_DIFF_MIN_FILES
+        line_min = self.policy.LARGE_DIFF_MIN_ADDED_LINES
+        for files, lines, fired in [(1,1,False),(file_min-1,line_min-1,False),
+                                    (file_min,line_min-1,True),(file_min-1,line_min,True)]:
             with self.subTest(files=files, lines=lines):
                 self.state.update(diff_files=files, diff_added_lines=lines)
-                self.assertEqual(bool(state_module.selection_signals(self.state).get('large_diff')), fired)
+                self.assertEqual(self.policy.large_diff_fired(
+                    state_module.selection_signals(self.state)), fired)
         for components, fired in [(1,False),(3,False),(4,True)]:
             self.state['component_count'] = components
             self.assertEqual(bool(state_module.selection_signals(self.state).get('many_components')), fired)
@@ -209,12 +219,16 @@ class PolicyGraphTests(unittest.TestCase):
     def test_first_review_does_not_inherit_planning_or_repair_signals(self):
         self.state.update(component_count=4, novel_architecture=True, author_independence=True, re_review_after_severe=True)
         bg.make_cloud_review(self.deps, activity='code_review', node_name='cloud_review')(self.state)
-        self.assertEqual(self.calls[-1], ('code_review', self.policy.resolve('code_review').model, {}))
+        signals = {'diff_files': 1, 'diff_added_lines': 1}
+        self.assertEqual(self.calls[-1], ('code_review',
+            self.policy.resolve('code_review', signals=signals).model, signals))
 
     def test_re_review_does_not_inherit_diff_or_planning_signals(self):
         self.state.update(diff_files=9, diff_added_lines=401, component_count=4, novel_architecture=True, security_sensitive=True, financial_sensitive=True)
         bg.make_cloud_review(self.deps, activity='re_review', node_name='cloud_re_review')(self.state)
-        self.assertEqual(self.calls[-1], ('re_review', self.policy.resolve('re_review').model, {}))
+        signals = {'diff_files': 9, 'diff_added_lines': 401}
+        self.assertEqual(self.calls[-1], ('re_review',
+            self.policy.resolve('re_review', signals=signals).model, signals))
 
     def test_repair_sets_and_clears_independence_from_actual_policy_identity(self):
         first = bg.make_fix(self.deps, rung='rung1', activity='fix_sonnet')(self.state)
@@ -263,7 +277,8 @@ class PolicyGraphTests(unittest.TestCase):
         self.assertEqual([x[0] for x in self.calls], ['code_review','fix_sonnet','re_review','classify','fix_codex'])
         self.assertEqual(self.calls[0][1], self.policy.resolve('code_review').model)
         self.assertNotEqual(self.calls[1][1], self.calls[2][1])
-        self.assertEqual(self.calls[2][2], {'author_independence': True})
+        self.assertEqual(self.calls[2][2], {'diff_files': 1,
+            'diff_added_lines': 1, 'author_independence': True})
         self.assertTrue(result['objection_recurred'])
         self.assertEqual(result['rung_attempts'], {'rung1':1,'rung3':1})
         self.assertEqual(result['cloud_review_calls'], 2)
@@ -274,8 +289,10 @@ class PolicyGraphTests(unittest.TestCase):
         app,_ = bg.build(self.deps)
         result = app.invoke(self.state, {'configurable': {'thread_id':'mechanical'}, 'recursion_limit':40})
         self.assertEqual([x[0] for x in self.calls], ['fix_sonnet','re_review','fix_opus','re_review','fix_codex'])
-        self.assertEqual(self.calls[1][2], {'author_independence': True})
-        self.assertEqual(self.calls[3][2], {})
+        self.assertEqual(self.calls[1][2], {'diff_files': 1,
+            'diff_added_lines': 1, 'author_independence': True})
+        self.assertEqual(self.calls[3][2], {'diff_files': 1,
+            'diff_added_lines': 1})
         self.assertNotEqual(self.calls[2][1], self.calls[3][1])
         self.assertEqual(result['rung_attempts'], {'rung1':1,'rung2':1,'rung3':1})
         self.assertEqual(result['cloud_review_calls'],2)

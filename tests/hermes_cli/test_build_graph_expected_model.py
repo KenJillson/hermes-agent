@@ -25,6 +25,16 @@ def test_registry_requires_explicit_classification_when_checkpoint_is_absent():
                                    task_id="t_missing", component="main")
 
 
+def test_registry_surrogate_text_is_a_typed_refusal():
+    entry = contract_kwargs("t_bad")["review_contract"]
+    entry["task_id"] = "t_\ud800"
+    raw = json.dumps({"version": 1, "entries": [entry]}).encode()
+    with pytest.raises(constraints.ConstraintRefused,
+                       match="Invalid bounded task_id"):
+        constraints.parse_registry(raw, board_database="/isolated/test-board.db",
+                                   task_id="t_bad", component="main")
+
+
 def test_state_schema_binds_contract_and_rejects_old_or_changed_contract():
     bound = contract_kwargs("t_bound")
     state = new_workflow_state("t_bound", "main", **bound)

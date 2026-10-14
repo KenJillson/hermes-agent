@@ -5,7 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from hermes_cli import build_graph as bg
 from hermes_cli import build_graph_diff as diff
@@ -19,8 +19,11 @@ class AtModel(Exception):
 
 class DiffCounts(unittest.TestCase):
     def test_every_graph_model_call_has_state_counts(self):
-        for kind in ("review", "re_review", "fix", "classify"):
-            with self.subTest(kind=kind):
+        with patch.object(bg.revidence, "render", return_value="evidence"), \
+             patch.object(bg.revidence, "render_denials", return_value=""), \
+             patch.object(bg, "review_diff_current", return_value=True):
+            for kind in ("review", "re_review", "fix", "classify"):
+              with self.subTest(kind=kind):
                 state = new_workflow_state("t_fixture", "test", diff="+fixture\n",
                                            diff_files=2, diff_added_lines=7,
                                            **contract_kwargs("t_fixture", "test"))
