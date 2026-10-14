@@ -51,6 +51,20 @@ RECURRENCE_TIERS = ("classifier", "default")
 DISPUTE_CLASSES = ("approach_disputed", "impl_bug")
 
 
+def _bound_contract_copy(contract, digest):
+    if not isinstance(contract, dict):
+        raise ValueError("review_contract is missing")
+    try:
+        canonical = json.dumps(contract, sort_keys=True, separators=(",", ":"),
+                               allow_nan=False).encode()
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError("review_contract is not canonical JSON") from exc
+    if (not isinstance(digest, str)
+            or hashlib.sha256(canonical).hexdigest() != digest):
+        raise ValueError("review_contract SHA-256 differs")
+    return json.loads(canonical)
+
+
 class Objection(TypedDict):
     """One objection as carried between review passes.
 
@@ -181,6 +195,8 @@ def new_workflow_state(
     TypedDict defeats the point of pinning the schema, and a KeyError inside a
     node is a much worse failure than a wrong default.
     """
+    review_contract = _bound_contract_copy(
+        review_contract, review_contract_sha256)
     return WorkflowState(
         schema_version=SCHEMA_VERSION,
         card_id=card_id,
@@ -292,13 +308,8 @@ def validate(state: WorkflowState) -> None:
         raise ValueError("dispute_class %r not in %r" % (dc, DISPUTE_CLASSES))
     if not state["card_id"]:
         raise ValueError("card_id is empty")
-    contract = state["review_contract"]
-    if not isinstance(contract, dict):
-        raise ValueError("review_contract is missing")
-    canonical = json.dumps(contract, sort_keys=True, separators=(",", ":"),
-                           allow_nan=False).encode()
-    if hashlib.sha256(canonical).hexdigest() != state["review_contract_sha256"]:
-        raise ValueError("review_contract SHA-256 differs")
+    contract = _bound_contract_copy(
+        state["review_contract"], state["review_contract_sha256"])
     if (contract.get("task_id") != state["card_id"]
             or contract.get("component") != state["component"]
             or contract.get("workflow_classification") not in

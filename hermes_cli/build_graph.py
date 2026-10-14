@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import stat
 import tempfile
@@ -145,6 +146,7 @@ RC_LEDGER_UNRECORDED = 9          # call SUCCEEDED, ledger append FAILED
 RC_SANITIZE_HALT = 3
 RC_CONSTRAINT = 10
 _RETRYABLE = (4, 6, 8)            # transfer / fetch / transport
+_CONTRACT_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def rc_class(rc: int) -> str:
@@ -172,6 +174,53 @@ def rc_class(rc: int) -> str:
 # --------------------------------------------------------------------------
 # model-call invocation (design section 0.1: the node invokes ONE CLI command)
 # --------------------------------------------------------------------------
+
+def _wrapper_constraint_error(classification, expected, digest):
+    """Reject malformed protected arguments before preparing request files.
+
+    This checks only the transport shape needed to build safe argv.  The
+    model-call primitive remains the authority for policy resolution and the
+    exact expected-versus-actual comparison.
+    """
+    if classification is None:
+        if expected is None and digest is None:
+            return None
+        return "classification is required with protected arguments"
+    if classification not in ("constrained", "unconstrained"):
+        return "workflow classification is invalid"
+    if not isinstance(digest, str) or not _CONTRACT_DIGEST.fullmatch(digest):
+        return "review contract SHA-256 is invalid"
+    if classification == "unconstrained":
+        if expected is not None:
+            return "unconstrained workflow cannot carry an expected model"
+        return None
+    if not isinstance(expected, dict) or set(expected) != {
+            "schema", "model", "lane", "invoke"} or expected.get("schema") != 1:
+        return "expected model has an invalid shape"
+    for field in ("model", "lane", "invoke"):
+        value = expected.get(field)
+        if not isinstance(value, str) or not value:
+            return "expected model field is invalid"
+        try:
+            if len(value.encode("utf-8")) > 256:
+                return "expected model field is invalid"
+        except UnicodeError:
+            return "expected model field is invalid"
+    try:
+        encoded = json.dumps(expected, sort_keys=True, separators=(",", ":"),
+                             allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        return "expected model is not canonical JSON"
+    if len(encoded) > 2048:
+        return "expected model is oversized"
+    return None
+
+
+def _constraint_refusal(detail):
+    return {"rc": RC_CONSTRAINT, "klass": "constraint",
+            "result": {"ok": False, "invoked": False,
+                "error": {"stage": "constraint", "code": "expected_model_invalid",
+                          "retryable": False, "detail": detail}}}
 
 def _model_artifact_directory(workspace: str) -> str:
     """Keep retained provider output in the graph's reserved metadata tree."""
@@ -247,15 +296,15 @@ def call_model(
     skill names unbounded re-calling as an explicit pitfall, and a retry that
     crosses the rc-9 case double-spends. Retry policy is a D5.4 question.
     """
+    constraint_error = _wrapper_constraint_error(
+        workflow_classification, expected_model, review_contract_sha256)
+    if constraint_error is not None:
+        return _constraint_refusal(constraint_error)
     exe = exe or MODEL_CALL_EXE
     if workflow_classification is not None and (not allow_test_exe
             and (exe != CANONICAL_MODEL_CALL_EXE
                  or os.path.realpath(exe) != CANONICAL_MODEL_CALL_TARGET)):
-        return {"rc": RC_CONSTRAINT, "klass": "constraint",
-                "result": {"ok": False, "invoked": False,
-                    "error": {"stage": "constraint", "code": "expected_model_invalid",
-                              "retryable": False,
-                              "detail": "constrained call requires canonical launcher"}}}
+        return _constraint_refusal("protected call requires canonical launcher")
     artifacts = None
     try:
         artifacts = _model_artifact_directory(workspace)

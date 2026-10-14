@@ -28,6 +28,8 @@ def test_registry_requires_explicit_classification_when_checkpoint_is_absent():
 def test_state_schema_binds_contract_and_rejects_old_or_changed_contract():
     bound = contract_kwargs("t_bound")
     state = new_workflow_state("t_bound", "main", **bound)
+    bound["review_contract"]["contract_version"] = 99
+    assert state["review_contract"]["contract_version"] == 1
     validate(state)
     assert SCHEMA_VERSION == 3
     old = dict(state); old["schema_version"] = 2
@@ -111,6 +113,23 @@ def test_wrapper_rejects_noncanonical_launcher_before_artifact_preparation():
     assert result["rc"] == 10
     assert result["klass"] == "constraint"
     assert result["result"]["invoked"] is False
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"workflow_classification": "constrained", "expected_model": SONNET,
+     "review_contract_sha256": "not-a-digest"},
+    {"workflow_classification": None, "expected_model": SONNET,
+     "review_contract_sha256": "a" * 64},
+    {"workflow_classification": "unconstrained", "expected_model": SONNET,
+     "review_contract_sha256": "a" * 64},
+])
+def test_wrapper_rejects_malformed_constraint_before_artifact_preparation(kwargs):
+    result = graph.call_model(activity="code_review", prompt="review",
+        workspace="/path/that/must/not/be/opened", card_id="t_wrapper", **kwargs)
+    assert result["rc"] == 10
+    assert result["klass"] == "constraint"
+    assert result["result"]["invoked"] is False
+    assert result["result"]["error"]["code"] == "expected_model_invalid"
 
 
 def test_node_update_cannot_replace_protected_contract(monkeypatch):
