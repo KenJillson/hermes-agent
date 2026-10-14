@@ -66,6 +66,7 @@ from hermes_cli import build_graph_review_evidence as revidence
 from hermes_cli import build_graph_eval as ev
 from hermes_cli import build_graph_sanitize as sz
 from hermes_cli import build_graph_trace as tl
+from hermes_cli.build_graph_constraints import activity_rule
 from hermes_cli.build_graph_state import (
     SCHEMA_VERSION,
     WorkflowState,
@@ -75,8 +76,9 @@ from hermes_cli.build_graph_state import (
     validate,
 )
 
-MODEL_CALL_EXE = os.environ.get(
-    "HERMES_MODEL_CALL", "/home/jetson/.local/bin/model-call")
+CANONICAL_MODEL_CALL_EXE = "/home/jetson/.local/bin/model-call"
+CANONICAL_MODEL_CALL_TARGET = "/home/jetson/.hermes/lib/model_call/bin/model-call"
+MODEL_CALL_EXE = os.environ.get("HERMES_MODEL_CALL", CANONICAL_MODEL_CALL_EXE)
 
 # Per-rung attempt cap and the per-component cloud-review cap (section 2.2).
 RUNG_ATTEMPT_CAP = 1
@@ -126,9 +128,9 @@ IMPLEMENT_OK = "completed"
 # triage, but that is a backstop for a misbehaving card, not a budget for
 # this node.
 #
-# The count lives in the EXISTING `rung_attempts` dict channel, so there is
-# NO SCHEMA CHANGE -- SCHEMA_VERSION stays 2 and every checkpoint written
-# since CD-032 still resumes. LADDER does not contain "implement", so
+# The count lives in the EXISTING `rung_attempts` dict channel; it did not
+# cause a schema change. Version 3 was later required by the protected review
+# contract and deliberately refuses older checkpoints. LADDER does not contain "implement", so
 # next_available_rung ignores the key and the fix ladder is unaffected.
 IMPLEMENT_ATTEMPT_CAP = 1
 
@@ -141,6 +143,7 @@ IMPLEMENT_TIMEOUT_SECONDS = 900
 RC_OK = 0
 RC_LEDGER_UNRECORDED = 9          # call SUCCEEDED, ledger append FAILED
 RC_SANITIZE_HALT = 3
+RC_CONSTRAINT = 10
 _RETRYABLE = (4, 6, 8)            # transfer / fetch / transport
 
 
@@ -159,6 +162,8 @@ def rc_class(rc: int) -> str:
         return "ledger_unrecorded"
     if rc == RC_SANITIZE_HALT:
         return "sanitize_halt"
+    if rc == RC_CONSTRAINT:
+        return "constraint"
     if rc in _RETRYABLE:
         return "retryable"
     return "failed"
@@ -222,6 +227,10 @@ def call_model(
     mode: str = "none",
     timeout: int = 900,
     exe: str = None,
+    workflow_classification: Optional[str] = None,
+    expected_model: Optional[dict] = None,
+    review_contract_sha256: Optional[str] = None,
+    allow_test_exe: bool = False,
 ) -> dict:
     """Invoke model-call and return {"rc", "klass", "result"}.
 
@@ -239,6 +248,14 @@ def call_model(
     crosses the rc-9 case double-spends. Retry policy is a D5.4 question.
     """
     exe = exe or MODEL_CALL_EXE
+    if workflow_classification is not None and (not allow_test_exe
+            and (exe != CANONICAL_MODEL_CALL_EXE
+                 or os.path.realpath(exe) != CANONICAL_MODEL_CALL_TARGET)):
+        return {"rc": RC_CONSTRAINT, "klass": "constraint",
+                "result": {"ok": False, "invoked": False,
+                    "error": {"stage": "constraint", "code": "expected_model_invalid",
+                              "retryable": False,
+                              "detail": "constrained call requires canonical launcher"}}}
     artifacts = None
     try:
         artifacts = _model_artifact_directory(workspace)
@@ -260,6 +277,12 @@ def call_model(
                 "--card-id", card_id, "--task", task, "--component", component,
                 "--task-class", task_class, "--workspace", artifacts,
                 "--mode", mode]
+        if workflow_classification is not None:
+            argv += ["--workflow-classification", workflow_classification,
+                     "--review-contract-sha256", review_contract_sha256]
+            if expected_model is not None:
+                argv += ["--expected-model-json", json.dumps(expected_model,
+                    sort_keys=True, separators=(",", ":"), allow_nan=False)]
         if directive:
             argv += ["--directive", directive]
         if cwd:
@@ -366,6 +389,9 @@ def guard(update: dict, state) -> dict:
 
     The recorded value is a RULE NAME and a field name, never the match.
     """
+    if "review_contract" in update or "review_contract_sha256" in update:
+        return {"terminal_reason": "expected_model_invalid:contract_mutation",
+                "expected_model_refusal": "expected_model_invalid"}
     reason = sz.state_halt_reason(update)
     if reason is None:
         return update
@@ -499,10 +525,9 @@ def make_implement(deps: Deps):
     block_task(reason=...), and the vocabulary below is closed and
     code-authored -- same posture as cli.py's graph_invoke_failed:<TypeName>.
 
-    NO SCHEMA CHANGE. Every field written already exists in WorkflowState, so
-    SCHEMA_VERSION stays 2 and resume_refusal keeps accepting every checkpoint
-    written since CD-032. Carrying the child's summary in state would have
-    forced a bump; it is not worth one.
+    This node itself writes only existing fields. The version-3 protected
+    review-contract bump is independent of the implementer payload; carrying
+    the child's summary in state would require another bump and is not worth one.
     """
 
     def _node(state):
@@ -737,12 +762,39 @@ def normal_review_model():
     return value
 
 
+def review_constraint(state, activity):
+    """Return model-call contract arguments, or a terminal forbidden update."""
+    rule = activity_rule(state["review_contract"], activity)
+    if rule["mode"] == "forbidden":
+        return None, {"terminal_reason": "expected_model_forbidden:%s" % activity,
+                      "expected_model_refusal": "expected_model_invalid"}
+    return {"workflow_classification":
+                state["review_contract"]["workflow_classification"],
+            "expected_model": rule.get("expected"),
+            "review_contract_sha256": state["review_contract_sha256"]}, None
+
+
+def constraint_refusal(out, activity):
+    result = out.get("result") or {}
+    error = result.get("error") or {}
+    if out.get("klass") != "constraint" and error.get("stage") != "constraint":
+        return None
+    code = error.get("code")
+    if code not in ("expected_model_invalid", "expected_model_mismatch"):
+        code = "expected_model_invalid"
+    return {"terminal_reason": "%s:%s" % (code, activity),
+            "expected_model_refusal": code}
+
+
 def make_cloud_review(deps: Deps, *, activity: str, node_name: str):
     """cloud_review / cloud_re_review. --mode read_only, no --cwd (note 2)."""
 
     def _node(state):
         if state["cloud_review_calls"] >= CLOUD_REVIEW_CAP:
             return {"terminal_reason": "cloud_review_cap"}
+        contract, refused = review_constraint(state, activity)
+        if refused:
+            return refused
         # After the count cap deliberately: that check is free, this one costs
         # a ledger read over ssh.
         refusal = spend_gate(deps, state)
@@ -763,8 +815,11 @@ def make_cloud_review(deps: Deps, *, activity: str, node_name: str):
             activity=activity, prompt=prompt, workspace=deps.workspace,
             card_id=state["card_id"], component=state["component"],
             directive=state["directive"], signals=selection_signals(state, activity=activity),
-            mode="read_only")
+            mode="read_only", **contract)
         res = out.get("result") or {}
+        refused = constraint_refusal(out, activity)
+        if refused:
+            return guard(refused, state)
         update = {"cloud_review_calls": state["cloud_review_calls"] + 1,
                   "reviewer_model": res.get("model")}
         if out["klass"] != "ok":
@@ -786,6 +841,9 @@ def make_cloud_plan_review(deps: Deps):
             return {'terminal_reason': 'cloud_plan_review_not_enabled'}
         if state['rung_attempts'].get('cloud_plan_review_calls', 0) != 0:
             return {'terminal_reason': 'cloud_plan_review_cap'}
+        contract, refused = review_constraint(state, 'plan_review')
+        if refused:
+            return refused
         refusal = spend_gate(deps, state)
         if refusal:
             return refusal
@@ -803,7 +861,11 @@ def make_cloud_plan_review(deps: Deps):
             activity='plan_review', prompt=prompt, workspace=deps.workspace,
             card_id=state['card_id'], component=state['component'],
             directive=state['directive'],
-            signals=selection_signals(state, activity='plan_review'), mode='none')
+            signals=selection_signals(state, activity='plan_review'), mode='none',
+            **contract)
+        refused = constraint_refusal(out, 'plan_review')
+        if refused:
+            return guard(refused, state)
         attempts = dict(state['rung_attempts'])
         attempts['cloud_plan_review_calls'] = 1
         update = {'rung_attempts': attempts}
@@ -1267,8 +1329,8 @@ def failing_checks(state) -> list:
     overwrite each other. Confirmed as a live state channel in the same trace
     line above, not inferred.
 
-    NO SCHEMA CHANGE. Nothing new is written to state; this only READS a channel
-    that has existed since CD-027, so SCHEMA_VERSION stays 2.
+    Nothing new is written to state here; this only reads a channel that has
+    existed since CD-027. The later version-3 bump has a separate owner.
 
     FAILS SOFT, DELIBERATELY. A missing or malformed record must not park a card
     that has a real diff and a real objection to fix -- the caller renders a
@@ -1642,6 +1704,7 @@ def build(deps: Deps, *, checkpointer=None):
 
 def run(conn, task_id, workspace, *, body="", component="main", plan="", diff="",
         diff_files=0, diff_added_lines=0, changed_files=None,
+        review_contract, review_contract_sha256,
         directive=None, deps=None, thread_id=None, recursion_limit=40,
         agent=None,
         cloud_plan_review=False,
@@ -1669,6 +1732,8 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
         cloud_plan_review=cloud_plan_review,
         checkpoint=checkpoint,
         resume=resume)
+    options.update(review_contract=review_contract,
+                   review_contract_sha256=review_contract_sha256)
     if checkpoint != "workspace":
         return _run_with_checkpointer(conn, task_id, workspace, **options)
     try:
@@ -1688,13 +1753,15 @@ def run(conn, task_id, workspace, *, body="", component="main", plan="", diff=""
             refused = "checkpoint_storage_refused:" + type(exc).__name__
     parked = new_workflow_state(task_id, component, plan=plan, diff=diff,
                                diff_files=diff_files, diff_added_lines=diff_added_lines,
-                               directive=directive)
+                               directive=directive, review_contract=review_contract,
+                               review_contract_sha256=review_contract_sha256)
     parked["terminal_reason"] = refused
     return parked
 
 
 def _run_with_checkpointer(conn, task_id, workspace, *, body="", component="main", plan="", diff="",
         diff_files=0, diff_added_lines=0, changed_files=None,
+        review_contract, review_contract_sha256,
         directive=None, deps=None, thread_id=None, recursion_limit=40,
         agent=None,
         cloud_plan_review=False,
@@ -1749,7 +1816,8 @@ def _run_with_checkpointer(conn, task_id, workspace, *, body="", component="main
         parked = new_workflow_state(task_id, component, plan=plan, diff=diff,
                                     diff_files=diff_files,
                                     diff_added_lines=diff_added_lines,
-                                    directive=directive)
+                                    directive=directive, review_contract=review_contract,
+                                    review_contract_sha256=review_contract_sha256)
         parked["terminal_reason"] = reason
         return parked
 
@@ -1790,6 +1858,17 @@ def _run_with_checkpointer(conn, task_id, workspace, *, body="", component="main
         refusal = ckmod.resume_refusal(pair[0], tid, schema_version=SCHEMA_VERSION)
         if refusal:
             return _parked(refusal)
+        try:
+            snapshot = app.get_state(cfg)
+            persisted = dict(snapshot.values)
+            validate(persisted)
+        except Exception:
+            return _parked("resume_constraint_invalid")
+        if (persisted["review_contract"] != review_contract
+                or persisted["review_contract_sha256"] != review_contract_sha256):
+            return _parked("resume_constraint_mismatch")
+        if persisted.get("expected_model_refusal"):
+            return persisted
         # Partial input: re-derived work product only. Everything else is
         # restored from the checkpoint.
         return _invoke({**({"plan": plan} if plan else {}), "diff": diff,
@@ -1805,6 +1884,7 @@ def _run_with_checkpointer(conn, task_id, workspace, *, body="", component="main
     state = new_workflow_state(task_id, component, plan=plan, diff=diff,
                                diff_files=diff_files,
                                diff_added_lines=diff_added_lines,
-                               directive=directive)
+                               directive=directive, review_contract=review_contract,
+                               review_contract_sha256=review_contract_sha256)
     validate(state)
     return _invoke(state)

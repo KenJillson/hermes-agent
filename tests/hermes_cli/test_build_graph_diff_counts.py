@@ -10,6 +10,7 @@ from unittest.mock import Mock
 from hermes_cli import build_graph as bg
 from hermes_cli import build_graph_diff as diff
 from hermes_cli.build_graph_state import new_workflow_state, selection_signals
+from tests.hermes_cli.expected_model_fixtures import contract_kwargs
 
 
 class AtModel(Exception):
@@ -21,7 +22,8 @@ class DiffCounts(unittest.TestCase):
         for kind in ("review", "re_review", "fix", "classify"):
             with self.subTest(kind=kind):
                 state = new_workflow_state("t_fixture", "test", diff="+fixture\n",
-                                           diff_files=2, diff_added_lines=7)
+                                           diff_files=2, diff_added_lines=7,
+                                           **contract_kwargs("t_fixture", "test"))
                 model = Mock(side_effect=AtModel)
                 deps = bg.Deps(model=model, over_cap=lambda *a: False,
                                review_default=lambda: "sonnet")
@@ -45,7 +47,8 @@ class DiffCounts(unittest.TestCase):
                 self.assertNotIn("large_diff", signals)
 
     def test_reviews_keep_zero_counts_and_activity_booleans(self):
-        state = new_workflow_state("t_fixture", "test", security_sensitive=True)
+        state = new_workflow_state("t_fixture", "test", security_sensitive=True,
+                                   **contract_kwargs("t_fixture", "test"))
         for activity in ("plan_review", "code_review", "re_review"):
             signals = selection_signals(state, activity=activity)
             self.assertEqual(signals["diff_files"], 0)
@@ -73,7 +76,8 @@ class DiffCounts(unittest.TestCase):
             derived = diff.derive(str(workspace))
             self.assertTrue(derived["ok"], derived)
             state = new_workflow_state("t_fixture", "test", diff=derived["diff"],
-                diff_files=derived["diff_files"], diff_added_lines=derived["diff_added_lines"])
+                diff_files=derived["diff_files"], diff_added_lines=derived["diff_added_lines"],
+                **contract_kwargs("t_fixture", "test"))
             exe = root / "capture"
             exe.write_text("#!" + sys.executable + "\nimport json,sys\n"
                            "print(json.dumps({'ok':True,'argv':sys.argv[1:]}))\n")

@@ -17921,6 +17921,9 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
     conn = _kb.connect()
     try:
         task = _kb.get_task(conn, task_id)
+        board_rows = conn.execute("PRAGMA database_list").fetchall()
+        board_database = next((_os.path.realpath(row[2]) for row in board_rows
+                               if row[1] == "main" and row[2]), None)
     finally:
         try:
             conn.close()
@@ -17936,12 +17939,29 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
     workspace = (_os.environ.get("HERMES_KANBAN_WORKSPACE") or "").strip()
     derived = {"diff": "", "diff_files": 0, "diff_added_lines": 0}
 
+    review_contract = None
+    review_contract_sha256 = None
+    try:
+        if not board_database:
+            raise ValueError("board database identity unavailable")
+        from hermes_cli.build_graph_constraints import load_review_contract
+        review_contract, review_contract_sha256 = load_review_contract(
+            board_database=board_database, task_id=task_id, component="main")
+    except Exception as exc:
+        logger.error("build-graph constraint REFUSED for %s: %s", task_id,
+                     type(exc).__name__)
+        constraint_reason = "graph_constraint_refused:%s" % type(exc).__name__
+    else:
+        constraint_reason = None
+
     if executor not in _kb.GRAPH_EXECUTORS:
         # An executor outside the closed enum can only arrive from a
         # hand-edited DB (set_graph_executor validates membership). Fail
         # closed with a reason that says which, rather than treating it as
         # the known one.
         reason = "graph_executor_unknown:%s" % (executor,)
+    elif constraint_reason:
+        reason = constraint_reason
     else:
         # CD-035 (D5.2b-iii prereq): DERIVE THE WORK PRODUCT, then invoke.
         #
@@ -18021,6 +18041,8 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
                                     diff_files=derived["diff_files"],
                                     diff_added_lines=derived["diff_added_lines"],
                                     changed_files=derived.get("changed_files"),
+                                    review_contract=review_contract,
+                                    review_contract_sha256=review_contract_sha256,
                                     agent=cli.agent,
                                     deps=_bg.Deps(implement_runner=a2_runner, derive=a2_runner.derive),
                                     cloud_plan_review=(executor == 'build_graph_cloud_plan_review'),

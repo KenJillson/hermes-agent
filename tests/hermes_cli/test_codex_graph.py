@@ -10,13 +10,14 @@ from unittest.mock import patch
 
 from hermes_cli import build_graph as bg
 from hermes_cli.build_graph_state import new_workflow_state
+from tests.hermes_cli.expected_model_fixtures import contract_kwargs
 
 class GraphContract(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.workspace=Path(self.tmp.name);self.file=self.workspace/'code.py';self.file.write_text('answer = 0\n')
         self.calls=[];self.prompts=[];self.derived=[];self.records=[]
-        self.state=new_workflow_state('t_graph','main',plan='bounded integer result',diff='diff --git a/code.py b/code.py\n+answer = 0',diff_files=1)
+        self.state=new_workflow_state('t_graph','main',plan='bounded integer result',diff='diff --git a/code.py b/code.py\n+answer = 0',diff_files=1, **contract_kwargs('t_graph'))
         self.state['implementer_model']='qwen'
         self.deps=bg.Deps(workspace=str(self.workspace),body='Return the verified integer. Acceptance: answer is 2.',task_id='t_graph',
             changed_files=['code.py'],gate=lambda *a,**k: {'verdict':'all_pass'},
@@ -158,7 +159,7 @@ class PolicyGraphTests(unittest.TestCase):
         self.workspace = Path(self.tmp.name)
         self.file = self.workspace / 'code.py'
         self.file.write_text('answer = 0\n')
-        self.state = state_module.new_workflow_state('t_policy', 'main', diff='diff --git a/code.py b/code.py\n+answer = 0', diff_files=1, diff_added_lines=1)
+        self.state = state_module.new_workflow_state('t_policy', 'main', diff='diff --git a/code.py b/code.py\n+answer = 0', diff_files=1, diff_added_lines=1, **contract_kwargs('t_policy'))
         self.state['implementer_model'] = 'fixture-local-author'
         self.calls = []
         self.first_gate_fails = False

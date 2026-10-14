@@ -76,17 +76,21 @@ def cli_function():
  ns={'logger':logging.getLogger('dispatch-test')};exec(compile(ast.Module(body=nodes,type_ignores=[]),'actual-cli','exec'),ns);return ns['_run_build_graph_q']
 class CliPathTests(unittest.TestCase):
  def setup_path(self,failure=False,implemented=True):
-  kb=types.ModuleType('hermes_cli.kanban_db');kb.GRAPH_EXECUTORS={'build_graph'};kb.connect=lambda:types.SimpleNamespace(close=lambda:None);kb.get_task=lambda *a:task();kb.parse_ac_text=lambda b:(None,None,None,None);kb.block_task=unittest.mock.Mock(return_value=True)
+  class DB:
+   def close(self):pass
+   def execute(self,*args):return types.SimpleNamespace(fetchall=lambda:[(0,'main','/isolated/board.db')])
+  kb=types.ModuleType('hermes_cli.kanban_db');kb.GRAPH_EXECUTORS={'build_graph'};kb.connect=lambda:DB();kb.get_task=lambda *a:task();kb.parse_ac_text=lambda b:(None,None,None,None);kb.block_task=unittest.mock.Mock(return_value=True)
   bg=types.ModuleType('hermes_cli.build_graph');bg.Deps=lambda **kw:types.SimpleNamespace(**kw)
   def graph(*args,**kw):
    self.assertEqual(kw['checkpoint'],'workspace');self.assertEqual(kw['resume'],'auto')
    if implemented:invoke(kw['deps'].implement_runner)
    return {'terminal_reason':'human_review'}
   bg.run=graph;pkg=types.ModuleType('hermes_cli');pkg.kanban_db=kb;pkg.build_graph=bg;pkg.build_graph_implementer=runner
+  constraints=types.ModuleType('hermes_cli.build_graph_constraints');constraints.load_review_contract=lambda **kw: ({'task_id':'t_test','component':'main','workflow_classification':'unconstrained'},'a'*64);pkg.build_graph_constraints=constraints
   bgd=types.ModuleType('hermes_cli.build_graph_diff');bgd.EMPTY_DIFF_REASON='empty';pkg.build_graph_diff=bgd
   context=unittest.mock.Mock();context.derive.return_value={'ok':False,'reason':'empty'}
   PARENT.ParentGit=unittest.mock.Mock(return_value=context)
-  return kb,{'hermes_cli':pkg,'hermes_cli.kanban_db':kb,'hermes_cli.build_graph':bg,'hermes_cli.build_graph_implementer':runner,'hermes_cli.build_graph_parent_git':PARENT,'hermes_cli.build_graph_diff':bgd}
+  return kb,{'hermes_cli':pkg,'hermes_cli.kanban_db':kb,'hermes_cli.build_graph':bg,'hermes_cli.build_graph_implementer':runner,'hermes_cli.build_graph_parent_git':PARENT,'hermes_cli.build_graph_diff':bgd,'hermes_cli.build_graph_constraints':constraints}
  def test_actual_cli_success_uses_a2_then_parks(self):
   kb,modules=self.setup_path()
   with patch.dict(sys.modules,modules),patch.dict(os.environ,ENV,clear=True),patch.object(runner,'_a2_client',return_value=client),patch.object(client,'launch',return_value={}) as launch:

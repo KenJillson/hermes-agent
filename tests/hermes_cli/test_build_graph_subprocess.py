@@ -10,6 +10,7 @@ import pytest
 
 from hermes_cli import build_graph as graph
 from hermes_cli.build_graph_state import new_workflow_state
+from tests.hermes_cli.expected_model_fixtures import contract_kwargs
 
 
 @pytest.fixture
@@ -82,6 +83,7 @@ def test_full_run_empty_diff_parks_without_consuming_payload(worktree, diff):
     conn = sqlite3.connect(":memory:")
     try:
         state = graph.run(conn, "t_a1", str(worktree), deps=deps, diff=diff,
+                          **contract_kwargs("t_a1"),
                           body="Change fixture.txt to after. No acceptance block.")
     finally:
         conn.close()
@@ -97,6 +99,7 @@ def test_nonempty_diff_bypasses_implementer(worktree):
     conn = sqlite3.connect(":memory:")
     try:
         state = graph.run(conn, "t_a1", str(worktree), deps=deps, diff="+existing\n",
+                          **contract_kwargs("t_a1"),
                           body="Existing work product without acceptance block")
     finally:
         conn.close()
@@ -164,6 +167,7 @@ def test_workspace_adapter_refuses_unregistered_identity(worktree):
     conn = sqlite3.connect(":memory:")
     try:
         state = graph.run(conn, "t_a1", str(worktree), deps=deps,
+                          **contract_kwargs("t_a1"),
                           body="A specification", checkpoint="workspace", resume="auto")
     finally:
         conn.close()
@@ -184,6 +188,7 @@ def test_zero_cap_refuses_paid_review_on_existing_work(worktree):
         task_id = kanban_db.create_task(conn, title="A1 zero-cap fixture")
         assert kanban_db.set_max_card_spend(conn, task_id, 0.0)
         state = graph.run(conn, task_id, str(worktree), deps=deps,
+                          **contract_kwargs(task_id),
                           body="Review existing work", diff="+existing\n")
     finally:
         conn.close()
@@ -196,7 +201,7 @@ def test_dispatcher_clean_worktree_parks_at_unbuilt_plan(monkeypatch, worktree, 
     """Exercise the imported dispatcher entry, including the empty-diff exemption."""
     from types import SimpleNamespace
     import cli
-    from hermes_cli import kanban_db, build_graph_diff
+    from hermes_cli import kanban_db, build_graph_diff, build_graph_constraints
 
     body = "Change fixture.txt to after."
     if with_ac:
@@ -215,6 +220,9 @@ def test_dispatcher_clean_worktree_parks_at_unbuilt_plan(monkeypatch, worktree, 
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(worktree))
+    protected = contract_kwargs(task_id)
+    monkeypatch.setattr(build_graph_constraints, "load_review_contract",
+        lambda **_: (protected["review_contract"], protected["review_contract_sha256"]))
     deps, calls = _full_deps(worktree, _write_fixture)
     if with_ac:
         # AC transport is a separate integration; this case proves the
@@ -257,11 +265,43 @@ def test_dispatcher_clean_worktree_parks_at_unbuilt_plan(monkeypatch, worktree, 
     assert calls == {"runner": 0, "gate": 0, "model": 0}
 
 
+def test_dispatcher_missing_classification_parks_before_derivation(monkeypatch, worktree):
+    from types import SimpleNamespace
+    import cli
+    from hermes_cli import kanban_db, build_graph_constraints, build_graph_implementer
+    db_path = worktree.parent / "missing-classification.db"
+    conn = kanban_db.connect(db_path)
+    try:
+        task_id = kanban_db.create_task(conn, title="Missing classification",
+            body="Change fixture.txt", workspace_kind="worktree",
+            workspace_path=str(worktree))
+        assert kanban_db.set_graph_executor(conn, task_id, "build_graph")
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(worktree))
+    monkeypatch.setattr(build_graph_constraints, "load_review_contract",
+        lambda **_: (_ for _ in ()).throw(
+            build_graph_constraints.ConstraintRefused(
+                "Explicit protected workflow classification required")))
+    monkeypatch.setattr(build_graph_implementer, "make_a2_runner",
+                        lambda *_: pytest.fail("derivation reached"))
+    parked = []
+    monkeypatch.setattr(kanban_db, "block_task",
+        lambda conn, card_id, *, reason, kind:
+            parked.append((card_id, reason, kind)) or True)
+    assert cli._run_build_graph_q(SimpleNamespace(agent=None)) == 0
+    assert parked == [(task_id, "graph_constraint_refused:ConstraintRefused",
+                       "needs_input")]
+
+
 def test_full_run_empty_spec_never_spawns(worktree):
     deps, calls = _full_deps(worktree, lambda **kw: pytest.fail("runner called"))
     conn = sqlite3.connect(":memory:")
     try:
-        state = graph.run(conn, "t_a1", str(worktree), deps=deps, body=" \n\t")
+        state = graph.run(conn, "t_a1", str(worktree), deps=deps, body=" \n\t",
+                          **contract_kwargs("t_a1"))
     finally:
         conn.close()
     assert state["terminal_reason"] == "node_not_implemented:plan"
@@ -283,7 +323,8 @@ def test_missing_runner_import_parks(monkeypatch, worktree):
 
 
 def _state():
-    return new_workflow_state("t_a1", "component", diff="")
+    return new_workflow_state("t_a1", "component", diff="",
+                              **contract_kwargs("t_a1", "component"))
 
 
 def _deps(tmp_path, runner, derive, *, body="Implement the fixture"):

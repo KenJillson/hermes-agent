@@ -3,6 +3,7 @@ import unittest
 from hermes_cli import build_graph as bg
 from hermes_cli import build_graph_stages as stages
 from hermes_cli.build_graph_state import new_workflow_state
+from tests.hermes_cli.expected_model_fixtures import contract_kwargs
 
 
 class Runner:
@@ -35,7 +36,7 @@ class GraphStages(unittest.TestCase):
         runner = Runner(); calls=[]; deps=self.deps(runner,calls)
         app,_=bg.build(deps)
         cfg={'configurable':{'thread_id':'t_fixture'}}
-        state=new_workflow_state('t_fixture','main')
+        state=new_workflow_state('t_fixture','main', **contract_kwargs('t_fixture'))
         expected=['a2_stage_ready:plan_review','a2_stage_ready:implement',
                   'a2_stage_ready:local_review']
         for index in range(4):
@@ -58,7 +59,7 @@ class GraphStages(unittest.TestCase):
 
     def test_same_run_cannot_advance(self):
         runner=Runner();deps=self.deps(runner,[])
-        state=new_workflow_state('t_fixture','main')
+        state=new_workflow_state('t_fixture','main', **contract_kwargs('t_fixture'))
         state.update(stages.make_stage(deps,'plan',bg.guard)(state))
         state['terminal_reason']=None
         result=stages.make_stage(deps,'plan_review',bg.guard)(state)
@@ -67,7 +68,7 @@ class GraphStages(unittest.TestCase):
 
     def test_planning_keeps_spec_but_does_not_seed_from_old_plan_or_diff(self):
         runner=Runner();deps=self.deps(runner,[])
-        state=new_workflow_state('t_fixture','main',plan='STALE_PLAN_COUNT_3')
+        state=new_workflow_state('t_fixture','main',plan='STALE_PLAN_COUNT_3', **contract_kwargs('t_fixture'))
         state.update(diff='UNMEASURED_DIFF',diff_files=99,diff_added_lines=999)
         out=stages.make_stage(deps,'plan',bg.guard)(state)
         goal=runner.goals[0]
@@ -82,7 +83,7 @@ class GraphStages(unittest.TestCase):
         for operation,receipts in [('plan_review',{'plan':1}),
                                   ('local_review',{'plan':1,'plan_review':2,'implement':3})]:
             runner=Runner();runner.run_id=4;deps=self.deps(runner,[])
-            state=new_workflow_state('t_fixture','main',plan='Create a.py; validate value.')
+            state=new_workflow_state('t_fixture','main',plan='Create a.py; validate value.', **contract_kwargs('t_fixture'))
             state.update(diff='diff --git a/a.py b/a.py\n+value = 1\n',
                          rung_attempts={'a2_runs':receipts})
             stages.make_stage(deps,operation,bg.guard)(state)
@@ -95,7 +96,7 @@ class GraphStages(unittest.TestCase):
     def test_failed_review_has_no_handoff(self):
         runner=Runner();runner.run_id=2;deps=self.deps(runner,[])
         runner.stage=lambda **kw: {'result':{'operation':'plan_review','passed':False,'findings':['Missing validation']}}
-        state=new_workflow_state('t_fixture','main',plan='Create a.py')
+        state=new_workflow_state('t_fixture','main',plan='Create a.py', **contract_kwargs('t_fixture'))
         state['rung_attempts']={'a2_runs':{'plan':1}}
         out=stages.make_stage(deps,'plan_review',bg.guard)(state)
         self.assertEqual(out['terminal_reason'],'a2_stage_review_required:plan_review')
@@ -106,7 +107,7 @@ class GraphStages(unittest.TestCase):
         runner.stage=lambda **kw: {'phase':'failed','operation':'local_review',
             'failure':{'stage':'stage_result','reason':'json','exit_code':84}}
         deps.gate=lambda *a,**kw: self.fail('acceptance must not run after failed stage')
-        state=new_workflow_state('t_fixture','main',plan='Create a.py')
+        state=new_workflow_state('t_fixture','main',plan='Create a.py', **contract_kwargs('t_fixture'))
         state.update(diff='diff --git a/a.py b/a.py\n+value=1\n',diff_files=1,diff_added_lines=1,
                      rung_attempts={'a2_runs':{'plan':1,'plan_review':2,'implement':3}})
         app,_=bg.build(deps)
@@ -116,7 +117,7 @@ class GraphStages(unittest.TestCase):
         self.assertEqual(out['rung_attempts']['a2_runs']['local_review'],4)
 
     def test_out_of_order_receipts_refused(self):
-        state=new_workflow_state('t_fixture','main')
+        state=new_workflow_state('t_fixture','main', **contract_kwargs('t_fixture'))
         for runs in ({'implement':3},{'plan':1,'plan_review':1},{'plan':True}):
             state['rung_attempts']={'a2_runs':runs}
             with self.assertRaises(ValueError):stages.next_stage(state)

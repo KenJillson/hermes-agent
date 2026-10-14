@@ -19,6 +19,7 @@ if worker.is_dir():sys.path.insert(0,str(worker))
 from hermes_cli import build_graph as bg, build_graph_stages as stages
 from hermes_cli import build_graph_review_evidence as ev, build_graph_implementer as implementer
 from hermes_cli.build_graph_state import new_workflow_state
+from tests.hermes_cli.expected_model_fixtures import contract_kwargs
 import launch_client as client
 import launch_protocol as protocol
 import launch_session as session
@@ -28,7 +29,7 @@ from test_launch_session import Authority, Runtime, BOOT
 
 class HandoffTests(unittest.TestCase):
     def setUp(self):
-        self.state=new_workflow_state('t_fixture','main')
+        self.state=new_workflow_state('t_fixture','main', **contract_kwargs('t_fixture'))
         self.workspace='/tmp/isolated-denial-workspace';self.body='Change a.txt\n## A2 Files\n```json\n["a.txt"]\n```'
         self.sent=[];self.encoded=[]
         self.deps=bg.Deps(workspace=self.workspace,body=self.body,over_cap=lambda *a:False,

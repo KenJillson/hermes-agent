@@ -15,6 +15,7 @@ if _overlay.is_dir():hermes_cli.__path__.insert(0,str(_overlay))
 from hermes_cli import build_graph as bg, build_graph_review_evidence as evidence
 from hermes_cli import ac_check_runner as ac, build_graph_diff as diff
 from hermes_cli.build_graph_state import new_workflow_state
+from tests.hermes_cli.expected_model_fixtures import contract_kwargs
 
 class AtModel(Exception):pass
 
@@ -24,7 +25,7 @@ class ReviewEvidence(unittest.TestCase):
   def git(*args):return subprocess.check_output(['git','-c','core.hooksPath=/dev/null','-c','user.name=QA','-c','user.email=qa@invalid','-C',str(self.repo),*args],stderr=subprocess.DEVNULL,text=True)
   git('init','--initial-branch=main');(self.repo/'file.py').write_text('x=1\n');git('add','file.py');git('commit','-m','seed');git('worktree','add','-b','qa',str(self.ws));(self.ws/'file.py').write_text('x=2\n')
   derived=diff.derive(str(self.ws));assert derived['ok']
-  self.state=new_workflow_state('t_qa','main',diff=derived['diff']);self.body='A test specification';self.sent=[]
+  self.state=new_workflow_state('t_qa','main',diff=derived['diff'], **contract_kwargs('t_qa'));self.body='A test specification';self.sent=[]
   self.guard=patch.object(bg,'guard',lambda update,state:update);self.guard.start();self.addCleanup(self.guard.stop)
   self.deps=bg.Deps(workspace=str(self.ws),body=self.body,over_cap=lambda *a:False,model=self.model,derive=diff.derive)
  def model(self,**kwargs):self.sent.append(kwargs);raise AtModel

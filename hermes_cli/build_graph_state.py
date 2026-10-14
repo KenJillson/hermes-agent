@@ -30,10 +30,11 @@ accumulating into them, so reducers are not required.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, Literal, Optional, TypedDict
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Ladder positions (design section 1 flow, section 2.2 rung caps).
 RUNGS = ("none", "rung1", "rung2", "rung3")
@@ -78,6 +79,8 @@ class WorkflowState(TypedDict):
     card_id: str
     component: str
     iteration: int
+    review_contract: dict
+    review_contract_sha256: str
 
     # work product
     plan: str
@@ -153,12 +156,15 @@ class WorkflowState(TypedDict):
     halt_reason: Optional[str]
     terminal_reason: Optional[str]
     last_verdict_passed: bool
+    expected_model_refusal: Optional[str]
 
 
 def new_workflow_state(
     card_id: str,
     component: str,
     *,
+    review_contract: dict,
+    review_contract_sha256: str,
     plan: str = "",
     diff: str = "",
     diff_files: int = 0,
@@ -180,6 +186,8 @@ def new_workflow_state(
         card_id=card_id,
         component=component,
         iteration=0,
+        review_contract=review_contract,
+        review_contract_sha256=review_contract_sha256,
         plan=plan,
         diff=diff,
         gate_summary={},
@@ -209,6 +217,7 @@ def new_workflow_state(
         halt_reason=None,
         terminal_reason=None,
         last_verdict_passed=False,
+        expected_model_refusal=None,
     )
 
 
@@ -283,4 +292,43 @@ def validate(state: WorkflowState) -> None:
         raise ValueError("dispute_class %r not in %r" % (dc, DISPUTE_CLASSES))
     if not state["card_id"]:
         raise ValueError("card_id is empty")
+    contract = state["review_contract"]
+    if not isinstance(contract, dict):
+        raise ValueError("review_contract is missing")
+    canonical = json.dumps(contract, sort_keys=True, separators=(",", ":"),
+                           allow_nan=False).encode()
+    if hashlib.sha256(canonical).hexdigest() != state["review_contract_sha256"]:
+        raise ValueError("review_contract SHA-256 differs")
+    if (contract.get("task_id") != state["card_id"]
+            or contract.get("component") != state["component"]
+            or contract.get("workflow_classification") not in
+                ("constrained", "unconstrained")):
+        raise ValueError("review_contract identity differs")
+    activities = contract.get("activity_constraints")
+    if not isinstance(activities, dict) or set(activities) != {
+            "plan_review", "code_review", "re_review"}:
+        raise ValueError("review_contract activity inventory differs")
+    classification = contract["workflow_classification"]
+    for rule in activities.values():
+        if not isinstance(rule, dict) or rule.get("mode") not in (
+                "model", "forbidden", "unconstrained"):
+            raise ValueError("review_contract activity rule is invalid")
+        if classification == "constrained" and rule["mode"] == "unconstrained":
+            raise ValueError("constrained review activity is unconstrained")
+        if classification == "unconstrained" and rule != {"mode": "unconstrained"}:
+            raise ValueError("unconstrained review activity differs")
+        if rule["mode"] == "model":
+            expected = rule.get("expected")
+            if (not isinstance(expected, dict)
+                    or set(expected) != {"schema", "model", "lane", "invoke"}
+                    or expected.get("schema") != 1
+                    or any(not isinstance(expected.get(key), str)
+                           or not expected[key] for key in ("model", "lane", "invoke"))):
+                raise ValueError("expected-model activity rule is invalid")
+        elif set(rule) != {"mode"}:
+            raise ValueError("review activity rule fields differ")
+    refusal = state["expected_model_refusal"]
+    if refusal is not None and refusal not in (
+            "expected_model_invalid", "expected_model_mismatch"):
+        raise ValueError("unknown expected_model_refusal")
     assert_serializable(state)

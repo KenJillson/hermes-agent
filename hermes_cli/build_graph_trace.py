@@ -83,7 +83,7 @@ import time
 from typing import Any, Callable, Optional
 
 # Bump when the FIELD SET changes, same contract as build_graph_eval's.
-TRACE_SCHEMA_VERSION = 2
+TRACE_SCHEMA_VERSION = 3
 
 LOG_FILENAME = "graph-trace.jsonl"
 
@@ -421,7 +421,15 @@ class Tracer:
                    "card_id": _scalar(kwargs.get("card_id")),
                    "component": _scalar(kwargs.get("component")),
                    "mode": _scalar(kwargs.get("mode")),
+                   "workflow_classification": _scalar(
+                       kwargs.get("workflow_classification")),
+                   "review_contract_sha256": _scalar(
+                       kwargs.get("review_contract_sha256")),
                    "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
+            expected = kwargs.get("expected_model")
+            if isinstance(expected, dict):
+                rec["expected_model"] = _scalar(expected.get("model"))
+                rec["expected_invoke"] = _scalar(expected.get("invoke"))
             rec.update(redact_model_result(out))
             self._emit(rec)
             return out
