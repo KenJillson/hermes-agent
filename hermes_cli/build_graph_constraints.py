@@ -34,8 +34,12 @@ def _pairs(items):
 
 
 def _bounded_text(value, name, limit=1024):
-    require(isinstance(value, str) and value and len(value.encode()) <= limit,
-            "Invalid bounded %s" % name)
+    require(isinstance(value, str) and value, "Invalid bounded %s" % name)
+    try:
+        bounded = len(value.encode("utf-8")) <= limit
+    except UnicodeError as exc:
+        raise ConstraintRefused("Invalid bounded %s" % name) from exc
+    require(bounded, "Invalid bounded %s" % name)
     return value
 
 

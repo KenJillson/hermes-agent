@@ -1,10 +1,11 @@
-"""D5.6 outbound dispute copy, derived from WorkflowState version 2.
+"""D5.6 outbound dispute copy, derived from the current WorkflowState schema.
 
 No transport, model selection, credentials, file writes, or accounting here.
 The caller injects the canonical cloud-boundary sanitizer. It is applied before
 JSON encoding and again to the whole prompt; live state is never modified.
 """
 import json
+from hermes_cli.build_graph_state import SCHEMA_VERSION
 
 
 def build_dispute_prompt(state, *, task_body, fix_prompt_builder, sanitize):
@@ -14,8 +15,9 @@ def build_dispute_prompt(state, *, task_body, fix_prompt_builder, sanitize):
     the current diff, failing acceptance checks, and the existing files response
     contract. No second response schema or path scope is introduced here.
     """
-    if type(state.get('schema_version')) is not int or state['schema_version'] != 2:
-        raise ValueError('D5.6 requires inspected workflow schema 2')
+    if (type(state.get('schema_version')) is not int
+            or state['schema_version'] != SCHEMA_VERSION):
+        raise ValueError('D5.6 requires inspected workflow schema %d' % SCHEMA_VERSION)
     for field in ('card_id', 'component', 'plan', 'diff'):
         if not isinstance(state.get(field), str):
             raise ValueError('D5.6 missing text field: ' + field)
