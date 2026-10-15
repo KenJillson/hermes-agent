@@ -1,5 +1,7 @@
 """Tracked Hermes adapter for the protected admission module; local candidate."""
 import atexit
+import contextlib
+import fcntl
 import functools
 import importlib.util
 import os
@@ -49,3 +51,32 @@ def admitted(function):
         with _protected_module().admit():
             return function(*args, **kwargs)
     return guarded
+
+
+@contextlib.contextmanager
+def exclusive_admission():
+    """Root-only open-state exclusion for bounded cross-board mutations."""
+    if os.geteuid() != 0:
+        raise RuntimeError('exclusive Michael admission requires host root')
+    protected = _protected_module().Gate()
+    directory = protected._directory()
+    lock = None
+    try:
+        lock = protected._file(directory, 'admission.lock')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError('exclusive Michael admission is busy') from exc
+
+        def check():
+            protected._open(protected._state(directory))
+            protected._assert_no_worker_inhibits(directory)
+            protected.no_active_runs()
+
+        check()
+        yield check
+        check()
+    finally:
+        if lock is not None:
+            os.close(lock)
+        os.close(directory)

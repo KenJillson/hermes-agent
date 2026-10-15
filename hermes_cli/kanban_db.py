@@ -72,6 +72,7 @@ from __future__ import annotations
 
 # Michael maintenance: fail closed before runtime imports or run admission.
 from hermes_cli.maintenance_gate import admitted as _maintenance_admitted
+from hermes_cli.maintenance_gate import exclusive_admission as _maintenance_exclusive_admission
 from hermes_cli.maintenance_gate import hold_runtime_for_process as _hold_maintenance_runtime
 _hold_maintenance_runtime()
 
@@ -85,6 +86,7 @@ import random
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -9263,6 +9265,492 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+_PRELAUNCH_RECONCILIATION_KIND = "prelaunch_no_worker_reconciled"
+_PRELAUNCH_FAILURE = "workspace: parent confinement changed"
+_MODEL_REQUEST_ROOT = Path("/home/jetson/.hermes/state/model-call-requests")
+_MODEL_REQUEST_UID = 1000
+_MODEL_REQUEST_GID = 1000
+_PRELAUNCH_CAD_PROBE = r'''import hashlib,json,os,re,stat,sys
+task_id=sys.argv[1]
+if re.fullmatch(r'[A-Za-z0-9_-]{1,128}',task_id) is None:raise RuntimeError('invalid task identity')
+scratch='/work/coder/scratch';ledger='/work/coder/router-usage.log'
+s=os.stat(scratch,follow_symlinks=False)
+if not stat.S_ISDIR(s.st_mode) or s.st_uid!=os.geteuid():raise RuntimeError('unsafe provider scratch')
+names=os.listdir(scratch)
+if len(names)>16384:raise RuntimeError('provider envelope inventory exceeds bound')
+envelopes=sorted(n for n in names if n.startswith(task_id+'-') and n.endswith('result.json'))
+fd=os.open(ledger,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+with os.fdopen(fd,'rb') as stream:
+ info=os.fstat(stream.fileno())
+ if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid() or info.st_nlink!=1 or info.st_size>16*1024*1024:raise RuntimeError('unsafe retained ledger')
+ raw=stream.read(16*1024*1024+1)
+if len(raw)>16*1024*1024:raise RuntimeError('retained ledger exceeds bound')
+print(json.dumps({'provider_envelopes':envelopes,'ledger_md5':hashlib.md5(raw).hexdigest()},sort_keys=True,separators=(',',':')))
+'''
+_PRELAUNCH_PG_PYTHON = Path(
+    "/home/jetson/.hermes/hermes-agent/venv/bin/python"
+)
+_PRELAUNCH_PG_PROBE = r'''import json,os,re,sys
+from psycopg import connect
+board_database,task_id=sys.argv[1:]
+if (not os.path.isabs(board_database) or os.path.realpath(board_database)!=board_database
+        or re.fullmatch(r'[A-Za-z0-9_-]{1,128}',task_id) is None):
+ raise RuntimeError('invalid checkpoint evidence identity')
+with connect(host='/run/postgresql',dbname='michael_checkpoints',user='michael_checkpoint',
+             connect_timeout=8,autocommit=True) as pg:
+ pg.execute('SET default_transaction_read_only=on')
+ peer=pg.execute('SELECT current_user,current_database()').fetchone()
+ count=pg.execute('SELECT count(*) FROM michael_checkpoint_scopes WHERE board_database=%s AND task_id=%s',
+                  (board_database,task_id)).fetchone()[0]
+print(json.dumps({'role':peer[0],'database':peer[1],'postgres_scopes':count},sort_keys=True,separators=(',',':')))
+'''
+
+
+def _main_database_identity(conn: sqlite3.Connection) -> str:
+    rows = conn.execute("PRAGMA database_list").fetchall()
+    main = [row[2] for row in rows if row[1] == "main"]
+    if len(main) != 1 or not main[0] or not os.path.isabs(main[0]):
+        raise RuntimeError("durable canonical board database required")
+    return os.path.realpath(main[0])
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode()
+
+
+def _decode_object(raw: Optional[str], label: str) -> dict:
+    try:
+        value = json.loads(raw) if raw is not None else None
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise RuntimeError("invalid " + label) from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(label + " must be an object")
+    return value
+
+
+def _prelaunch_provider_evidence(task_id: str, expected_ledger_md5: str) -> dict:
+    if (re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task_id) is None
+            or re.fullmatch(r"[a-f0-9]{32}", expected_ledger_md5) is None):
+        raise RuntimeError("invalid provider evidence identity")
+    command = [
+        "/usr/bin/setpriv", "--reuid=1000", "--regid=1000", "--clear-groups",
+        "--inh-caps=-all", "--ambient-caps=-all", "--bounding-set=-all",
+        "--no-new-privs", "/usr/bin/ssh", "-o", "BatchMode=yes", "-o",
+        "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "-o",
+        "HostKeyAlias=10.10.40.2", "coder@10.10.100.2",
+        "/usr/bin/python3 -I -B - " + task_id,
+    ]
+    try:
+        result = subprocess.run(
+            command, input=_PRELAUNCH_CAD_PROBE.encode(), capture_output=True,
+            timeout=15, env={"HOME": "/home/jetson", "PATH": "/usr/bin:/bin",
+                             "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("provider evidence unavailable") from exc
+    if result.returncode or len(result.stdout) > 4096:
+        raise RuntimeError("provider evidence unavailable")
+    try:
+        value = json.loads(result.stdout)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise RuntimeError("provider evidence invalid") from exc
+    if (not isinstance(value, dict)
+            or set(value) != {"provider_envelopes", "ledger_md5"}
+            or not isinstance(value["provider_envelopes"], list)
+            or any(not isinstance(name, str) for name in value["provider_envelopes"])
+            or value["provider_envelopes"]
+            or value["ledger_md5"] != expected_ledger_md5):
+        raise RuntimeError("provider envelope or ledger evidence differs")
+    return value
+
+
+def _prelaunch_postgres_evidence(board_database: str, task_id: str) -> dict:
+    """Query the fixed peer-authenticated store as its OS identity, never root."""
+    if (not isinstance(board_database, str) or not os.path.isabs(board_database)
+            or os.path.realpath(board_database) != board_database
+            or not isinstance(task_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task_id) is None):
+        raise RuntimeError("invalid checkpoint evidence identity")
+    command = [
+        "/usr/bin/setpriv", "--reuid=1000", "--regid=1000", "--clear-groups",
+        "--inh-caps=-all", "--ambient-caps=-all", "--bounding-set=-all",
+        "--no-new-privs", str(_PRELAUNCH_PG_PYTHON), "-I", "-B", "-c",
+        _PRELAUNCH_PG_PROBE, board_database, task_id,
+    ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, timeout=12,
+            env={"HOME": "/home/jetson", "PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("PostgreSQL checkpoint evidence unavailable") from exc
+    if result.returncode or len(result.stdout) > 4096:
+        raise RuntimeError("PostgreSQL checkpoint evidence unavailable")
+    try:
+        value = json.loads(result.stdout)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise RuntimeError("PostgreSQL checkpoint evidence invalid") from exc
+    if (not isinstance(value, dict)
+            or set(value) != {"role", "database", "postgres_scopes"}
+            or value.get("role") != "michael_checkpoint"
+            or value.get("database") != "michael_checkpoints"
+            or type(value.get("postgres_scopes")) is not int
+            or value["postgres_scopes"] < 0):
+        raise RuntimeError("PostgreSQL checkpoint evidence invalid")
+    return value
+
+
+def _prelaunch_external_evidence(
+    board_database: str, task_id: str, workspace: str,
+    expected_ledger_md5: str,
+) -> dict:
+    """Prove task-specific request and checkpoint state is still absent."""
+    request_key = hashlib.sha256(task_id.encode()).hexdigest()
+    directory = os.open(
+        _MODEL_REQUEST_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        info = os.fstat(directory)
+        if (info.st_uid != _MODEL_REQUEST_UID
+                or stat.S_IMODE(info.st_mode) != 0o700):
+            raise RuntimeError("request directory identity changed")
+        names = os.listdir(directory)
+        if len(names) > 16384:
+            raise RuntimeError("request inventory exceeds bound")
+        matches = sorted(
+            name for name in names
+            if name.startswith(request_key + "-") and name.endswith(".json")
+        )
+        if matches:
+            raise RuntimeError("task has durable model request evidence")
+    finally:
+        os.close(directory)
+
+    identity_key = (board_database + "\0" + task_id).encode()
+    marker_name = "postgres-" + hashlib.sha256(identity_key).hexdigest() + ".json"
+    checkpoint_root = Path(workspace) / ".graph-checkpoints"
+    marker = checkpoint_root / marker_name
+    legacy = checkpoint_root / "checkpoints.json"
+    if os.path.lexists(marker) or os.path.lexists(legacy):
+        raise RuntimeError("task has filesystem checkpoint evidence")
+
+    postgres = _prelaunch_postgres_evidence(board_database, task_id)
+    if postgres["postgres_scopes"]:
+        raise RuntimeError("task has PostgreSQL checkpoint evidence")
+    provider = _prelaunch_provider_evidence(task_id, expected_ledger_md5)
+    return {
+        "request_key": request_key,
+        "request_records": 0,
+        "checkpoint_marker": marker_name,
+        "filesystem_checkpoints": 0,
+        "postgres_scopes": 0,
+        "provider_envelopes": provider["provider_envelopes"],
+        "ledger_md5": provider["ledger_md5"],
+    }
+
+
+@contextlib.contextmanager
+def _prelaunch_request_lock(task_id: str):
+    """Serialize the absence proof with the model-call RequestStore."""
+    import fcntl
+    key = hashlib.sha256(task_id.encode()).hexdigest()
+    directory = os.open(
+        _MODEL_REQUEST_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    lock = None
+    try:
+        try:
+            lock = os.open(
+                key + ".lock", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600, dir_fd=directory,
+            )
+            try:
+                os.fchown(lock, _MODEL_REQUEST_UID, _MODEL_REQUEST_GID)
+                os.fchmod(lock, 0o600)
+            except BaseException:
+                os.close(lock)
+                lock = None
+                os.unlink(key + ".lock", dir_fd=directory)
+                raise
+        except FileExistsError:
+            lock = os.open(
+                key + ".lock", os.O_RDWR | os.O_NOFOLLOW, dir_fd=directory,
+            )
+        info = os.fstat(lock)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != _MODEL_REQUEST_UID
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+            raise RuntimeError("unsafe task request lock")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("task request evidence is busy") from exc
+        yield
+    finally:
+        if lock is not None:
+            os.close(lock)
+        os.close(directory)
+
+
+def _derive_prelaunch_no_worker_evidence(
+    conn: sqlite3.Connection, task_id: str, run_id: int,
+    board_database: str, expected_ledger_md5: str,
+) -> dict:
+    task = conn.execute(
+        "SELECT status,assignee,current_run_id,claim_lock,worker_pid,"
+        "workspace_path,graph_executor FROM tasks WHERE id=?", (task_id,),
+    ).fetchone()
+    if (task is None or task["status"] != "blocked" or task["assignee"] is not None
+            or task["current_run_id"] is not None or task["claim_lock"] is not None
+            or task["worker_pid"] is not None or not task["workspace_path"]
+            or not task["graph_executor"]):
+        raise RuntimeError("task is not blocked, unassigned, idle graph work")
+    run = conn.execute(
+        "SELECT id,task_id,status,outcome,started_at,ended_at,worker_pid,error,metadata "
+        "FROM task_runs WHERE id=?", (int(run_id),),
+    ).fetchone()
+    if (run is None or run["task_id"] != task_id or run["status"] != "gave_up"
+            or run["outcome"] != "gave_up" or run["ended_at"] is None
+            or run["worker_pid"] is not None or run["error"] != _PRELAUNCH_FAILURE):
+        raise RuntimeError("run is not the proven pre-launch failure")
+    metadata = _decode_object(run["metadata"], "run metadata")
+    if metadata.get("trigger_outcome") != "spawn_failed":
+        raise RuntimeError("run did not end on the workspace pre-launch path")
+
+    events = conn.execute(
+        "SELECT id,kind,payload,created_at FROM task_events "
+        "WHERE task_id=? AND run_id=? "
+        "AND kind IN ('claimed','gave_up','spawned') ORDER BY id",
+        (task_id, int(run_id)),
+    ).fetchall()
+    if [event["kind"] for event in events] != ["claimed", "gave_up"]:
+        raise RuntimeError("run event path is not exactly claim then pre-launch failure")
+    claimed = _decode_object(events[0]["payload"], "claimed event")
+    failed = _decode_object(events[1]["payload"], "gave-up event")
+    if (claimed.get("run_id") != int(run_id)
+            or failed.get("error") != _PRELAUNCH_FAILURE
+            or failed.get("trigger_outcome") != "spawn_failed"):
+        raise RuntimeError("run event evidence differs")
+    spawned = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='spawned' LIMIT 1",
+        (task_id, int(run_id)),
+    ).fetchone()
+    if spawned is not None:
+        raise RuntimeError("run has worker launch evidence")
+
+    workspace = os.path.realpath(task["workspace_path"])
+    external = _prelaunch_external_evidence(
+        board_database, task_id, workspace, expected_ledger_md5,
+    )
+    return {
+        "run": {
+            "id": int(run["id"]), "task_id": run["task_id"],
+            "status": run["status"], "outcome": run["outcome"],
+            "started_at": run["started_at"], "ended_at": run["ended_at"],
+            "worker_pid": None, "error": run["error"],
+            "metadata_raw": run["metadata"], "metadata": metadata,
+        },
+        "events": [
+            {"id": event["id"], "kind": event["kind"],
+             "created_at": event["created_at"],
+             "payload_raw": event["payload"],
+             "payload": _decode_object(event["payload"], event["kind"] + " event")}
+            for event in events
+        ],
+        "workspace": workspace,
+        "external": external,
+    }
+
+
+def _valid_prelaunch_reconciliation(
+    conn: sqlite3.Connection, board_database: str, task_id: str, run_id: int,
+) -> bool:
+    try:
+        rows = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? "
+            "ORDER BY id", (task_id, int(run_id), _PRELAUNCH_RECONCILIATION_KIND),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return False
+    if len(rows) != 1:
+        return False
+    try:
+        record = _decode_object(rows[0]["payload"], "pre-launch reconciliation")
+        if not isinstance(record.get("evidence"), dict):
+            return False
+        evidence = record["evidence"]
+        run = evidence.get("run")
+        events = evidence.get("events")
+        external = evidence.get("external")
+        if (not isinstance(run, dict) or not isinstance(events, list)
+                or not isinstance(external, dict) or len(events) != 2
+                or any(not isinstance(event, dict) for event in events)):
+            return False
+        payloads = [event.get("payload") for event in events]
+        metadata = run.get("metadata")
+        if (not isinstance(metadata, dict)
+                or any(not isinstance(payload, dict) for payload in payloads)):
+            return False
+        expected_key = hashlib.sha256(task_id.encode()).hexdigest()
+        expected_marker = "postgres-" + hashlib.sha256(
+            (board_database + "\0" + task_id).encode(),
+        ).hexdigest() + ".json"
+        valid = (
+            set(record) == {"version", "classification", "board_database",
+                            "task_id", "run_id", "evidence_sha256", "evidence"}
+            and type(record["version"]) is int and record["version"] == 1
+            and record["classification"] == "prelaunch_no_worker"
+            and record["board_database"] == board_database
+            and record["task_id"] == task_id and record["run_id"] == int(run_id)
+            and isinstance(evidence, dict) and set(evidence) == {
+                "run", "events", "workspace", "external"}
+            and isinstance(record.get("evidence_sha256"), str)
+            and record["evidence_sha256"]
+                == hashlib.sha256(_canonical_json(evidence)).hexdigest()
+            and set(run) == {"id", "task_id", "status", "outcome", "started_at",
+                             "ended_at", "worker_pid", "error", "metadata_raw",
+                             "metadata"}
+            and type(run.get("id")) is int
+            and run.get("id") == int(run_id) and run.get("task_id") == task_id
+            and run.get("status") == run.get("outcome") == "gave_up"
+            and type(run.get("started_at")) is int
+            and type(run.get("ended_at")) is int
+            and run.get("error") == _PRELAUNCH_FAILURE
+            and run.get("worker_pid") is None
+            and isinstance(run.get("metadata_raw"), str)
+            and _decode_object(run["metadata_raw"], "recorded run metadata") == metadata
+            and metadata.get("trigger_outcome") == "spawn_failed"
+            and all(set(event) == {"id", "kind", "created_at", "payload_raw",
+                                   "payload"}
+                    and type(event.get("id")) is int
+                    and type(event.get("created_at")) is int
+                    and isinstance(event.get("payload_raw"), str)
+                    and _decode_object(event["payload_raw"], "recorded event")
+                        == event["payload"] for event in events)
+            and [event.get("kind") for event in events] == ["claimed", "gave_up"]
+            and payloads[0].get("run_id") == int(run_id)
+            and payloads[1].get("error") == _PRELAUNCH_FAILURE
+            and payloads[1].get("trigger_outcome") == "spawn_failed"
+            and isinstance(evidence.get("workspace"), str)
+            and os.path.isabs(evidence["workspace"])
+            and set(external) == {"request_key", "request_records",
+                                 "checkpoint_marker", "filesystem_checkpoints",
+                                 "postgres_scopes", "provider_envelopes",
+                                 "ledger_md5"}
+            and external.get("request_key") == expected_key
+            and external.get("request_records") == 0
+            and external.get("checkpoint_marker") == expected_marker
+            and external.get("filesystem_checkpoints") == 0
+            and external.get("postgres_scopes") == 0
+            and external.get("provider_envelopes") == []
+            and isinstance(external.get("ledger_md5"), str)
+            and re.fullmatch(r"[a-f0-9]{32}", external["ledger_md5"]) is not None
+        )
+        if not valid:
+            return False
+        current_run = conn.execute(
+            "SELECT id,task_id,status,outcome,started_at,ended_at,worker_pid,error,metadata "
+            "FROM task_runs WHERE id=? AND task_id=?", (int(run_id), task_id),
+        ).fetchone()
+        if current_run is None:
+            return False
+        current_run_snapshot = {
+            "id": int(current_run["id"]), "task_id": current_run["task_id"],
+            "status": current_run["status"], "outcome": current_run["outcome"],
+            "started_at": current_run["started_at"], "ended_at": current_run["ended_at"],
+            "worker_pid": current_run["worker_pid"], "error": current_run["error"],
+            "metadata_raw": current_run["metadata"],
+            "metadata": _decode_object(current_run["metadata"], "run metadata"),
+        }
+        if current_run_snapshot != run:
+            return False
+        current_events = conn.execute(
+            "SELECT id,kind,payload,created_at FROM task_events "
+            "WHERE task_id=? AND run_id=? "
+            "AND kind IN ('claimed','gave_up','spawned') ORDER BY id",
+            (task_id, int(run_id)),
+        ).fetchall()
+        current_event_snapshots = [
+            {"id": event["id"], "kind": event["kind"],
+             "created_at": event["created_at"],
+             "payload_raw": event["payload"],
+             "payload": _decode_object(event["payload"], event["kind"] + " event")}
+            for event in current_events
+        ]
+        if current_event_snapshots != events:
+            return False
+    except (KeyError, TypeError, ValueError, RuntimeError, AttributeError,
+            sqlite3.Error, UnicodeError):
+        return False
+    return True
+
+
+def reconcile_prelaunch_no_worker(
+    conn: sqlite3.Connection, task_id: str, run_id: int, *, board: str,
+    expected_ledger_md5: str,
+) -> dict:
+    """Append one exact pre-launch reconciliation without rewriting the run."""
+    if (not isinstance(task_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task_id) is None
+            or type(run_id) is not int
+            or not isinstance(expected_ledger_md5, str)
+            or re.fullmatch(r"[a-f0-9]{32}", expected_ledger_md5) is None):
+        raise ValueError("exact task and run identity required")
+    with _maintenance_exclusive_admission() as admission_check:
+        admission_check()
+        expected_database = os.path.realpath(kanban_db_path(board))
+        if _main_database_identity(conn) != expected_database:
+            raise RuntimeError("connection does not belong to the canonical board")
+        with _dispatch_tick_lock(Path(expected_database)) as held:
+            if not held:
+                raise RuntimeError("board dispatch lock is busy")
+            admission_check()
+            with _prelaunch_request_lock(task_id):
+                with write_txn(conn):
+                    admission_check()
+                    evidence = _derive_prelaunch_no_worker_evidence(
+                        conn, task_id, run_id, expected_database,
+                        expected_ledger_md5,
+                    )
+                    record = {
+                        "version": 1,
+                        "classification": "prelaunch_no_worker",
+                        "board_database": expected_database,
+                        "task_id": task_id,
+                        "run_id": run_id,
+                        "evidence_sha256": hashlib.sha256(
+                            _canonical_json(evidence),
+                        ).hexdigest(),
+                        "evidence": evidence,
+                    }
+                    existing = conn.execute(
+                        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                        "AND kind=? ORDER BY id",
+                        (task_id, run_id, _PRELAUNCH_RECONCILIATION_KIND),
+                    ).fetchall()
+                    if existing:
+                        if len(existing) != 1 or _decode_object(
+                            existing[0]["payload"], "existing reconciliation",
+                        ) != record:
+                            raise RuntimeError(
+                                "existing pre-launch reconciliation differs")
+                    else:
+                        admission_check()
+                        _append_event(
+                            conn, task_id, _PRELAUNCH_RECONCILIATION_KIND,
+                            record, run_id=run_id,
+                        )
+                    if not _valid_prelaunch_reconciliation(
+                        conn, expected_database, task_id, run_id,
+                    ):
+                        raise RuntimeError(
+                            "published pre-launch reconciliation differs")
+                    admission_check()
+                admission_check()
+                return record
+
+
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -9319,11 +9807,19 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     if graph_row is not None and graph_row["graph_executor"]:
         uncertain = conn.execute(
             "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
-            "AND (outcome IS NULL OR outcome NOT IN ('blocked', 'completed')) LIMIT 1",
+            "AND (outcome IS NULL OR outcome NOT IN ('blocked', 'completed')) ORDER BY id",
             (task_id,),
-        ).fetchone()
-        if uncertain is not None:
-            return "a2_prior_run_requires_reconciliation"
+        ).fetchall()
+        if uncertain:
+            try:
+                board_database = _main_database_identity(conn)
+            except RuntimeError:
+                board_database = ""
+            for prior in uncertain:
+                if not _valid_prelaunch_reconciliation(
+                    conn, board_database, task_id, int(prior["id"]),
+                ):
+                    return "a2_prior_run_requires_reconciliation"
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
         (task_id,),

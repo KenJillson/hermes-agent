@@ -141,12 +141,12 @@ class CliPathTests(unittest.TestCase):
    with self.assertRaisesRegex(RuntimeError,'not pre-created'):ns['_resolve_worktree_workspace'](t,board='ops')
  def test_dispatcher_prior_uncertain_run_never_reclaims(self):
   import sqlite3
-  tree=ast.parse(KANBAN_SOURCE.read_text());node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='check_respawn_guard')
-  ns={'sqlite3':sqlite3,'Optional':__import__('typing').Optional}
-  exec(compile(ast.Module(body=[node],type_ignores=[]),'actual-respawn-guard','exec'),ns)
+  tree=ast.parse(KANBAN_SOURCE.read_text());names={'_main_database_identity','_canonical_json','_decode_object','_valid_prelaunch_reconciliation','check_respawn_guard'};nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names]
+  ns={'sqlite3':sqlite3,'Optional':__import__('typing').Optional,'os':os,'re':__import__('re'),'json':json,'hashlib':__import__('hashlib'),'Any':object,'_PRELAUNCH_RECONCILIATION_KIND':'prelaunch_no_worker_reconciled','_PRELAUNCH_FAILURE':'workspace: parent confinement changed'}
+  exec(compile(ast.Module(body=nodes,type_ignores=[]),'actual-respawn-guard','exec'),ns)
   with sqlite3.connect(':memory:') as db:
    db.row_factory=sqlite3.Row
-   db.executescript('CREATE TABLE tasks(id TEXT,graph_executor TEXT,last_failure_error TEXT);CREATE TABLE task_runs(id INTEGER,task_id TEXT,ended_at INTEGER,outcome TEXT);')
+   db.executescript('CREATE TABLE tasks(id TEXT,graph_executor TEXT,last_failure_error TEXT);CREATE TABLE task_runs(id INTEGER,task_id TEXT,ended_at INTEGER,outcome TEXT);CREATE TABLE task_events(id INTEGER,task_id TEXT,run_id INTEGER,kind TEXT,payload TEXT);')
    db.execute("INSERT INTO tasks VALUES ('t_test','build_graph',NULL)")
    for outcome in ('crashed','timed_out','reclaimed','stale','rate_limited','gave_up',None):
     db.execute('DELETE FROM task_runs');db.execute('INSERT INTO task_runs VALUES (1,?,?,?)',('t_test',1,outcome))
