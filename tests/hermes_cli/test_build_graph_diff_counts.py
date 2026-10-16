@@ -48,6 +48,21 @@ class DiffCounts(unittest.TestCase):
                 self.assertEqual(signals["diff_files"], state["diff_files"])
                 self.assertEqual(signals["diff_added_lines"], state["diff_added_lines"])
                 self.assertNotIn("large_diff", signals)
+                if kind in ("review", "re_review"):
+                    self.assertEqual(model.call_args.kwargs["review_slot"], 1)
+
+    def test_second_review_uses_second_durable_slot(self):
+        state = new_workflow_state("t_fixture", "test", diff="+fixture\n",
+                                   **contract_kwargs("t_fixture", "test"))
+        state["cloud_review_calls"] = 1
+        model = Mock(side_effect=AtModel)
+        deps = bg.Deps(model=model, over_cap=lambda *a: False)
+        with patch.object(bg.revidence, "render", return_value="evidence"), \
+             patch.object(bg.revidence, "render_denials", return_value=""), \
+             patch.object(bg, "review_diff_current", return_value=True):
+            with self.assertRaises(AtModel):
+                bg.make_cloud_review(deps, activity="re_review", node_name="re_review")(state)
+        self.assertEqual(model.call_args.kwargs["review_slot"], 2)
 
     def test_reviews_keep_zero_counts_and_activity_booleans(self):
         state = new_workflow_state("t_fixture", "test", security_sensitive=True,

@@ -279,6 +279,7 @@ def call_model(
     workflow_classification: Optional[str] = None,
     expected_model: Optional[dict] = None,
     review_contract_sha256: Optional[str] = None,
+    review_slot: Optional[int] = None,
     allow_test_exe: bool = False,
 ) -> dict:
     """Invoke model-call and return {"rc", "klass", "result"}.
@@ -332,6 +333,8 @@ def call_model(
             if expected_model is not None:
                 argv += ["--expected-model-json", json.dumps(expected_model,
                     sort_keys=True, separators=(",", ":"), allow_nan=False)]
+        if review_slot is not None:
+            argv += ["--review-slot", str(review_slot)]
         if directive:
             argv += ["--directive", directive]
         if cwd:
@@ -864,7 +867,8 @@ def make_cloud_review(deps: Deps, *, activity: str, node_name: str):
             activity=activity, prompt=prompt, workspace=deps.workspace,
             card_id=state["card_id"], component=state["component"],
             directive=state["directive"], signals=selection_signals(state, activity=activity),
-            mode="read_only", **contract)
+            mode="read_only", review_slot=state["cloud_review_calls"] + 1,
+            **contract)
         res = out.get("result") or {}
         refused = constraint_refusal(out, activity)
         if refused:
@@ -911,6 +915,7 @@ def make_cloud_plan_review(deps: Deps):
             card_id=state['card_id'], component=state['component'],
             directive=state['directive'],
             signals=selection_signals(state, activity='plan_review'), mode='none',
+            review_slot=1,
             **contract)
         refused = constraint_refusal(out, 'plan_review')
         if refused:

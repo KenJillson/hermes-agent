@@ -178,6 +178,7 @@ def test_review_node_propagates_constraint_and_latches_mismatch_without_count(mo
     assert seen["workflow_classification"] == "constrained"
     assert seen["expected_model"] == SONNET
     assert seen["review_contract_sha256"]
+    assert seen["review_slot"] == 1
     assert update["terminal_reason"] == "expected_model_mismatch:code_review"
     assert update["expected_model_refusal"] == "expected_model_mismatch"
     assert "cloud_review_calls" not in update
