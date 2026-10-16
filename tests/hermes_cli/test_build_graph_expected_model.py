@@ -4,6 +4,7 @@ import ast
 import logging
 import os
 import stat
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -16,6 +17,83 @@ from hermes_cli.build_graph_state import SCHEMA_VERSION, new_workflow_state, val
 from tests.hermes_cli.expected_model_fixtures import contract_kwargs
 
 SONNET = {"schema": 1, "model": "sonnet", "lane": "lane_a", "invoke": "sonnet"}
+
+
+def _write_validator(path, marker):
+    path.parent.mkdir(parents=True)
+    path.parent.joinpath("__init__.py").write_text("")
+    path.write_text(
+        "MARKER = %r\n"
+        "def validate_expected_model(value):\n"
+        "    assert value == {\"schema\": 1, \"model\": \"sonnet\", "
+        "\"lane\": \"lane_a\", \"invoke\": \"sonnet\"}\n" % marker)
+
+
+def _run_profile_loader(agent_root, hermes_root, registry, *, preload_shadow=False):
+    script = r'''
+import json
+import os
+import pathlib
+import sys
+
+agent_root = pathlib.Path(sys.argv[1])
+registry = pathlib.Path(sys.argv[2])
+profile_lib = pathlib.Path(os.environ["HERMES_HOME"]) / "lib"
+sys.path.insert(0, str(agent_root))
+from hermes_constants import get_default_hermes_root
+default_root = get_default_hermes_root().resolve()
+if sys.argv[3] == "shadow":
+    sys.path.insert(0, str(profile_lib))
+    import model_call.constraints
+from hermes_cli import build_graph_constraints as constraints
+constraints._protected_bytes = registry.read_bytes
+try:
+    contract, digest = constraints.load_review_contract(
+        board_database="/isolated/test-board.db", task_id="t_profile",
+        component="main")
+except constraints.ConstraintRefused as exc:
+    print(json.dumps({"refused": str(exc)}))
+else:
+    imported = sys.modules["model_call.constraints"]
+    print(json.dumps({"task_id": contract["task_id"], "digest": digest,
+                      "default_root": default_root.as_posix(),
+                      "origin": pathlib.Path(imported.__file__).resolve().as_posix(),
+                      "marker": imported.MARKER}))
+'''
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_root / "profiles" / "builder")
+    return subprocess.run(
+        [sys.executable, "-I", "-B", "-c", script, str(agent_root),
+         str(registry), "shadow" if preload_shadow else "canonical"],
+        env=env, text=True, capture_output=True, check=False)
+
+
+def test_real_loader_uses_canonical_root_and_rejects_imported_profile_shadow(tmp_path):
+    agent_root = Path(__file__).resolve().parents[2]
+    hermes_root = tmp_path / "hermes"
+    profile = hermes_root / "profiles" / "builder"
+    profile.mkdir(parents=True)
+    canonical = hermes_root / "lib" / "model_call" / "constraints.py"
+    shadow = profile / "lib" / "model_call" / "constraints.py"
+    _write_validator(canonical, "canonical")
+    _write_validator(shadow, "profile-shadow")
+    entry = contract_kwargs("t_profile")["review_contract"]
+    registry = tmp_path / "review-constraints.json"
+    registry.write_text(json.dumps({"version": 1, "entries": [entry]}))
+
+    accepted = _run_profile_loader(agent_root, hermes_root, registry)
+    assert accepted.returncode == 0, accepted.stderr
+    result = json.loads(accepted.stdout)
+    assert result["task_id"] == "t_profile"
+    assert result["default_root"] == hermes_root.resolve().as_posix()
+    assert result["marker"] == "canonical"
+    assert result["origin"] == canonical.resolve().as_posix()
+
+    refused = _run_profile_loader(
+        agent_root, hermes_root, registry, preload_shadow=True)
+    assert refused.returncode == 0, refused.stderr
+    assert json.loads(refused.stdout) == {
+        "refused": "Canonical expected-model validator identity differs"}
 
 
 def test_registry_permission_contract_is_root_controlled_and_runtime_readable():

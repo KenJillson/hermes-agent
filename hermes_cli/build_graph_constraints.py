@@ -175,8 +175,8 @@ def load_review_contract(*, board_database, task_id, component):
     # The protected contract constrains policy vocabulary; it never supplies
     # policy output.  Prove the validator came from the canonical config root.
     import sys
-    from hermes_constants import get_hermes_home
-    lib = get_hermes_home() / "lib"
+    from hermes_constants import get_default_hermes_root
+    lib = get_default_hermes_root() / "lib"
     if str(lib) not in sys.path:
         sys.path.append(str(lib))
     from model_call import constraints as model_constraints
