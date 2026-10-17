@@ -16,6 +16,7 @@ ACTIVITIES = ("plan_review", "code_review", "re_review")
 ENTRY_KEYS = {"board_database", "task_id", "component",
               "workflow_classification", "contract_id", "contract_version",
               "authorization_ref", "protocol_sha256", "activity_constraints"}
+EVALUATION_KEYS = {"activity", "review_slot", "identity"}
 
 
 class ConstraintRefused(ValueError):
@@ -56,6 +57,29 @@ def _expected(value):
     return value
 
 
+def evaluation_target(contract):
+    """Return an exact protected target, if explicitly assigned to this entry."""
+    target = contract.get("evaluation")
+    if target is None:
+        require("evaluation" not in contract, "Null evaluation target is not an assignment")
+        return None
+    require(type(target) is dict and set(target) == EVALUATION_KEYS,
+            "Invalid evaluation target fields")
+    activity = target["activity"]
+    require(activity in ACTIVITIES, "Invalid evaluation activity")
+    require(type(target["review_slot"]) is int and
+            target["review_slot"] == (2 if activity == "re_review" else 1),
+            "Invalid evaluation review slot")
+    require(contract["workflow_classification"] == "constrained" and
+            contract["activity_constraints"][activity]["mode"] == "model",
+            "Evaluation target requires a constrained model activity")
+    require(type(target["identity"]) is dict,
+            "Invalid evaluation identity")
+    require(target["identity"].get("protocol_sha256") ==
+            contract["protocol_sha256"], "Evaluation protocol differs")
+    return target
+
+
 def parse_registry(raw, *, board_database, task_id, component):
     """Parse exact protected bytes and return (contract, canonical_sha256)."""
     require(isinstance(raw, bytes) and len(raw) <= MAX_REGISTRY_BYTES,
@@ -78,7 +102,8 @@ def parse_registry(raw, *, board_database, task_id, component):
     matches = []
     identities = set()
     for entry in entries:
-        require(isinstance(entry, dict) and set(entry) == ENTRY_KEYS,
+        require(isinstance(entry, dict) and
+                set(entry) in (ENTRY_KEYS, ENTRY_KEYS | {"evaluation"}),
                 "Unexpected registry entry fields")
         identity = tuple(_bounded_text(entry[k], k) for k in
                          ("board_database", "task_id", "component"))
@@ -117,6 +142,7 @@ def parse_registry(raw, *, board_database, task_id, component):
             else:
                 require(mode == "unconstrained",
                         "Unconstrained entry must classify every activity unconstrained")
+        evaluation_target(entry)
         if identity == (board_database, task_id, component):
             matches.append(entry)
     require(len(matches) == 1, "Explicit protected workflow classification required")
@@ -186,6 +212,16 @@ def load_review_contract(*, board_database, task_id, component):
     for rule in contract["activity_constraints"].values():
         if rule["mode"] == "model":
             model_constraints.validate_expected_model(rule["expected"])
+    target = evaluation_target(contract)
+    if target is not None:
+        from model_call import attribution
+        expected_origin = os.path.realpath(lib / "model_call" / "attribution.py")
+        require(os.path.realpath(getattr(attribution, "__file__", "")) == expected_origin,
+                "Canonical evaluation validator identity differs")
+        try:
+            attribution.validate(target["identity"])
+        except attribution.AttributionError as exc:
+            raise ConstraintRefused("Invalid evaluation identity") from exc
     return contract, digest
 
 

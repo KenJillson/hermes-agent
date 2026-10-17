@@ -1,6 +1,7 @@
 """Offline expected-model propagation and refusal qualification."""
 import json
 import ast
+import hashlib
 import logging
 import os
 import stat
@@ -27,6 +28,17 @@ def _write_validator(path, marker):
         "def validate_expected_model(value):\n"
         "    assert value == {\"schema\": 1, \"model\": \"sonnet\", "
         "\"lane\": \"lane_a\", \"invoke\": \"sonnet\"}\n" % marker)
+
+
+def _write_attribution_validator(path, marker):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "MARKER = %r\n"
+        "class AttributionError(ValueError): pass\n"
+        "def validate(value):\n"
+        "    if value.get('case_id') != 'declared_case':\n"
+        "        raise AttributionError('invalid case')\n"
+        "    return value\n" % marker)
 
 
 def _run_profile_loader(agent_root, hermes_root, registry, *, preload_shadow=False):
@@ -94,6 +106,28 @@ def test_real_loader_uses_canonical_root_and_rejects_imported_profile_shadow(tmp
     assert refused.returncode == 0, refused.stderr
     assert json.loads(refused.stdout) == {
         "refused": "Canonical expected-model validator identity differs"}
+
+
+def test_protected_evaluation_uses_canonical_validator(tmp_path):
+    agent_root = Path(__file__).resolve().parents[2]
+    hermes_root = tmp_path / "hermes"
+    profile = hermes_root / "profiles" / "builder"
+    profile.mkdir(parents=True)
+    _write_validator(hermes_root / "lib" / "model_call" / "constraints.py", "canonical")
+    _write_attribution_validator(
+        hermes_root / "lib" / "model_call" / "attribution.py", "canonical")
+    entry = _evaluation_bound("t_profile")["review_contract"]
+    registry = tmp_path / "review-constraints.json"
+    registry.write_text(json.dumps({"version": 1, "entries": [entry]}))
+    accepted = _run_profile_loader(agent_root, hermes_root, registry)
+    assert accepted.returncode == 0, accepted.stderr
+    assert json.loads(accepted.stdout)["task_id"] == "t_profile"
+
+    entry["evaluation"]["identity"]["case_id"] = "undeclared"
+    registry.write_text(json.dumps({"version": 1, "entries": [entry]}))
+    refused = _run_profile_loader(agent_root, hermes_root, registry)
+    assert refused.returncode == 0, refused.stderr
+    assert json.loads(refused.stdout) == {"refused": "Invalid evaluation identity"}
 
 
 def test_registry_permission_contract_is_root_controlled_and_runtime_readable():
@@ -255,6 +289,39 @@ def _evaluation_identity():
             "protocol_sha256": "b" * 64, "input_sha256": "c" * 64}
 
 
+def _evaluation_bound(task_id="t_evaluation", *, target=None):
+    bound = contract_kwargs(task_id, classification="constrained", expected=SONNET)
+    bound["review_contract"]["evaluation"] = target or {
+        "activity": "code_review", "review_slot": 1,
+        "identity": _evaluation_identity()}
+    raw = json.dumps(bound["review_contract"], sort_keys=True,
+                     separators=(",", ":"), allow_nan=False).encode()
+    bound["review_contract_sha256"] = hashlib.sha256(raw).hexdigest()
+    return bound
+
+
+def test_protected_evaluation_target_is_exact_and_activity_bound():
+    bound = _evaluation_bound()
+    entry = bound["review_contract"]
+    raw = json.dumps({"version": 1, "entries": [entry]}).encode()
+    parsed, digest = constraints.parse_registry(
+        raw, board_database="/isolated/test-board.db",
+        task_id="t_evaluation", component="main")
+    assert parsed == entry
+    assert digest == bound["review_contract_sha256"]
+    for change in (
+            {"review_slot": 2},
+            {"activity": "re_review", "review_slot": 1},
+            {"identity": dict(_evaluation_identity(), protocol_sha256="a" * 64)}):
+        wrong = _evaluation_bound()["review_contract"]
+        wrong["evaluation"].update(change)
+        with pytest.raises(constraints.ConstraintRefused):
+            constraints.parse_registry(
+                json.dumps({"version": 1, "entries": [wrong]}).encode(),
+                board_database="/isolated/test-board.db",
+                task_id="t_evaluation", component="main")
+
+
 def test_evaluation_wrapper_requires_constrained_directed_slot_before_artifacts():
     for changed, code in (({"directive": "opus"}, "evaluation_invalid"),
                           ({"review_slot": None}, "evaluation_invalid"),
@@ -321,6 +388,26 @@ def test_graph_review_forwards_only_explicit_matching_evaluation(monkeypatch):
     assert seen["evaluation"] == identity
     assert update["terminal_reason"] == "evaluation_invalid:code_review"
     assert "expected_model_refusal" not in update
+
+
+def test_checkpoint_bound_evaluation_reaches_exact_review_call(monkeypatch):
+    bound = _evaluation_bound("t_review")
+    state = new_workflow_state("t_review", "main", diff="+change\n", **bound)
+    target = bound["review_contract"]["evaluation"]
+    seen = {}
+    deps = graph.Deps(model=lambda **kwargs: (seen.update(kwargs) or
+        {"rc": 0, "klass": "ok", "result": {"ok": True,
+        "invoked": True, "model": "sonnet", "verdict": {"passed": True}}}),
+        workspace="/isolated", body="spec", evaluation=target)
+    monkeypatch.setattr(graph, "spend_gate", lambda *_: None)
+    monkeypatch.setattr(graph.revidence, "render", lambda *_: "evidence")
+    monkeypatch.setattr(graph.revidence, "render_denials", lambda *_: "")
+    monkeypatch.setattr(graph, "review_diff_current", lambda *_: True)
+    graph.make_cloud_review(
+        deps, activity="code_review", node_name="cloud_review")(state)
+    assert seen["evaluation"] == target["identity"]
+    assert seen["review_slot"] == target["review_slot"]
+    assert seen["activity"] == target["activity"]
 
 
 def test_graph_evaluation_target_mismatch_stops_before_spend(monkeypatch):
@@ -412,6 +499,7 @@ def _caller_modules(loader, capture):
         parked=(task_id, reason, kind)) or True
     constraints_module = types.ModuleType("hermes_cli.build_graph_constraints")
     constraints_module.load_review_contract = loader
+    constraints_module.evaluation_target = constraints.evaluation_target
     implementer = types.ModuleType("hermes_cli.build_graph_implementer")
     implementer.A2ReconciliationRequired = type("A2ReconciliationRequired", (Exception,), {})
     implementer.make_a2_runner = lambda *args: capture.update(a2=True) or \
@@ -440,7 +528,23 @@ def test_actual_assigned_caller_propagates_protected_contract(monkeypatch):
         assert _actual_caller()(types.SimpleNamespace(agent=None)) == 0
     assert capture["run"]["review_contract"] == bound["review_contract"]
     assert capture["run"]["review_contract_sha256"] == bound["review_contract_sha256"]
+    assert capture["run"]["deps"].evaluation is None
     assert capture["parked"][1] == "graph_terminal:human_review"
+
+
+def test_actual_assigned_caller_supplies_exact_protected_evaluation(monkeypatch):
+    capture = {}
+    bound = _evaluation_bound("t_caller")
+    modules = _caller_modules(lambda **kwargs: (
+        bound["review_contract"], bound["review_contract_sha256"]), capture)
+    monkeypatch.setattr(os, "environ", {"HERMES_KANBAN_TASK": "t_caller",
+        "HERMES_KANBAN_WORKSPACE": "/isolated/workspace"})
+    with monkeypatch.context() as context:
+        for name, module in modules.items(): context.setitem(sys.modules, name, module)
+        assert _actual_caller()(types.SimpleNamespace(agent=None)) == 0
+    assert capture["run"]["deps"].evaluation == bound["review_contract"]["evaluation"]
+    assert capture["run"]["checkpoint"] == "workspace"
+    assert capture["run"]["resume"] == "auto"
 
 
 def test_actual_assigned_caller_refuses_missing_classification_before_a2(monkeypatch):
@@ -463,8 +567,9 @@ def test_workspace_checkpoint_preserves_latched_refusal_and_rejects_contract_dri
     from hermes_cli import build_graph_checkpoint as checkpoint
     # Use the real file-backed saver/serde path with disposable state. The
     # separately required Postgres adapter is qualified only when a server is available.
-    monkeypatch.setenv("HERMES_CONFIG_ROOT",
-        str(Path(__file__).resolve().parents[3] / "config"))
+    monkeypatch.setenv("HERMES_CONFIG_ROOT", os.environ.get(
+        "HERMES_CONFIG_ROOT",
+        str(Path(__file__).resolve().parents[3] / "config")))
     bound = contract_kwargs("t_resume")
     pair = checkpoint.make_workspace_checkpointer(str(tmp_path), schema_version=3)
     deps = graph.Deps(gate=lambda *a, **k: {"verdict": "no_checks"},
@@ -494,3 +599,105 @@ def test_workspace_checkpoint_preserves_latched_refusal_and_rejects_contract_dri
         deps=deps, checkpoint="workspace", resume=True, _workspace_pair=pair,
         **changed)
     assert refused["terminal_reason"] == "resume_constraint_mismatch"
+
+
+def test_fresh_worker_resume_preserves_evaluation_and_refuses_missing_or_changed_identity(
+        tmp_path, monkeypatch):
+    from hermes_cli import build_graph_checkpoint as checkpoint
+    monkeypatch.setenv("HERMES_CONFIG_ROOT", os.environ.get(
+        "HERMES_CONFIG_ROOT",
+        str(Path(__file__).resolve().parents[3] / "config")))
+    bound = _evaluation_bound("t_eval_resume")
+    pair = checkpoint.make_workspace_checkpointer(str(tmp_path), schema_version=3)
+    deps = graph.Deps(gate=lambda *a, **k: {"verdict": "no_checks"},
+        arbiter=lambda *a, **k: ("no_arbiter", "fixture"),
+        parse_ac=lambda *a, **k: (None, None, None, None),
+        workspace=str(tmp_path),
+        evaluation=bound["review_contract"]["evaluation"])
+    app, _ = graph.build(deps, checkpointer=pair)
+    state = new_workflow_state("t_eval_resume", "main", **bound)
+    state["terminal_reason"] = "human_review"
+    config = {"configurable": {"thread_id": "t_eval_resume:main"}}
+    app.invoke(state, config)
+    # A separate interpreter reconstructs the saver and graph from only the
+    # bound protected contract, just as a fresh assigned worker does.
+    script = r'''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+sys.path.insert(0, sys.argv[2])
+from hermes_cli import build_graph as graph
+from hermes_cli import build_graph_checkpoint as checkpoint
+workspace = sys.argv[3]
+bound = json.loads(sys.argv[4])
+pair = checkpoint.make_workspace_checkpointer(workspace, schema_version=3)
+deps = graph.Deps(gate=lambda *a, **k: {"verdict": "no_checks"},
+    arbiter=lambda *a, **k: ("no_arbiter", "fixture"),
+    parse_ac=lambda *a, **k: (None, None, None, None),
+    model=lambda **k: (_ for _ in ()).throw(AssertionError("provider reached")),
+    workspace=workspace, evaluation=bound["review_contract"]["evaluation"])
+result = graph._run_with_checkpointer(None, "t_eval_resume", workspace,
+    deps=deps, checkpoint="workspace", resume="auto", _workspace_pair=pair,
+    **bound)
+print(json.dumps({"evaluation": result["review_contract"]["evaluation"],
+                  "terminal_reason": result["terminal_reason"]}))
+'''
+    root = Path(__file__).resolve().parents[2]
+    config_lib = Path(os.environ["HERMES_CONFIG_ROOT"]) / "lib"
+    child = subprocess.run([sys.executable, "-I", "-B", "-c", script,
+        str(root), str(config_lib), str(tmp_path), json.dumps(bound)],
+        text=True, capture_output=True, check=False)
+    assert child.returncode == 0, child.stderr
+    resumed = json.loads(child.stdout.splitlines()[-1])
+    assert resumed["evaluation"] == bound["review_contract"]["evaluation"]
+
+    # Refusals are checked on the reopened disposable saver. No model or
+    # provider is reachable in either refusal path.
+    fresh_pair = checkpoint.make_workspace_checkpointer(
+        str(tmp_path), schema_version=3)
+
+    unbound = graph._run_with_checkpointer(
+        None, "t_eval_resume", str(tmp_path), deps=graph.Deps(
+            gate=deps.gate, arbiter=deps.arbiter, parse_ac=deps.parse_ac,
+            evaluation=None, model=lambda **_: pytest.fail("provider reached")),
+        checkpoint="workspace", resume="auto", _workspace_pair=fresh_pair,
+        **bound)
+    assert unbound["terminal_reason"] == "evaluation_binding_mismatch"
+
+    missing = contract_kwargs("t_eval_resume", classification="constrained", expected=SONNET)
+    refused = graph._run_with_checkpointer(
+        None, "t_eval_resume", str(tmp_path), deps=graph.Deps(
+            gate=deps.gate, arbiter=deps.arbiter, parse_ac=deps.parse_ac,
+            evaluation=None, model=lambda **_: pytest.fail("provider reached")),
+        checkpoint="workspace", resume="auto", _workspace_pair=fresh_pair,
+        **missing)
+    assert refused["terminal_reason"] == "resume_constraint_mismatch"
+
+    changed = _evaluation_bound("t_eval_resume")
+    changed["review_contract"]["evaluation"]["identity"]["arm_id"] = "different"
+    raw = json.dumps(changed["review_contract"], sort_keys=True,
+                     separators=(",", ":")).encode()
+    changed["review_contract_sha256"] = hashlib.sha256(raw).hexdigest()
+    refused = graph._run_with_checkpointer(
+        None, "t_eval_resume", str(tmp_path), deps=graph.Deps(
+            gate=deps.gate, arbiter=deps.arbiter, parse_ac=deps.parse_ac,
+            evaluation=changed["review_contract"]["evaluation"],
+            model=lambda **_: pytest.fail("provider reached")),
+        checkpoint="workspace", resume="auto", _workspace_pair=fresh_pair,
+        **changed)
+    assert refused["terminal_reason"] == "resume_constraint_mismatch"
+
+
+def test_workspace_refuses_uncheckpointed_evaluation_before_graph_start(tmp_path):
+    from hermes_cli import build_graph_checkpoint as checkpoint
+    bound = contract_kwargs("t_unbound", classification="constrained", expected=SONNET)
+    target = _evaluation_bound()["review_contract"]["evaluation"]
+    deps = graph.Deps(gate=lambda *a, **k: pytest.fail("gate reached"),
+        arbiter=lambda *a, **k: pytest.fail("arbiter reached"),
+        parse_ac=lambda *a, **k: pytest.fail("parse reached"),
+        model=lambda **_: pytest.fail("provider reached"), evaluation=target)
+    result = graph._run_with_checkpointer(
+        None, "t_unbound", str(tmp_path), deps=deps,
+        checkpoint="workspace", resume=False,
+        _workspace_pair=checkpoint.make_workspace_checkpointer(
+            str(tmp_path), schema_version=3), **bound)
+    assert result["terminal_reason"] == "evaluation_binding_mismatch"

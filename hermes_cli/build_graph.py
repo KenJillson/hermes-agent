@@ -67,7 +67,7 @@ from hermes_cli import build_graph_review_evidence as revidence
 from hermes_cli import build_graph_eval as ev
 from hermes_cli import build_graph_sanitize as sz
 from hermes_cli import build_graph_trace as tl
-from hermes_cli.build_graph_constraints import activity_rule
+from hermes_cli.build_graph_constraints import activity_rule, evaluation_target
 from hermes_cli.build_graph_state import (
     SCHEMA_VERSION,
     WorkflowState,
@@ -855,9 +855,13 @@ def review_constraint(state, activity):
             "review_contract_sha256": state["review_contract_sha256"]}, None
 
 
-def review_evaluation(deps, activity, slot):
-    """Forward one explicit target; never derive a case or arm from graph state."""
-    target = deps.evaluation
+def review_evaluation(deps, state, activity, slot):
+    """Use the checkpoint-bound target; retain the opt-in memory bridge."""
+    target = evaluation_target(state["review_contract"])
+    if target is not None and deps.evaluation not in (None, target):
+        return None, {"terminal_reason": "evaluation_invalid:%s" % activity}
+    if target is None:
+        target = deps.evaluation
     if target is None:
         return None, None
     if (type(target) is not dict or set(target) !=
@@ -895,7 +899,7 @@ def make_cloud_review(deps: Deps, *, activity: str, node_name: str):
         if refused:
             return refused
         evaluation, refused = review_evaluation(
-            deps, activity, state["cloud_review_calls"] + 1)
+            deps, state, activity, state["cloud_review_calls"] + 1)
         if refused:
             return refused
         # After the count cap deliberately: that check is free, this one costs
@@ -949,7 +953,7 @@ def make_cloud_plan_review(deps: Deps):
         contract, refused = review_constraint(state, 'plan_review')
         if refused:
             return refused
-        evaluation, refused = review_evaluation(deps, 'plan_review', 1)
+        evaluation, refused = review_evaluation(deps, state, 'plan_review', 1)
         if refused:
             return refused
         refusal = spend_gate(deps, state)
@@ -1930,6 +1934,12 @@ def _run_with_checkpointer(conn, task_id, workspace, *, body="", component="main
                                     review_contract_sha256=review_contract_sha256)
         parked["terminal_reason"] = reason
         return parked
+
+    # A durable run may not rely on a Deps-only identity that disappears when
+    # a fresh worker reconstructs the caller after checkpoint loss.
+    if (checkpoint == "workspace" and
+            deps.evaluation != evaluation_target(review_contract)):
+        return _parked("evaluation_binding_mismatch")
 
     def _invoke(payload):
         try:

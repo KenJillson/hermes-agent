@@ -17944,9 +17944,10 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
     try:
         if not board_database:
             raise ValueError("board database identity unavailable")
-        from hermes_cli.build_graph_constraints import load_review_contract
+        from hermes_cli.build_graph_constraints import load_review_contract, evaluation_target
         review_contract, review_contract_sha256 = load_review_contract(
             board_database=board_database, task_id=task_id, component="main")
+        review_evaluation = evaluation_target(review_contract)
     except Exception as exc:
         logger.error("build-graph constraint REFUSED for %s: %s", task_id,
                      type(exc).__name__)
@@ -18044,7 +18045,9 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
                                     review_contract=review_contract,
                                     review_contract_sha256=review_contract_sha256,
                                     agent=cli.agent,
-                                    deps=_bg.Deps(implement_runner=a2_runner, derive=a2_runner.derive),
+                                    deps=_bg.Deps(implement_runner=a2_runner,
+                                                  derive=a2_runner.derive,
+                                                  evaluation=review_evaluation),
                                     cloud_plan_review=(executor == 'build_graph_cloud_plan_review'),
                                     checkpoint="workspace",
                                     resume="auto")
