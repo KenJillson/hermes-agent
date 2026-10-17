@@ -185,7 +185,9 @@ def test_review_node_propagates_constraint_and_latches_mismatch_without_count(mo
 
 
 def test_matching_review_counts_one_invocation(monkeypatch):
+    seen = {}
     def model(**kwargs):
+        seen.update(kwargs)
         return {"rc": 0, "klass": "ok", "result": {
             "ok": True, "invoked": True, "model": "sonnet",
             "verdict": {"passed": True}, "text": "ok"}}
@@ -201,6 +203,7 @@ def test_matching_review_counts_one_invocation(monkeypatch):
     assert update["cloud_review_calls"] == 1
     assert update["reviewer_model"] == "sonnet"
     assert update["last_verdict_passed"] is True
+    assert "evaluation" not in seen
 
 
 def test_forbidden_activity_refuses_before_spend_gate_or_model(monkeypatch):
@@ -244,6 +247,134 @@ def test_wrapper_rejects_malformed_constraint_before_artifact_preparation(kwargs
     assert result["klass"] == "constraint"
     assert result["result"]["invoked"] is False
     assert result["result"]["error"]["code"] == "expected_model_invalid"
+
+
+def _evaluation_identity():
+    return {"schema": 1, "evaluation_id": "frozen_eval",
+            "case_id": "declared_case", "arm_id": "declared_arm",
+            "protocol_sha256": "b" * 64, "input_sha256": "c" * 64}
+
+
+def test_evaluation_wrapper_requires_constrained_directed_slot_before_artifacts():
+    for changed, code in (({"directive": "opus"}, "evaluation_invalid"),
+                          ({"review_slot": None}, "evaluation_invalid"),
+                          ({"workflow_classification": "unconstrained"},
+                           "expected_model_invalid"),
+                          ({"evaluation": {"invalid": float("nan")}},
+                           "evaluation_invalid")):
+        arguments = dict(activity="code_review", prompt="review",
+            workspace="/path/that/must/not/be/opened", card_id="t_wrapper",
+            workflow_classification="constrained", expected_model=SONNET,
+            review_contract_sha256="a" * 64, directive="sonnet",
+            review_slot=1, evaluation=_evaluation_identity())
+        arguments.update(changed)
+        result = graph.call_model(**arguments)
+        assert result["rc"] == 10
+        assert result["klass"] == "constraint"
+        assert result["result"]["invoked"] is False
+        assert result["result"]["error"]["code"] == code
+
+
+def test_evaluation_wrapper_forwards_exact_identity_to_offline_process(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    exe = tmp_path / "capture"
+    exe.write_text("#!" + sys.executable + "\nimport json,sys\n"
+                   "print(json.dumps({'ok':True,'argv':sys.argv[1:]}))\n")
+    exe.chmod(0o700)
+    identity = _evaluation_identity()
+    result = graph.call_model(activity="code_review", prompt="review",
+        workspace=str(workspace), card_id="t_wrapper", exe=str(exe),
+        allow_test_exe=True, workflow_classification="constrained",
+        expected_model=SONNET, review_contract_sha256="a" * 64,
+        directive="sonnet", review_slot=1, evaluation=identity)
+    assert result["klass"] == "ok"
+    argv = result["result"]["argv"]
+    assert json.loads(argv[argv.index("--evaluation-json") + 1]) == identity
+    assert argv[argv.index("--review-slot") + 1] == "1"
+    assert argv[argv.index("--directive") + 1] == "sonnet"
+
+    ordinary = graph.call_model(activity="code_review", prompt="review",
+        workspace=str(workspace), card_id="t_wrapper", exe=str(exe),
+        allow_test_exe=True, workflow_classification="constrained",
+        expected_model=SONNET, review_contract_sha256="a" * 64,
+        directive="sonnet", review_slot=1)
+    assert ordinary["klass"] == "ok"
+    assert "--evaluation-json" not in ordinary["result"]["argv"]
+
+
+def test_graph_review_forwards_only_explicit_matching_evaluation(monkeypatch):
+    identity = _evaluation_identity()
+    seen = {}
+    deps = graph.Deps(model=lambda **kwargs: (seen.update(kwargs) or
+        {"rc": 10, "klass": "constraint", "result": {"ok": False,
+        "invoked": False, "error": {"stage": "constraint",
+        "code": "evaluation_invalid"}}}), workspace="/isolated", body="spec",
+        evaluation={"activity": "code_review", "review_slot": 1,
+                    "identity": identity})
+    monkeypatch.setattr(graph, "spend_gate", lambda *_: None)
+    monkeypatch.setattr(graph.revidence, "render", lambda *_: "evidence")
+    monkeypatch.setattr(graph.revidence, "render_denials", lambda *_: "")
+    monkeypatch.setattr(graph, "review_diff_current", lambda *_: True)
+    update = graph.make_cloud_review(
+        deps, activity="code_review", node_name="cloud_review")(_review_state())
+    assert seen["evaluation"] == identity
+    assert update["terminal_reason"] == "evaluation_invalid:code_review"
+    assert "expected_model_refusal" not in update
+
+
+def test_graph_evaluation_target_mismatch_stops_before_spend(monkeypatch):
+    deps = graph.Deps(model=lambda **_: pytest.fail("model reached"),
+        workspace="/isolated", body="spec",
+        evaluation={"activity": "re_review", "review_slot": 2,
+                    "identity": _evaluation_identity()})
+    monkeypatch.setattr(graph, "spend_gate", lambda *_: pytest.fail("spend gate reached"))
+    update = graph.make_cloud_review(
+        deps, activity="code_review", node_name="cloud_review")(_review_state())
+    assert update == {"terminal_reason": "evaluation_target_mismatch:code_review"}
+
+
+def test_re_review_uses_second_declared_slot(monkeypatch):
+    identity = _evaluation_identity()
+    seen = {}
+    deps = graph.Deps(model=lambda **kwargs: (seen.update(kwargs) or
+        {"rc": 10, "klass": "constraint", "result": {"ok": False,
+        "invoked": False, "error": {"stage": "constraint",
+        "code": "evaluation_invalid"}}}), workspace="/isolated", body="spec",
+        evaluation={"activity": "re_review", "review_slot": 2,
+                    "identity": identity})
+    monkeypatch.setattr(graph, "spend_gate", lambda *_: None)
+    monkeypatch.setattr(graph.revidence, "render", lambda *_: "evidence")
+    monkeypatch.setattr(graph.revidence, "render_denials", lambda *_: "")
+    monkeypatch.setattr(graph, "review_diff_current", lambda *_: True)
+    state = _review_state()
+    state["cloud_review_calls"] = 1
+    update = graph.make_cloud_review(
+        deps, activity="re_review", node_name="cloud_re_review")(state)
+    assert seen["review_slot"] == 2
+    assert seen["evaluation"] == identity
+    assert update["terminal_reason"] == "evaluation_invalid:re_review"
+
+
+def test_plan_review_forwards_declared_identity_only_when_enabled(monkeypatch):
+    identity = _evaluation_identity()
+    seen = {}
+    deps = graph.Deps(model=lambda **kwargs: (seen.update(kwargs) or
+        {"rc": 10, "klass": "constraint", "result": {"ok": False,
+        "invoked": False, "error": {"stage": "constraint",
+        "code": "evaluation_invalid"}}}), workspace="/isolated", body="spec",
+        cloud_plan_review=True,
+        evaluation={"activity": "plan_review", "review_slot": 1,
+                    "identity": identity})
+    monkeypatch.setattr(graph, "spend_gate", lambda *_: None)
+    monkeypatch.setattr(graph.revidence, "render_plan_denials", lambda *_: "")
+    state = _review_state()
+    state["plan"] = "plan"
+    update = graph.make_cloud_plan_review(deps)(state)
+    assert seen["activity"] == "plan_review"
+    assert seen["evaluation"] == identity
+    assert update["terminal_reason"] == "evaluation_invalid:plan_review"
+    assert "cloud_plan_review_calls" not in update.get("rung_attempts", {})
 
 
 def test_node_update_cannot_replace_protected_contract(monkeypatch):

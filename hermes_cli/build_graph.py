@@ -222,6 +222,13 @@ def _constraint_refusal(detail):
                 "error": {"stage": "constraint", "code": "expected_model_invalid",
                           "retryable": False, "detail": detail}}}
 
+
+def _evaluation_refusal(detail):
+    return {"rc": RC_CONSTRAINT, "klass": "constraint",
+            "result": {"ok": False, "invoked": False,
+                "error": {"stage": "constraint", "code": "evaluation_invalid",
+                          "retryable": False, "detail": detail}}}
+
 def _model_artifact_directory(workspace: str) -> str:
     """Keep retained provider output in the graph's reserved metadata tree."""
     from hermes_cli.build_graph_checkpoint import checkpoint_root
@@ -280,6 +287,7 @@ def call_model(
     expected_model: Optional[dict] = None,
     review_contract_sha256: Optional[str] = None,
     review_slot: Optional[int] = None,
+    evaluation: Optional[dict] = None,
     allow_test_exe: bool = False,
 ) -> dict:
     """Invoke model-call and return {"rc", "klass", "result"}.
@@ -301,6 +309,21 @@ def call_model(
         workflow_classification, expected_model, review_contract_sha256)
     if constraint_error is not None:
         return _constraint_refusal(constraint_error)
+    evaluation_json = None
+    if evaluation is not None:
+        if (type(evaluation) is not dict or
+                workflow_classification != "constrained" or
+                not isinstance(expected_model, dict) or
+                directive != expected_model.get("model") or
+                type(review_slot) is not int or review_slot not in (1, 2)):
+            return _evaluation_refusal("evaluation requires a constrained, directed review slot")
+        try:
+            evaluation_json = json.dumps(evaluation, sort_keys=True,
+                                         separators=(",", ":"), allow_nan=False)
+            if len(evaluation_json.encode("utf-8")) > 2048:
+                return _evaluation_refusal("evaluation JSON exceeds bound")
+        except (TypeError, ValueError, UnicodeError):
+            return _evaluation_refusal("evaluation JSON is invalid")
     exe = exe or MODEL_CALL_EXE
     if workflow_classification is not None and (not allow_test_exe
             and (exe != CANONICAL_MODEL_CALL_EXE
@@ -335,6 +358,8 @@ def call_model(
                     sort_keys=True, separators=(",", ":"), allow_nan=False)]
         if review_slot is not None:
             argv += ["--review-slot", str(review_slot)]
+        if evaluation_json is not None:
+            argv += ["--evaluation-json", evaluation_json]
         if directive:
             argv += ["--directive", directive]
         if cwd:
@@ -491,7 +516,8 @@ class Deps:
                  agent=None, implement_runner=None, derive=None, over_cap=None, codex=None,
                  review_default=None,
                  conn=None, task_id="", workspace="", body="",
-                 changed_files=None, cloud_plan_review=False):
+                 changed_files=None, cloud_plan_review=False,
+                 evaluation=None):
         self.gate = gate
         self.arbiter = arbiter
         self.model = model or call_model
@@ -503,6 +529,9 @@ class Deps:
         self.workspace = workspace
         self.body = body
         self.cloud_plan_review = cloud_plan_review
+        # A caller may supply one exact, already selected evaluation target.
+        # No production caller supplies one until a frozen protocol defines it.
+        self.evaluation = evaluation
         # CD-036 (D5.5): the files this card changed, for the synthetic check
         # specs. Empty is the honest default -- it narrows coverage to the
         # AI-instruction carve-out rather than silently passing.
@@ -826,12 +855,30 @@ def review_constraint(state, activity):
             "review_contract_sha256": state["review_contract_sha256"]}, None
 
 
+def review_evaluation(deps, activity, slot):
+    """Forward one explicit target; never derive a case or arm from graph state."""
+    target = deps.evaluation
+    if target is None:
+        return None, None
+    if (type(target) is not dict or set(target) !=
+            {"activity", "review_slot", "identity"} or
+            type(target["identity"]) is not dict):
+        return None, {"terminal_reason": "evaluation_invalid:%s" % activity}
+    if (target["activity"] != activity or
+            type(target["review_slot"]) is not int or
+            target["review_slot"] != slot):
+        return None, {"terminal_reason": "evaluation_target_mismatch:%s" % activity}
+    return target["identity"], None
+
+
 def constraint_refusal(out, activity):
     result = out.get("result") or {}
     error = result.get("error") or {}
     if out.get("klass") != "constraint" and error.get("stage") != "constraint":
         return None
     code = error.get("code")
+    if code == "evaluation_invalid":
+        return {"terminal_reason": "evaluation_invalid:%s" % activity}
     if code not in ("expected_model_invalid", "expected_model_mismatch"):
         code = "expected_model_invalid"
     return {"terminal_reason": "%s:%s" % (code, activity),
@@ -845,6 +892,10 @@ def make_cloud_review(deps: Deps, *, activity: str, node_name: str):
         if state["cloud_review_calls"] >= CLOUD_REVIEW_CAP:
             return {"terminal_reason": "cloud_review_cap"}
         contract, refused = review_constraint(state, activity)
+        if refused:
+            return refused
+        evaluation, refused = review_evaluation(
+            deps, activity, state["cloud_review_calls"] + 1)
         if refused:
             return refused
         # After the count cap deliberately: that check is free, this one costs
@@ -868,6 +919,7 @@ def make_cloud_review(deps: Deps, *, activity: str, node_name: str):
             card_id=state["card_id"], component=state["component"],
             directive=state["directive"], signals=selection_signals(state, activity=activity),
             mode="read_only", review_slot=state["cloud_review_calls"] + 1,
+            **({"evaluation": evaluation} if evaluation is not None else {}),
             **contract)
         res = out.get("result") or {}
         refused = constraint_refusal(out, activity)
@@ -897,6 +949,9 @@ def make_cloud_plan_review(deps: Deps):
         contract, refused = review_constraint(state, 'plan_review')
         if refused:
             return refused
+        evaluation, refused = review_evaluation(deps, 'plan_review', 1)
+        if refused:
+            return refused
         refusal = spend_gate(deps, state)
         if refusal:
             return refusal
@@ -916,6 +971,7 @@ def make_cloud_plan_review(deps: Deps):
             directive=state['directive'],
             signals=selection_signals(state, activity='plan_review'), mode='none',
             review_slot=1,
+            **({'evaluation': evaluation} if evaluation is not None else {}),
             **contract)
         refused = constraint_refusal(out, 'plan_review')
         if refused:
