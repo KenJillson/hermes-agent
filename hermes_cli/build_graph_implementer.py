@@ -278,7 +278,7 @@ def make_a2_runner(task, workspace, environment):
     # that never enters implement does not require a new artifact declaration.
     environment = dict(environment)
     assigned_workspace = workspace
-    def prepare(operation="implement"):
+    def prepare(operation="plan"):
         task_id = environment.get('HERMES_KANBAN_TASK', '')
         board = environment.get('HERMES_KANBAN_BOARD', '')
         run_text = environment.get('HERMES_KANBAN_RUN_ID', '')
@@ -313,7 +313,8 @@ def make_a2_runner(task, workspace, environment):
             raise A2ReconciliationRequired('a2_parent_git_binding_requires_reconciliation') from exc
 
     used = False
-    def runner(*, goal, workspace: str, max_iterations, timeout_seconds, interrupt_check=None):
+    def runner(*, goal, workspace: str, max_iterations, timeout_seconds, interrupt_check=None,
+               expected_source_sha256=None, expected_policy_sha256=None):
         nonlocal used
         if used:
             raise A2ReconciliationRequired('a2_no_automatic_retry')
@@ -324,7 +325,10 @@ def make_a2_runner(task, workspace, environment):
         # Iteration/model/resource policy belongs exclusively to root startup.
         if workspace != environment.get('HERMES_KANBAN_WORKSPACE') or timeout_seconds != client.DEADLINE_SECONDS:
             raise ProtocolError('a2_caller_budget_or_workspace_mismatch')
-        current = dict(request, goal=goal, files=list(request['files']))
+        current = dict(request, version=2, operation='implement', goal=goal,
+                       files=list(request['files']),
+                       expected_source_sha256=expected_source_sha256,
+                       expected_policy_sha256=expected_policy_sha256)
         validate(current)
         if interrupt_check is not None and interrupt_check():
             return _closed('interrupted')  # No channel has been opened.
@@ -355,11 +359,49 @@ def make_a2_runner(task, workspace, environment):
             result = client.launch(request)
             if result.get('phase') == 'failed':
                 return result
+            if operation in ('plan', 'plan_review'):
+                client.launch_protocol.capability_evidence(result['capability_evidence'])
             context.committed()
             return result
         except Exception as exc:
             raise A2ReconciliationRequired('a2_transport_requires_reconciliation') from exc
     runner.stage = stage
+    def binding_inputs():
+        # Reuse the validated declaration and the protected transfer reader's
+        # no-follow, size, type, mode and replacement checks. No new file scope.
+        client, request, _ = prepare()
+        transfer = sys.modules['workspace_transfer']
+        root = transfer.directory(assigned_workspace)
+        try:
+            records = {name: transfer.read(root, name) for name in request['files']}
+            transfer.validate_files({name: item for name, item in records.items() if item is not None})
+        finally:
+            os.close(root)
+        return request['files'], client.launch_protocol.source_digest(
+            request['files'], {name: item for name, item in records.items() if item is not None})
+    runner.binding_inputs = binding_inputs
+    def capability_evidence(state):
+        """Use only two authenticated planning receipts from the same policy."""
+        client = _a2_client()
+        attempts = state['rung_attempts']
+        rows = attempts.get('a2_capability_evidence')
+        denials = attempts.get('a2_denial_evidence')
+        if type(rows) is not dict or set(rows) != {'plan', 'plan_review'} or type(denials) is not dict:
+            raise ProtocolError('a2_capability_receipts_missing')
+        profiles = []
+        for operation in ('plan', 'plan_review'):
+            row = rows[operation]
+            denial = denials[operation]['evidence']
+            if (type(row) is not dict or set(row) != {'profile', 'token', 'request_sha256'}
+                    or row['token'] != denial['token']
+                    or row['request_sha256'] != denial['request_sha256']
+                    or denial['operation'] != operation):
+                raise ProtocolError('a2_capability_receipt_identity')
+            profiles.append(client.launch_protocol.capability_evidence(row['profile']))
+        if profiles[0] != profiles[1]:
+            raise ProtocolError('a2_policy_changed_between_planning_stages')
+        return profiles[1]
+    runner.capability_evidence = capability_evidence
     runner.run_id = task.current_run_id
     runner.payload_workspace = '/workspace' 
     runner.derive = derive

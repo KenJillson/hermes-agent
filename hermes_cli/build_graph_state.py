@@ -34,7 +34,7 @@ import hashlib
 import json
 from typing import Any, Literal, Optional, TypedDict
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Ladder positions (design section 1 flow, section 2.2 rung caps).
 RUNGS = ("none", "rung1", "rung2", "rung3")
@@ -98,6 +98,7 @@ class WorkflowState(TypedDict):
 
     # work product
     plan: str
+    plan_acceptance: Optional[dict]
     diff: str
     gate_summary: dict
     ac_record_path: str
@@ -205,6 +206,7 @@ def new_workflow_state(
         review_contract=review_contract,
         review_contract_sha256=review_contract_sha256,
         plan=plan,
+        plan_acceptance=None,
         diff=diff,
         gate_summary={},
         ac_record_path="",
@@ -298,6 +300,11 @@ def validate(state: WorkflowState) -> None:
         raise ValueError(
             "schema_version %r != %r" % (state["schema_version"], SCHEMA_VERSION)
         )
+    if state['plan_acceptance'] is not None:
+        record = state['plan_acceptance']
+        if (type(record) is not dict or record.get('version') != 1
+                or record.get('status') not in ('cloud_accepted', 'cloud_disabled')):
+            raise ValueError('plan_acceptance shape')
     if state["rung"] not in RUNGS:
         raise ValueError("rung %r not in %r" % (state["rung"], RUNGS))
     tier = state["recurrence_tier"]

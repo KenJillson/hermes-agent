@@ -67,6 +67,7 @@ from hermes_cli import build_graph_review_evidence as revidence
 from hermes_cli import build_graph_eval as ev
 from hermes_cli import build_graph_sanitize as sz
 from hermes_cli import build_graph_trace as tl
+from hermes_cli import build_graph_plan_connection as connection
 from hermes_cli.build_graph_constraints import activity_rule, evaluation_target
 from hermes_cli.build_graph_state import (
     SCHEMA_VERSION,
@@ -637,6 +638,19 @@ def make_implement(deps: Deps):
             except Exception:
                 return {"terminal_reason": "implement_runner_unavailable"}
 
+        try:
+            files, source = runner.binding_inputs()
+            capability = runner.capability_evidence(state)
+            connection.verify(state.get('plan_acceptance'), state, spec, deps.workspace,
+                              source, files, cloud_required=deps.cloud_plan_review,
+                              capability=capability)
+        except (connection.Refused, ValueError, KeyError, OSError, AttributeError):
+            return {'terminal_reason': 'plan_acceptance_stale_or_missing'}
+        try:
+            goal = build_implement_goal(state, getattr(runner, "payload_workspace", deps.workspace), spec)
+        except connection.Refused:
+            return {'terminal_reason': 'implement_goal_bounds'}
+
         # CD-042 THE ATTEMPT CAP, checked HERE rather than in route_entry so
         # the refusal carries a REASON. A router cannot write state, so a cap
         # enforced there would park the card as a bare "human_review" with
@@ -670,11 +684,13 @@ def make_implement(deps: Deps):
             return bool(event is not None and hasattr(event, "is_set") and event.is_set())
 
         raw = runner(
-            goal=build_implement_goal(state, getattr(runner, "payload_workspace", deps.workspace), spec),
+            goal=goal,
             workspace=deps.workspace,
             max_iterations=IMPLEMENT_MAX_ITERATIONS,
             timeout_seconds=IMPLEMENT_TIMEOUT_SECONDS,
             interrupt_check=_interrupted,
+            expected_source_sha256=source,
+            expected_policy_sha256=capability['policy_sha256'],
         )
         if not isinstance(raw, dict):
             return _park("implement_protocol_error")
@@ -950,6 +966,16 @@ def make_cloud_plan_review(deps: Deps):
             return {'terminal_reason': 'cloud_plan_review_not_enabled'}
         if state['rung_attempts'].get('cloud_plan_review_calls', 0) != 0:
             return {'terminal_reason': 'cloud_plan_review_cap'}
+        try:
+            files, source = deps.implement_runner.binding_inputs()
+        except (ValueError, KeyError, OSError, AttributeError):
+            return {'terminal_reason': 'plan_acceptance_source_unavailable'}
+        try:
+            capability = deps.implement_runner.capability_evidence(state)
+        except (ValueError, KeyError, OSError, AttributeError):
+            return {'terminal_reason': 'qwen_capability_unknown'}
+        if type(capability) is not dict:
+            return {'terminal_reason': 'qwen_capability_unknown'}
         contract, refused = review_constraint(state, 'plan_review')
         if refused:
             return refused
@@ -965,7 +991,20 @@ def make_cloud_plan_review(deps: Deps):
             return {'terminal_reason': 'protected_plan_evidence_unavailable'}
         prompt = ('Review this implementation plan against the specification. '
                   'This is a read-only planning review; do not implement. '
-                  'Give a verdict with concrete findings if changes are needed.\n'
+                  'Assess Qwen feasibility explicitly. Return a JSON object with exactly '
+                  'verdict (passed or revise), feasibility (feasible, infeasible, or unknown), '
+                  'approach_preserved and requirements_preserved (booleans), findings '
+                  '(blocking strings), guidance (objects with file and action), and summary. '
+                  'A passed verdict requires feasible, both preservation booleans true, and '
+                  'no blocking findings. '
+                  'A material change to the accepted approach or any specification requirement '
+                  'must return revise with a blocking finding, not passed guidance. Guidance is '
+                  'advice only and may name declared files; file names alone do not establish '
+                  'semantic compatibility. If capability evidence is insufficient for a needed '
+                  'judgment, return unknown feasibility. Declared files: ' + json.dumps(files) + '\n'
+                  'QWEN CAPABILITY/RESOURCE PROFILE (authenticated plan and plan_review '
+                  'receipts from the same loaded protected policy):\n'
+                  + json.dumps(capability, sort_keys=True) + '\n'
                   'SPECIFICATION:\n' + deps.body + '\nPLAN:\n' + state['plan'] + evidence)
         if len(prompt.encode('utf-8')) > 128 * 1024:
             return {'terminal_reason': 'cloud_plan_review_prompt_bounds'}
@@ -987,9 +1026,29 @@ def make_cloud_plan_review(deps: Deps):
             update['terminal_reason'] = 'model_call_%s:plan_review' % out['klass']
             return guard(update, state)
         result = out.get('result') or {}
+        try:
+            receipt, verdict = connection.cloud_receipt(result, deps.workspace,
+                                                        state['card_id'], files)
+            current_files, current_source = deps.implement_runner.binding_inputs()
+            if current_files != files or current_source != source:
+                raise connection.Refused('source_changed_during_review')
+        except (connection.Refused, ValueError, KeyError, OSError, AttributeError):
+            update['terminal_reason'] = 'cloud_plan_review_invalid_or_stale'
+            return guard(update, state)
         update['objections_current'] = extract_objections(result)
-        update['terminal_reason'] = ('a2_stage_ready:implement' if verdict_passed(result.get('verdict'))
-                                     else 'cloud_plan_review_rejected')
+        if verdict['verdict'] == 'passed' and verdict['feasibility'] == 'feasible':
+            attempts['cloud_plan_review_evidence'] = {
+                key: receipt[key] for key in ('run_id', 'envelope_sha256',
+                                             'verdict_sha256', 'ledger_line_sha256')}
+            attempts['cloud_plan_review_evidence']['guidance_sha256'] = connection.sha(verdict['guidance'])
+            update['rung_attempts'] = attempts
+            update['plan_acceptance'] = connection.binding(
+                state, deps.body, deps.workspace, source, files,
+                status='cloud_accepted', guidance=verdict['guidance'], cloud=receipt,
+                capability=capability)
+            update['terminal_reason'] = 'a2_stage_ready:implement'
+        else:
+            update['terminal_reason'] = 'cloud_plan_review_rejected'
         return guard(update, state)
     return _node
 
@@ -1355,46 +1414,28 @@ def node_human(state):
 # --------------------------------------------------------------------------
 
 def build_implement_goal(state, workspace: str, spec: str) -> str:
-    """The child's goal. NAMES THE WORKTREE -- see make_implement's docstring.
+    """Construct the bounded fixed-Qwen goal from the live spec and bound plan.
 
-    No commit, no push, no history rewrite: build_graph_diff.derive() computes
-    the card's work product as a diff against the merge-base, and its ONE
-    mutating command is pinned to `git add -A -N` (record intent, stage no
-    content). A child that committed would move HEAD out from under that.
-
-    CD-044: `spec` IS THE CARD BODY, carried on Deps by the caller. It is NOT
-    the `plan` channel, and the four reasons are worth keeping because the
-    obvious fix is the other one:
-
-      * PROVENANCE. `plan` is the (unbuilt) `plan` node's output slot -- this
-        module's own docstring lists it under `unbuilt`. Filling it from the
-        card body destroys the ability to tell "no plan node ran" from "a plan
-        node ran and produced this", permanently, in checkpointed state.
-      * COUPLING THROUGH A PAID PROMPT. build_review_prompt reads that same
-        channel. Routing the body through it would mean every future change to
-        what the FREE implementer sees silently changes what a METERED reviewer
-        is sent.
-      * THE RESUME CLOBBER. run()'s resume partial input NAMES that channel,
-        and cli.py always passes "". A terminal-thread resume merges named
-        channels over the restored ones, so a plan threaded at the call site is
-        erased on the second dispatch. The card body on Deps is re-set from the
-        live card row on every run() call and is never checkpointed, so it
-        cannot have that failure.
-      * CHECKPOINT BYTES. `plan` is a checkpointed channel and card bodies are
-        unbounded operator text. CD-043 was a checkpointed channel compounding
-        past MAX_DIFF_BYTES; run() already has a CheckpointTooLarge park.
-
-    THIS IS THE INTERIM CONTRACT, NOT THE END STATE. The card body is a
-    specification, not a plan. When the `plan` node is built it slots ABOVE
-    this and the body becomes the fallback. Said here so a future session
-    does not discover the layering by surprise.
+    The caller verifies acceptance against plan, spec and declared source
+    immediately before calling this function. The existing protected wire
+    parser validates the resulting goal and unchanged declared file list.
     """
-    return ("Implement component %r of card %s.\n\n"
+    acceptance = state['plan_acceptance']
+    guidance = acceptance['guidance'] if acceptance['status'] == 'cloud_accepted' else []
+    goal = ("Implement component %r of card %s.\n\n"
             "Work in this directory and nowhere else:\n  %s\n\n"
             "Make the change on disk. Do NOT commit, push, create branches, or "
             "otherwise alter git history -- the harness derives the diff "
             "itself.\n\nSPECIFICATION:\n%s\n"
             % (state["component"], state["card_id"], workspace, spec))
+    goal += '\nACCEPTED QWEN PLAN:\n' + state['plan'] + '\n'
+    if guidance:
+        goal += ('\nCLOUD PLAN REVIEW GUIDANCE (advice within the declared files only; '
+                 'the specification and protected runtime restrictions prevail):\n'
+                 + json.dumps(guidance, ensure_ascii=False) + '\n')
+    if len(goal.encode('utf-8')) > 32768:
+        raise connection.Refused('implement_goal_bounds')
+    return goal
 
 
 def build_implement_context(state):

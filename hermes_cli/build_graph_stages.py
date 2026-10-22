@@ -90,6 +90,21 @@ def make_stage(deps, operation, guard):
         except (evidence.Refused, TypeError, KeyError):
             return guard({'terminal_reason': 'a2_denial_evidence_unavailable',
                           'rung_attempts': attempts}, state)
+        if operation in ('plan', 'plan_review'):
+            try:
+                profile = raw['capability_evidence']
+                if type(profile) is not dict or not profile:
+                    raise ValueError('capability receipt missing')
+                prior = attempts.get('a2_capability_evidence', {})
+                if type(prior) is not dict or operation in prior:
+                    raise ValueError('capability receipt replay')
+                denial = raw['denial_evidence']
+                attempts['a2_capability_evidence'] = dict(prior, **{operation: {
+                    'profile': dict(profile), 'token': denial['token'],
+                    'request_sha256': denial['request_sha256']}})
+            except (KeyError, TypeError, ValueError):
+                return guard({'terminal_reason': 'a2_capability_evidence_unavailable',
+                              'rung_attempts': attempts}, state)
         update = {'rung_attempts': attempts}
         if operation == 'plan':
             update.update(plan=result['plan'], terminal_reason='a2_stage_ready:plan_review')
@@ -99,6 +114,16 @@ def make_stage(deps, operation, guard):
                                               for text in result['findings']])
         elif operation == 'plan_review':
             if not getattr(deps, 'cloud_plan_review', False):
+                from hermes_cli import build_graph_plan_connection as connection
+                try:
+                    files, source = runner.binding_inputs()
+                    capability = runner.capability_evidence(dict(state, rung_attempts=attempts))
+                    update['plan_acceptance'] = connection.binding(
+                        dict(state, rung_attempts=attempts), deps.body, deps.workspace,
+                        source, files, status='cloud_disabled', guidance=[], capability=capability)
+                except (connection.Refused, ValueError, KeyError, OSError, AttributeError):
+                    update['terminal_reason'] = 'plan_acceptance_source_unavailable'
+                    return guard(update, state)
                 update['terminal_reason'] = 'a2_stage_ready:implement'
         return guard(update, state)
     node.__name__ = operation

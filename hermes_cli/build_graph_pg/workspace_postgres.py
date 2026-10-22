@@ -39,6 +39,12 @@ def open_workspace_checkpointer(board_connection, task_id, workspace):
             registry.require(peer=={'role':'michael_checkpoint','database':'michael_checkpoints'},
                              'Unexpected checkpoint peer identity')
             registry.verify_schema(conn)
+            # An old registered scope must refuse before marker_lock can create
+            # a missing checkpoint directory or scope lock in its worktree.
+            existing = registry.lookup(conn, identity)
+            if existing is not None:
+                registry.require(existing['workflow_schema'] == SCHEMA_VERSION,
+                                 'Registered workflow schema differs')
             with identity_module.marker_lock(identity,mutation_gate=admitted_write) as directory:
                 with conn.transaction():
                     conn.execute('SELECT pg_advisory_xact_lock(%s)',(registry.identity_key(identity),))
