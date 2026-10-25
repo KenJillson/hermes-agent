@@ -68,7 +68,13 @@ def make_stage(deps, operation, guard):
                      'or claims that a diff has been measured. The graph measures the actual '
                      'Git diff after implementation. Do not include stage sequencing, run IDs, '
                      'socket launches, model routing, spending caps, retries, or card completion '
-                     'in the implementation plan.\nSPECIFICATION:\n' + deps.body)
+                     'in the implementation plan. Inspect the declared source before choosing '
+                     'an approach. Map each functional requirement and exception to a proposed '
+                     'change or explicit preservation decision and a concrete regression assertion. '
+                     'Make relevant boundary, ordering, and counting semantics explicit. Name the '
+                     'function each test exercises. Reference authored acceptance commands exactly; '
+                     'an exact reference is sufficient, without copying full commands into the plan. '
+                     'Keep this mapping concise within the plan size limit.\nSPECIFICATION:\n' + deps.body)
         else:
             goal += (' Reviews: passed must be false if findings is nonempty; '
                 'findings must contain concise strings. Evaluate the specification and supplied plan'

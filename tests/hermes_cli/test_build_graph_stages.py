@@ -132,6 +132,27 @@ class GraphStages(unittest.TestCase):
             with self.assertRaises(ValueError):stages.next_stage(state)
 
 
+    def test_plan_maps_requirements_without_altering_raw_spec(self):
+        runner = Runner()
+        original_stage = runner.stage
+        def valid_stage(**kwargs):
+            result = original_stage(**kwargs)
+            result['capability_evidence'] = {'fixture_profile': True}
+            return result
+        runner.stage = valid_stage
+        deps = self.deps(runner, [])
+        deps.body = '  Preserve raw bytes\r\nUnicode: π\n\n'
+        state = new_workflow_state('t_fixture', 'main', **contract_kwargs('t_fixture'))
+        out = stages.make_stage(deps, 'plan', bg.guard)(state)
+        goal = runner.goals[0]
+        self.assertEqual(goal.split('\nSPECIFICATION:\n', 1)[1].encode(), deps.body.encode())
+        self.assertEqual(goal.count('Map each functional requirement and exception'), 1)
+        self.assertIn('concrete regression assertion', goal)
+        self.assertIn('Name the function each test exercises.', goal)
+        self.assertIn('an exact reference is sufficient', goal)
+        self.assertEqual(out['terminal_reason'], 'a2_stage_ready:plan_review')
+
+
 class StageRunner(unittest.TestCase):
     def test_operation_and_run_are_bound_and_runner_cannot_relaunch(self):
         import types
