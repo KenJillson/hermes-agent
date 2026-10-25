@@ -627,8 +627,8 @@ def make_implement(deps: Deps):
         # deliberately: this cannot succeed on retry -- the card body will not
         # have grown -- so it must not consume an attempt. No child, no
         # subprocess, no dollars.
-        spec = (deps.body or "").strip()
-        if not spec:
+        spec = deps.body or ""
+        if not spec.strip():
             return {"terminal_reason": "implement_no_spec"}
 
         runner = deps.implement_runner

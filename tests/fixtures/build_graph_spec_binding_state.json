@@ -1,0 +1,202 @@
+{
+  "body": "Fix duplicate changed-path accounting in the existing cheap-gate component.\n\nThe existing _existing_regular implementation spends MAX_FILES slots on repeated\ncopies of one existing file, excluding another distinct file. Count each exact\nexisting regular path string once, in first-seen order. The unchanged MAX_FILES\nlimit applies to distinct valid paths. Count each distinct over-cap valid path\nonce. Preserve existing occurrence counts for missing and unsafe names, the\nthree-key dropped dictionary, empty input, directory handling, shlex quoting,\nsynthetic indices, no-authored-AC free path, and observation-only lint behavior.\nDo not normalize aliases, widen file/command authority, add lint infrastructure,\nchange enforcement, or change other components. Add meaningful stdlib regression\ntests for duplicates, ordering, cap boundary/overflow, invalid and empty inputs.\nTests may load the module by file path; no new dependencies or package files.\n\n## A2 Files\n```json\n[\"hermes_cli/build_graph_checks.py\", \"tests/test_build_graph_checks_distinct_paths.py\"]\n```\n\n## AC\n- [ ] Distinct-file coverage and the cap preserve the declared invariants.\n```check expect=exit:0\npython3 -B -c 'import importlib.util,tempfile\nfrom pathlib import Path\ns=importlib.util.spec_from_file_location('\"'\"'trial_checks'\"'\"','\"'\"'hermes_cli/build_graph_checks.py'\"'\"');m=importlib.util.module_from_spec(s);s.loader.exec_module(m)\nassert m.MAX_FILES==200\nwith tempfile.TemporaryDirectory() as td:\n p=Path(td)\n for name in ('\"'\"'first.py'\"'\"','\"'\"'second.py'\"'\"'): (p/name).write_text('\"'\"'value = 1\\n'\"'\"')\n kept,d=m._existing_regular(td,['\"'\"'first.py'\"'\"']*200+['\"'\"'second.py'\"'\"','\"'\"'first.py'\"'\"'])\n assert kept==['\"'\"'first.py'\"'\"','\"'\"'second.py'\"'\"'] and d=={'\"'\"'missing'\"'\"':0,'\"'\"'unsafe_name'\"'\"':0,'\"'\"'over_cap'\"'\"':0},(kept,d)\n names=['\"'\"'f%03d.py'\"'\"'%i for i in range(201)]\n for name in names:(p/name).write_text('\"'\"'value = 1\\n'\"'\"')\n kept,d=m._existing_regular(td,names+[names[-1],names[0]])\n assert kept==names[:200] and d=={'\"'\"'missing'\"'\"':0,'\"'\"'unsafe_name'\"'\"':0,'\"'\"'over_cap'\"'\"':1},(len(kept),d)\nprint('\"'\"'distinct-path invariants passed'\"'\"')\n'\n```\n- [ ] Focused standard-library regression tests pass.\n```check expect=exit:0\npython3 -B -m unittest discover -s tests -p test_build_graph_checks_distinct_paths.py -v\n```\n",
+  "cloud_envelope": "{\"duration_api_ms\": 12485, \"stop_reason\": \"end_turn\", \"session_id\": \"16cd9fe9-dc2e-4773-930d-4dfac4117b84\", \"total_cost_usd\": 0.0636658, \"usage\": {\"input_tokens\": 2, \"cache_creation_input_tokens\": 12174, \"cache_read_input_tokens\": 8858, \"output_tokens\": 1408, \"output_tokens_details\": {\"thinking_tokens\": 766}, \"server_tool_use\": {\"web_search_requests\": 0, \"web_fetch_requests\": 0}, \"service_tier\": \"standard\", \"cache_creation\": {\"ephemeral_1h_input_tokens\": 12174, \"ephemeral_5m_input_tokens\": 0}, \"inference_geo\": \"global\", \"iterations\": [{\"input_tokens\": 2, \"output_tokens\": 1408, \"cache_read_input_tokens\": 8858, \"cache_creation_input_tokens\": 12174, \"cache_creation\": {\"ephemeral_5m_input_tokens\": 0, \"ephemeral_1h_input_tokens\": 12174}, \"type\": \"message\"}], \"speed\": \"standard\", \"fallback_credit\": null}, \"modelUsage\": {\"claude-sonnet-5-5\": {\"inputTokens\": 2, \"outputTokens\": 1408, \"cacheReadInputTokens\": 8858, \"cacheCreationInputTokens\": 12174, \"webSearchRequests\": 0, \"costUSD\": 0.0636658, \"contextWindow\": 1000000, \"maxOutputTokens\": 128000, \"thinkingTokens\": 766, \"canonicalModel\": \"claude-sonnet-5-5\", \"provider\": \"firstParty\", \"costBasis\": \"list\"}}, \"permission_denials\": [], \"terminal_reason\": \"completed\", \"fast_mode_state\": \"off\", \"fast_mode_disabled_reason\": \"sdk_opt_in_required\", \"subagent_stats\": {\"spawned\": 0, \"requested\": {\"background\": 0, \"foreground\": 0, \"unset\": 0}, \"started_in_background\": 0, \"max_depth\": 0, \"spawned_by_subagents\": 0, \"completed\": 0, \"failed\": 0, \"killed\": {\"parent\": 0, \"user\": 0, \"system\": 0}, \"refused\": {\"depth_limit\": 0, \"concurrency_limit\": 0, \"budget\": 0}, \"by_type\": {}}, \"safety_stops\": 0, \"is_error\": false, \"num_turns\": 1, \"subtype\": \"success\", \"api_error_status\": null, \"result\": \"{\\\"verdict\\\":\\\"passed\\\",\\\"feasibility\\\":\\\"feasible\\\",\\\"approach_preserved\\\":true,\\\"requirements_preserved\\\":true,\\\"findings\\\":[],\\\"guidance\\\":[{\\\"file\\\":\\\"hermes_cli/build_graph_checks.py\\\",\\\"action\\\":\\\"Make the smallest change that satisfies the spec. Keep the existing unsafe-name test, directory handling, missing-name counting and quoting exactly as they are. The plan's 'starts with / or contains ..' rule and 'directory counts as missing' are guesses and must not replace what the file already does. Add only an exact-string seen set that is checked after a path is confirmed to be an existing regular file. Add the path to seen before the MAX_FILES check, so a repeated over-cap path is not counted twice. Keep missing and unsafe names counted per occurrence. Leave the three-key dropped dict, empty-input behavior and first-seen order untouched.\\\"},{\\\"file\\\":\\\"tests/test_build_graph_checks_distinct_paths.py\\\",\\\"action\\\":\\\"Load the module by file path with importlib and use stdlib unittest and tempfile only. Cover these cases: 200 repeats of one file followed by a second file; first-seen ordering; exactly 200 distinct files (over_cap 0); 201 distinct files (over_cap 1); an over-cap path repeated, which must still count once; repeated missing and unsafe names, which keep per-occurrence counts; a directory; empty input; and a name needing shlex quoting. Derive the expected unsafe and directory outcomes from the existing implementation, not from the plan's assumptions. Do not write any alias-normalization test, such as 'a.py' versus './a.py'.\\\"}],\\\"summary\\\":\\\"The plan is feasible for Qwen: the task is small and well inside the resource profile. It keeps the accepted approach and every spec requirement. The one risk is that it guesses at the existing unsafe-name and directory behavior, so it should keep that logic as is and only add the distinct-path dedupe.\\\"}\", \"ttft_ms\": 9788, \"type\": \"result\", \"duration_ms\": 14037, \"uuid\": \"d523029e-34f9-40a8-b9f0-3888d650b888\", \"ttft_stream_ms\": 3192, \"time_to_request_ms\": 1548, \"first_content_frame_ms\": 3193, \"queued_turn_count\": 0, \"result_index\": 0}\n",
+  "provenance": {
+    "captured_state_sha256": "695e0f77f7cffa16856bd9162f41f17c6b0085a8751fa1470e02f45fc8f30e36",
+    "checkpoint_id": "1f1cffdc-d3f2-67ca-8009-fcfb8a4a02ec",
+    "historical_case": "2026-10-24 preserved failed trial; tests relocate only filesystem scope and rebind coherent test fixtures, never production state",
+    "step": 9,
+    "task": "t_66a466e5"
+  },
+  "state": {
+    "ac_record_path": "",
+    "author_independence": false,
+    "branch:to:implement": null,
+    "card_id": "t_66a466e5",
+    "classify_log_failed": false,
+    "cloud_review_calls": 0,
+    "component": "main",
+    "component_count": 1,
+    "diff": "",
+    "diff_added_lines": 0,
+    "diff_files": 0,
+    "directive": null,
+    "dispute_class": null,
+    "expected_model_refusal": null,
+    "financial_sensitive": false,
+    "gate_summary": {},
+    "halt_reason": null,
+    "holdout": false,
+    "implementer_model": null,
+    "iteration": 0,
+    "last_verdict_passed": false,
+    "novel_architecture": false,
+    "objection_recurred": null,
+    "objections_current": [],
+    "objections_prior": [],
+    "plan": "1. **Load and Analyze `hermes_cli/build_graph_checks.py`:**\n   - Use `cat` to read the file and inspect `_existing_regular`.\n   - Identify current loop structure, `MAX_FILES` usage, `seen` set (if any), and dictionary updates.\n   - Identify helper functions for `is_unsafe`, `is_regular_file`, and `shlex` usage.\n\n2. **Update `_existing_regular` in `hermes_cli/build_graph_checks.py`:**\n   - Add a `seen` set to track distinct valid paths.\n   - Iterate through input paths:\n     - If path is unsafe (e.g., starts with `/` or contains `..`), increment `unsafe_name` and continue.\n     - If path exists and is a regular file:\n       - If path in `seen`, continue.\n       - Add path to `seen`.\n       - If `len(kept) < MAX_FILES`, append path to `kept`.\n       - Else, increment `over_cap`.\n     - Else (missing or directory), increment `missing`.\n   - Preserve existing `shlex` quoting logic for output.\n   - Preserve `synthetic_indices` and `no-authored-AC` checks if present.\n   - Ensure return tuple matches `(kept, {'missing': ..., 'unsafe_name': ..., 'over_cap': ...})`.\n\n3. **Create `tests/test_build_graph_checks_distinct_paths.py`:**\n   - Import `unittest`, `tempfile`, `importlib.util`, `pathlib.Path`.\n   - Load module dynamically using `spec_from_file_location`.\n   - **TestDistinctPaths:** Verify distinct files are kept in first-seen order.\n   - **TestDuplicates:** Verify duplicates are skipped and `over_cap` increments correctly when distinct count exceeds `MAX_FILES`.\n   - **TestEmptyInput:** Verify empty list returns empty kept and zero counts.\n   - **TestMissing:** Verify missing files increment `missing`.\n   - **TestUnsafe:** Verify unsafe paths increment `unsafe_name`.\n   - **TestDirectory:** Verify directories are not counted as regular files.\n   - **TestBoundary:** Verify `MAX_FILES` limit with exactly `MAX_FILES` and `MAX_FILES + 1` distinct files.\n   - **TestShlex:** Verify paths with special characters are handled correctly.\n\n4. **Validation:**\n   - Run the provided check command to verify distinct-path invariants.\n   - Run `python3 -B -m unittest discover -s tests -p test_build_graph_checks_distinct_paths.py -v` to verify regression tests.",
+    "plan_acceptance": {
+      "capability_sha256": "7b3e4ab9dea62c885fdfba5c5b5b2b3dd04a900d4ea641d1897f804e0a1fc761",
+      "card_id": "t_66a466e5",
+      "cloud_receipt": {
+        "activity": "plan_review",
+        "envelope_path": "/home/jetson/.hermes/kanban/boards/ops/workspaces/t_66a466e5/.graph-checkpoints/model-call-h56sg5f_/t_66a466e5-90b43e27-result.json",
+        "envelope_sha256": "f55557b3f9c96fa03b7449afe524f16d37b5062acb3db5b1f4a6a305fd6084ba",
+        "ledger_line_sha256": "021bd1ddd2fcb949d8d1aac4bd3de9aeb0cfe872c67c6f50c938e55c3924419a",
+        "model": "sonnet",
+        "run_id": "90b43e27",
+        "verdict_sha256": "fbf3d82eb1b557571d29fa0c8c4520e1e12997aa9601620966cad8a5e0a48cd5"
+      },
+      "component": "main",
+      "files_sha256": "7783407ed8f3b7116d401b5a8470aba8a9265154eff19272fa8994702c2c0e69",
+      "guidance": [
+        {
+          "action": "Make the smallest change that satisfies the spec. Keep the existing unsafe-name test, directory handling, missing-name counting and quoting exactly as they are. The plan's 'starts with / or contains ..' rule and 'directory counts as missing' are guesses and must not replace what the file already does. Add only an exact-string seen set that is checked after a path is confirmed to be an existing regular file. Add the path to seen before the MAX_FILES check, so a repeated over-cap path is not counted twice. Keep missing and unsafe names counted per occurrence. Leave the three-key dropped dict, empty-input behavior and first-seen order untouched.",
+          "file": "hermes_cli/build_graph_checks.py"
+        },
+        {
+          "action": "Load the module by file path with importlib and use stdlib unittest and tempfile only. Cover these cases: 200 repeats of one file followed by a second file; first-seen ordering; exactly 200 distinct files (over_cap 0); 201 distinct files (over_cap 1); an over-cap path repeated, which must still count once; repeated missing and unsafe names, which keep per-occurrence counts; a directory; empty input; and a name needing shlex quoting. Derive the expected unsafe and directory outcomes from the existing implementation, not from the plan's assumptions. Do not write any alias-normalization test, such as 'a.py' versus './a.py'.",
+          "file": "tests/test_build_graph_checks_distinct_paths.py"
+        }
+      ],
+      "guidance_sha256": "408b76aa2f7a8a7105302792154ff623665539af01e4924131a59c50a1828829",
+      "plan_sha256": "24169f9d78c711a680496fe56ea2aa60e056e2108e1a9cc8cb2430d1977a2c82",
+      "planning_receipt_sha256": "fedb25fb482ca90d5079b146304d690d6f97938127b6600c28be31f3e61310dc",
+      "review_contract_sha256": "59da43a398e87ffbfdca8ef976588ae6bf00513128af37ad573c96bb1c477cb5",
+      "source_sha256": "f7e039cc8ccabbfe0508f582963ee6e933c9af5e49a0141911efabf8f6f3f839",
+      "spec_sha256": "ed247de835de150491aa7aab2eace8a6a2209b1f654e5bcb53c39ef9605ebc2d",
+      "status": "cloud_accepted",
+      "version": 1
+    },
+    "re_review_after_severe": false,
+    "recurrence_confounded": false,
+    "recurrence_tier": null,
+    "review_contract": {
+      "activity_constraints": {
+        "code_review": {
+          "mode": "unconstrained"
+        },
+        "plan_review": {
+          "mode": "unconstrained"
+        },
+        "re_review": {
+          "mode": "unconstrained"
+        }
+      },
+      "authorization_ref": null,
+      "board_database": "/home/jetson/.hermes/kanban/boards/ops/kanban.db",
+      "component": "main",
+      "contract_id": "phase5-qwen-distinct-path-fresh-20261024",
+      "contract_version": 1,
+      "protocol_sha256": "cccd2f03fb0cd742e230cbca0227d7e346fcbceb0eed00ba7ae4582264d832ad",
+      "task_id": "t_66a466e5",
+      "workflow_classification": "unconstrained"
+    },
+    "review_contract_sha256": "59da43a398e87ffbfdca8ef976588ae6bf00513128af37ad573c96bb1c477cb5",
+    "reviewer_model": null,
+    "rung": "none",
+    "rung_attempts": {
+      "a2_capability_evidence": {
+        "plan": {
+          "profile": {
+            "calls": 50,
+            "cpu_usec": 1000000,
+            "file_bytes": 1048576,
+            "iterations": 50,
+            "max_tokens": 16384,
+            "memory_bytes": 1073741824,
+            "model": "Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf",
+            "policy_sha256": "d0edeb77741d15ae485580c1b3be705ac25b95d000890118dd01cfa4fbdbd1a7",
+            "request_seconds": 120,
+            "runtime_pin": "76f6dd6e8b26cb61aeabf68f15b138bd808528ac8c787bff102198afd599d2c7",
+            "runtime_seconds": 600,
+            "scratch_bytes": 67108864,
+            "tasks": 64,
+            "workspace_bytes": 67108864
+          },
+          "request_sha256": "3b080b0e96d74e5a4613bf8052c190284fa24a76263da51c2653a2cf1770a0be",
+          "token": "b56841ba30359bde53c6559fd428f774"
+        },
+        "plan_review": {
+          "profile": {
+            "calls": 50,
+            "cpu_usec": 1000000,
+            "file_bytes": 1048576,
+            "iterations": 50,
+            "max_tokens": 16384,
+            "memory_bytes": 1073741824,
+            "model": "Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf",
+            "policy_sha256": "d0edeb77741d15ae485580c1b3be705ac25b95d000890118dd01cfa4fbdbd1a7",
+            "request_seconds": 120,
+            "runtime_pin": "76f6dd6e8b26cb61aeabf68f15b138bd808528ac8c787bff102198afd599d2c7",
+            "runtime_seconds": 600,
+            "scratch_bytes": 67108864,
+            "tasks": 64,
+            "workspace_bytes": 67108864
+          },
+          "request_sha256": "79792b5d8bb834af439d1c7ca49b433811cdaca57da79e14d02b54f0d863c263",
+          "token": "39a9b4296b214653898435ee59b8e500"
+        }
+      },
+      "a2_denial_evidence": {
+        "plan": {
+          "component": "main",
+          "evidence": {
+            "board": "ops",
+            "complete": true,
+            "denied": 0,
+            "journal_sha256": "c932700030dfe9b930067dfc1de863c66facd770c9bb8bc5e015e629b15118dd",
+            "journal_version": 3,
+            "observed": 0,
+            "operation": "plan",
+            "request_sha256": "3b080b0e96d74e5a4613bf8052c190284fa24a76263da51c2653a2cf1770a0be",
+            "requested": 0,
+            "run_id": 224,
+            "task_id": "t_66a466e5",
+            "token": "b56841ba30359bde53c6559fd428f774",
+            "unknown": 0,
+            "version": 1
+          },
+          "spec_sha256": "ed247de835de150491aa7aab2eace8a6a2209b1f654e5bcb53c39ef9605ebc2d",
+          "workspace": "/home/jetson/.hermes/kanban/boards/ops/workspaces/t_66a466e5"
+        },
+        "plan_review": {
+          "component": "main",
+          "evidence": {
+            "board": "ops",
+            "complete": true,
+            "denied": 0,
+            "journal_sha256": "ff4d4319fb14002e759f89ab984cc766a9ff301113ea28bd49086e61f43833ef",
+            "journal_version": 3,
+            "observed": 0,
+            "operation": "plan_review",
+            "request_sha256": "79792b5d8bb834af439d1c7ca49b433811cdaca57da79e14d02b54f0d863c263",
+            "requested": 0,
+            "run_id": 225,
+            "task_id": "t_66a466e5",
+            "token": "39a9b4296b214653898435ee59b8e500",
+            "unknown": 0,
+            "version": 1
+          },
+          "spec_sha256": "ed247de835de150491aa7aab2eace8a6a2209b1f654e5bcb53c39ef9605ebc2d",
+          "workspace": "/home/jetson/.hermes/kanban/boards/ops/workspaces/t_66a466e5"
+        }
+      },
+      "a2_runs": {
+        "plan": 224,
+        "plan_review": 225
+      },
+      "cloud_plan_review_calls": 1,
+      "cloud_plan_review_evidence": {
+        "envelope_sha256": "f55557b3f9c96fa03b7449afe524f16d37b5062acb3db5b1f4a6a305fd6084ba",
+        "guidance_sha256": "408b76aa2f7a8a7105302792154ff623665539af01e4924131a59c50a1828829",
+        "ledger_line_sha256": "021bd1ddd2fcb949d8d1aac4bd3de9aeb0cfe872c67c6f50c938e55c3924419a",
+        "run_id": "90b43e27",
+        "verdict_sha256": "fbf3d82eb1b557571d29fa0c8c4520e1e12997aa9601620966cad8a5e0a48cd5"
+      }
+    },
+    "schema_version": 4,
+    "security_sensitive": false,
+    "terminal_reason": null
+  }
+}
