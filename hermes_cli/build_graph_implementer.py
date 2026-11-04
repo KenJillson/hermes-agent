@@ -58,6 +58,23 @@ def _closed(status: str, *, identity: Optional[dict[str, str]] = None,
     }
 
 
+def _failed(result) -> dict[str, Any]:
+    """CD-095: a sealed A2 implement failure keeps the controller's failure.
+
+    The client has already validated it against the protected controller's
+    closed stage/reason vocabulary; the plan/review stage path keeps the same
+    record. Only the exact three-key shape is carried; anything else is the
+    plain closed 'failed' status, as before.
+    """
+    out = _closed('failed')
+    failure = result.get('failure') if isinstance(result, dict) else None
+    if (isinstance(failure, dict) and set(failure) == {'stage', 'reason', 'exit_code'}
+            and type(failure['stage']) is str and type(failure['reason']) is str
+            and type(failure['exit_code']) is int):
+        out['failure'] = dict(failure)
+    return out
+
+
 def _read_bounded(path: Path, limit: int) -> tuple[bytes, bool]:
     with path.open("rb") as fh:
         data = fh.read(limit + 1)
@@ -338,7 +355,7 @@ def make_a2_runner(task, workspace, environment):
             context.launch()
             result = client.launch(current, interrupt_check=interrupt_check)
             if result.get('phase') == 'failed':
-                return _closed('failed')
+                return _failed(result)
             context.committed()
         except Exception as exc:
             raise A2ReconciliationRequired('a2_transport_requires_reconciliation') from exc

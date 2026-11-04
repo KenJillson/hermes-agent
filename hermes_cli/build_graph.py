@@ -120,6 +120,24 @@ IMPLEMENT_STATUSES = (
 # gives up after repeated empty-LLM-response retries.
 IMPLEMENT_OK = "completed"
 
+# CD-095: the A2 implement failure keeps the protected controller's stage and
+# reason, in the same a2_stage_failed:<operation>:<stage>:<reason> form the
+# other A2 stages use. Both tokens come from the controller's closed
+# vocabulary (validated by the launch client); this re-checks their shape so
+# no other text can reach the board reason.
+A2_FAILURE_TOKEN = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def a2_failure_reason(operation, raw):
+    """Return the A2 failure terminal reason, or None when it is not exact."""
+    failure = raw.get("failure") if isinstance(raw, dict) else None
+    if (not isinstance(failure, dict) or set(failure) != {"stage", "reason", "exit_code"}
+            or type(failure["exit_code"]) is not int
+            or any(type(failure[k]) is not str or A2_FAILURE_TOKEN.fullmatch(failure[k]) is None
+                   for k in ("stage", "reason"))):
+        return None
+    return "a2_stage_failed:%s:%s:%s" % (operation, failure["stage"], failure["reason"])
+
 # CD-042: how many times `implement` may run for one card, ACROSS
 # DISPATCHES. Separate from RUNG_ATTEMPT_CAP, which governs the fix ladder
 # and does not apply here.
@@ -698,6 +716,10 @@ def make_implement(deps: Deps):
         if status not in IMPLEMENT_STATUSES:
             return _park("implement_unknown_status")
         if status != IMPLEMENT_OK:
+            if status == "failed" and callable(getattr(runner, 'stage', None)):
+                reason = a2_failure_reason("implement", raw)
+                if reason is not None:
+                    return _park(reason)
             return _park("implement_%s" % status)
 
         identity = raw.get("identity")
