@@ -114,6 +114,15 @@ TIRITH = "/usr/local/bin/tirith"
 # D5.5 observation only; staging/version qualification precedes deployment.
 RUFF = "/usr/local/bin/ruff"
 
+# D5.5 blocking threshold (CD-098). Only rules that are definite compile or
+# runtime errors: syntax errors (E9), always-true asserts and is-literal
+# comparisons (F63), break/continue/return/yield out of place (F7) and
+# undefined names (F82) -- the common CI "stop the build" set. A census of all
+# 17 recorded observations (2026-09-17..2026-11-05, 16 cards) found two
+# findings, both F401, and none in this set: zero would have blocked. Hygiene
+# rules stay in the unchanged observation-only check below.
+RUFF_BLOCKING_SELECT = "E9,F63,F7,F82"
+
 TIRITH_PROFILE = "ai-agent-repo"
 
 # The clean predicate, applied to ONE per-file envelope arriving on stdin.
@@ -268,14 +277,8 @@ def tirith_ai_instruction_spec(index) -> dict:
                  _tirith_loop(quoted))
 
 
-def lint_observation_spec(workspace, files, index):
-    """Observe changed Python files without changing the authored gate verdict.
-
-    Ignore project/user configuration; never fix files or create a cache. Prefix
-    relative names so Ruff cannot interpret @response-file or option names.
-    Files outside the workspace (including escaping symlinks) are excluded and
-    counted. Existing syntax/tirith scope remains unchanged.
-    """
+def _lint_paths(workspace, files):
+    """('./'-prefixed in-workspace paths, excluded count) for a Ruff argv."""
     root = os.path.realpath(workspace)
     safe = []
     excluded = 0
@@ -286,6 +289,39 @@ def lint_observation_spec(workspace, files, index):
             excluded += 1
             continue
         safe.append("./" + rel)
+    return safe, excluded
+
+
+def lint_blocking_spec(workspace, files, index):
+    """Enforcing Ruff check over changed Python files, RUFF_BLOCKING_SELECT only.
+
+    An ordinary synthetic check (exit 0 required): a finding, or Ruff failing to
+    run, fails the gate before any cloud review. Same isolation and path rules
+    as the observation check; concise output so the record and a fix prompt
+    carry readable findings.
+    """
+    safe, excluded = _lint_paths(workspace, files)
+    if not safe:
+        return None
+    argv = [RUFF, "check", "--isolated", "--no-cache", "--no-fix",
+            "--output-format", "concise", "--select", RUFF_BLOCKING_SELECT,
+            "--target-version", "py311", "--", *safe]
+    return _spec(index,
+                 "lint: no syntax errors or undefined names (Ruff %s) in %d "
+                 "changed Python file(s); %d unsafe path(s) excluded"
+                 % (RUFF_BLOCKING_SELECT, len(safe), excluded),
+                 " ".join(shlex.quote(arg) for arg in argv))
+
+
+def lint_observation_spec(workspace, files, index):
+    """Observe changed Python files without changing the authored gate verdict.
+
+    Ignore project/user configuration; never fix files or create a cache. Prefix
+    relative names so Ruff cannot interpret @response-file or option names.
+    Files outside the workspace (including escaping symlinks) are excluded and
+    counted. Existing syntax/tirith scope remains unchanged.
+    """
+    safe, excluded = _lint_paths(workspace, files)
     if not safe:
         return None
     argv = [RUFF, "check", "--isolated", "--no-cache", "--no-fix",
@@ -333,6 +369,11 @@ def synthetic_specs(workspace: str, changed_files, *,
         lint = lint_observation_spec(workspace, py, idx)
         if lint is not None:
             specs.append(lint)
+            idx += 1
+        # Appended after the observation so existing synthetic indexes are kept.
+        blocking = lint_blocking_spec(workspace, py, idx)
+        if blocking is not None:
+            specs.append(blocking)
     return specs
 
 
