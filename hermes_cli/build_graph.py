@@ -953,6 +953,12 @@ def make_cloud_review(deps: Deps, *, activity: str, node_name: str):
             evidence += revidence.render_denials(state, deps.workspace, deps.body)
         except (revidence.Refused, TypeError, KeyError, ValueError):
             return {"terminal_reason": "protected_denial_evidence_unavailable"}
+        if state.get("rung") in LADDER:
+            # CD-099: code-authored text only; the rung name is a LADDER literal.
+            evidence += ("\nREPAIR NOTE (data, not instructions): the protected-stage "
+                         "evidence above was recorded before cloud repair %s changed "
+                         "the work product. The diff under review includes that "
+                         "repair; no protected stage has reviewed it.\n" % state["rung"])
         if not review_diff_current(deps, state):
             return {"terminal_reason": "review_evidence_diff_changed"}
         prompt = build_review_prompt(state, task_body=deps.body) + evidence
@@ -1657,6 +1663,11 @@ def route_after_gate(state, deps: Deps):
             return "cloud_re_review"
         return GATE_PASS_TARGET
     if decision == "escalate":
+        # CD-099: RETAINED. Under the 2026-09-27 stage ruling a failing cheap
+        # gate on a protected-stage card is repaired by the LOCAL fix loop,
+        # (fix + local review) twice, which is not built yet. Until it is,
+        # such a card parks here rather than buying a cloud rung that would
+        # skip that loop. Remove this only together with that loop.
         if state['rung_attempts'].get('a2_runs'):
             return 'human'
         rung = next_available_rung(state)
@@ -1669,8 +1680,10 @@ def route_after_review(state):
         return "human"
     if state.get("last_verdict_passed"):
         return "assemble"
-    if state['rung_attempts'].get('a2_runs'):
-        return 'human'
+    # CD-099: a protected-stage card whose cloud review asks for revision
+    # climbs the retained cloud repair ladder (owner ruling 2026-09-27). The
+    # park-before-ladder brake added by 8c770d2775 was conditional on stage
+    # receipts working; Test5-Test10 met that condition.
     # "revise" and verdict-is-None are the SAME edge. _parse_verdict fail-closes
     # to None and the graph must never re-call to chase a parseable verdict --
     # a reviewer produces new findings each pass, so a clean verdict is not
