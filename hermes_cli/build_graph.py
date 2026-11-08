@@ -271,6 +271,15 @@ def _model_artifact_directory(workspace: str) -> str:
     return tempfile.mkdtemp(prefix="model-call-", dir=root)
 
 
+# CD-104 (2026-11-08). The outer wait for the separate Codex process. Measured:
+# with CD-102's complete-file prompt (44 KB), Codex was still writing at the
+# CAD provider kill (120 s; run 9de0fb70, rc -9, timed_out). The chain must
+# nest strictly: CAD provider < bridge < bridge + collect (30 s) + ledger
+# append (30 s) < this. F-W1c sets provider 480 s and bridge 540 s; this must
+# land FIRST, or CAD would outlive the graph's wait.
+CODEX_CALL_SECONDS = 660
+
+
 def call_codex(*, activity, prompt, card_id, component, directive=None, **_unused):
     """One separate CLI; no user-selected provider, path or credentials."""
     if activity != "fix_codex":
@@ -279,7 +288,8 @@ def call_codex(*, activity, prompt, card_id, component, directive=None, **_unuse
     try:
         result = subprocess.run(
             ["/usr/bin/python3", "-I", "-B", "/home/jetson/.hermes/lib/model_call/bin/codex-call"],
-            input=json.dumps(message, allow_nan=False), text=True, capture_output=True, timeout=330)
+            input=json.dumps(message, allow_nan=False), text=True, capture_output=True,
+            timeout=CODEX_CALL_SECONDS)
         if len(result.stdout.encode()) > 8 * 1024 * 1024:
             raise ValueError("oversized Codex result")
         reply = json.loads(result.stdout)
