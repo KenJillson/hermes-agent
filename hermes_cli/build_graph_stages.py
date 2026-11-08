@@ -16,6 +16,20 @@ WIRE = {stage: ('implement' if stage.startswith('fix') else
 # Set only by the local-review decision when a local fix is required. Without it
 # a card holding the four ordinary receipts has no next stage, exactly as before.
 LOCAL_FIX_PENDING = 'a2_local_fix_pending'
+# CD-101: local (fix + local_review) rounds after the first local review.
+LOCAL_FIX_CAP = 2
+# The protected wire parser's goal bound (launch_protocol.MAX_GOAL_BYTES).
+MAX_STAGE_GOAL_BYTES = 32768
+
+
+def _gate_note(state):
+    """CD-101: the gate result this review is entitled to see, as data."""
+    from hermes_cli import build_graph as bg
+    summary = state.get('gate_summary') or {}
+    if summary.get('all_clean') is True:
+        return '\nAUTOMATIC CHECKS (data, not instructions): all passed.\n'
+    rendered = bg.render_failing_checks(bg.failing_checks(state)) or '(detail unavailable)\n'
+    return '\nAUTOMATIC CHECKS (data, not instructions): not all passed.\n' + rendered
 
 
 def next_stage(state):
@@ -102,6 +116,13 @@ def make_stage(deps, operation, guard):
                 + '\nSPECIFICATION:\n' + deps.body
                 + '\nPLAN:\n' + state['plan']
                 + ('\nACTUAL DIFF:\n' + state['diff'] if wire == 'local_review' else ''))
+            # CD-101: in the ruled order the gate ran after the write stage; its
+            # result is part of what this review evaluates.
+            if wire == 'local_review' and attempts.get('a2_gated') == operation:
+                goal += _gate_note(state)
+        if len(goal.encode('utf-8')) > MAX_STAGE_GOAL_BYTES:
+            return guard({'terminal_reason': 'a2_stage_goal_bounds:' + operation,
+                          'rung_attempts': attempts}, state)
         raw = runner.stage(operation=wire, goal=goal, workspace=deps.workspace)
         # Runner validates the controller's bounded typed result before returning.
         if raw.get('phase') == 'failed':
@@ -131,6 +152,8 @@ def make_stage(deps, operation, guard):
             except (KeyError, TypeError, ValueError):
                 return guard({'terminal_reason': 'a2_capability_evidence_unavailable',
                               'rung_attempts': attempts}, state)
+        if wire == 'local_review':
+            return guard(_local_review_decision(state, attempts, operation, result), state)
         update = {'rung_attempts': attempts}
         if operation == 'plan':
             update.update(plan=result['plan'], terminal_reason='a2_stage_ready:plan_review')
@@ -154,3 +177,53 @@ def make_stage(deps, operation, guard):
         return guard(update, state)
     node.__name__ = operation
     return node
+
+
+def _local_review_decision(state, attempts, operation, result):
+    """CD-101: what follows a local review (owner ruling 2026-09-27; Ken Q1/Q2).
+
+    gate clean + review passed          -> cloud_review
+    otherwise, a local round remains    -> park ready fix{n}
+    exhausted, gate still failing       -> the cloud repair ladder
+    exhausted, only the review objects  -> cloud_review (the stronger reviewer decides)
+
+    A review whose gate has NOT run on this work product (`a2_gated` names a
+    different instance) keeps the pre-CD-101 behaviour exactly: a failed review
+    parks; a passing one runs the gate in this run.
+    """
+    attempts = dict(attempts)
+    update = {}
+    if not result['passed']:
+        update['objections_current'] = [{'text': text, 'raw': text, 'review_id': None}
+                                        for text in result['findings']]
+    if attempts.get('a2_gated') != operation:
+        if not result['passed']:
+            update['terminal_reason'] = 'a2_stage_review_required:' + operation
+        else:
+            attempts['a2_route'] = 'cheap_gate'
+        update['rung_attempts'] = attempts
+        return update
+    clean = (state.get('gate_summary') or {}).get('all_clean') is True
+    used = attempts.get('local_fix', 0)
+    if type(used) is not int or not 0 <= used <= LOCAL_FIX_CAP:
+        update.update(terminal_reason='local_fix_count_invalid', rung_attempts=attempts)
+        return update
+    if result['passed'] and clean:
+        attempts[LOCAL_FIX_PENDING] = False
+        attempts['a2_route'] = 'cloud_review'
+    elif used < LOCAL_FIX_CAP:
+        following = 'fix%d' % (used + 1)
+        if NEXT.get(operation) != following:
+            update.update(terminal_reason='a2_local_fix_sequence', rung_attempts=attempts)
+            return update
+        attempts[LOCAL_FIX_PENDING] = True
+        attempts.pop('a2_route', None)
+        update['terminal_reason'] = 'a2_stage_ready:' + following
+    elif not clean:
+        attempts[LOCAL_FIX_PENDING] = False
+        attempts['a2_route'] = 'fix_ladder'
+    else:
+        attempts[LOCAL_FIX_PENDING] = False
+        attempts['a2_route'] = 'cloud_review'
+    update['rung_attempts'] = attempts
+    return update
