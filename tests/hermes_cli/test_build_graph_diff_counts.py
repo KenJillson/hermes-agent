@@ -28,15 +28,19 @@ class DiffCounts(unittest.TestCase):
                                            diff_files=2, diff_added_lines=7,
                                            **contract_kwargs("t_fixture", "test"))
                 model = Mock(side_effect=AtModel)
+                # CD-102: a fix rung renders the work product's current files.
+                workspace = tempfile.mkdtemp()
+                Path(workspace, "fixture.py").write_text("value = 1\n")
                 deps = bg.Deps(model=model, over_cap=lambda *a: False,
-                               review_default=lambda: "sonnet")
+                               review_default=lambda: "sonnet", workspace=workspace,
+                               changed_files=["fixture.py"])
                 if kind in ("review", "re_review"):
                     node = bg.make_cloud_review(deps, activity=(
                         "code_review" if kind == "review" else "re_review"),
                         node_name=kind)
                 elif kind == "fix":
                     node = bg.make_fix(deps, rung="rung1", activity="fix_sonnet",
-                                       prompt_builder=lambda s: "fixture")
+                                       prompt_builder=lambda s, current_files="": "fixture")
                 else:
                     state.update(rung="rung1", rung_attempts={"rung1": 1},
                                  objections_prior=[{"description": "a"}],

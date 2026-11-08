@@ -265,8 +265,13 @@ _REGEX_FAMILY_TOKENS = (
 
 def _filter_tokens() -> tuple:
     mod = _load_sanitizer()
-    return tuple(t.lower() for t in _REGEX_FAMILY_TOKENS) + tuple(
-        m.lower() for m in mod.HONCHO_MARKERS)
+    # CD-102: rules added to the sanitizer from F-S1 on publish their own filter
+    # substrings (FAST_FILTER_TOKENS), so a new rule cannot be skipped here by
+    # an optimisation this list was never told about. An older sanitizer has
+    # neither the rules nor the attribute, so the empty default is exact.
+    return (tuple(t.lower() for t in _REGEX_FAMILY_TOKENS)
+            + tuple(m.lower() for m in mod.HONCHO_MARKERS)
+            + tuple(t.lower() for t in getattr(mod, "FAST_FILTER_TOKENS", ())))
 
 
 def _might_match(text: str) -> bool:
