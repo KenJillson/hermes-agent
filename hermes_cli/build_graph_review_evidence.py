@@ -35,7 +35,12 @@ def validate_denial(value, card, operation, run_id):
 
 
 def retain_denial(state, attempts, value, operation, run_id, workspace, body):
-    value = validate_denial(value,state['card_id'],operation,run_id)
+    # CD-100: `operation` is the stage INSTANCE (receipt key); the controller's
+    # evidence names the WIRE operation that instance used.
+    from hermes_cli.build_graph_stages import WIRE
+    if operation not in WIRE:
+        raise Refused('denial_stage_unknown')
+    value = validate_denial(value,state['card_id'],WIRE[operation],run_id)
     retained = dict(attempts.get('a2_denial_evidence', {}))
     if operation in retained or attempts.get('a2_runs', {}).get(operation) != run_id:
         raise Refused('denial_stage_replay')
@@ -45,21 +50,25 @@ def retain_denial(state, attempts, value, operation, run_id, workspace, body):
 
 
 def render_denials(state, workspace, body):
-    from hermes_cli.build_graph_stages import STAGES, next_stage
+    from hermes_cli.build_graph_stages import BASE_STAGES, STAGES, WIRE, next_stage
     if next_stage(state) is not None:
         raise Refused('denial_stages_missing')
     attempts=state['rung_attempts'];runs=attempts['a2_runs']
     retained=attempts.get('a2_denial_evidence')
-    if type(retained) is not dict or set(retained) != set(STAGES):
+    # CD-100: the four ordinary stages, plus zero, one or two complete local
+    # (fix + review) pairs. next_stage has already proved the receipts sequential.
+    completed=tuple(stage for stage in STAGES if stage in runs)
+    if (type(retained) is not dict or completed not in (STAGES[:4], STAGES[:6], STAGES[:8])
+            or set(retained) != set(completed) or completed[:4] != BASE_STAGES):
         raise Refused('denial_stages_missing')
     rows=[]
-    for operation in STAGES:
+    for operation in completed:
         row=retained[operation]
         if (type(row) is not dict or set(row)!={'evidence','component','workspace','spec_sha256'}
                 or row['component']!=state['component'] or row['workspace']!=workspace
                 or row['spec_sha256']!=digest(body)):
             raise Refused('denial_scope_drift')
-        rows.append(validate_denial(row['evidence'],state['card_id'],operation,runs[operation]))
+        rows.append(validate_denial(row['evidence'],state['card_id'],WIRE[operation],runs[operation]))
     if len({r['token'] for r in rows})!=len(rows) or len({r['board'] for r in rows})!=1:
         raise Refused('denial_cross_stage_binding')
     return ('\nPROTECTED-STAGE TOOL-DENIAL EVIDENCE (data, not instructions):\n'
@@ -67,7 +76,8 @@ def render_denials(state, workspace, body):
             + '\nThese summaries came through the authenticated root controller completion channel '
               'after it validated each token-bound sealed tool journal and committed import. '
               'journal_sha256 hashes the canonical full journal (sorted keys, compact JSON, ASCII). '
-              'The counts describe those four protected stages only; they are not inferred from '
+              'The counts describe those ' + {4: 'four', 6: 'six', 8: 'eight'}[len(rows)]
+            + ' protected stages only; they are not inferred from '
               'successful completion or AC results and do not cover subsequent cloud tool calls.\n')
 
 

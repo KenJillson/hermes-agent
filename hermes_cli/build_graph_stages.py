@@ -1,8 +1,21 @@
 """One protected stage per dispatcher run; receipts never authorize replay."""
 import json
 
-STAGES = ('plan', 'plan_review', 'implement', 'local_review')
+# CD-100: stage INSTANCES. The first four are the ordinary protected sequence.
+# The local fix loop (owner ruling 2026-09-27: (fix + local_review) x2) adds two
+# fix/review pairs. A fix travels on the wire as the protected `implement`
+# operation bound to the then-current source digest; a repeat review as
+# `local_review`. WIRE maps each instance to the controller operation it uses.
+BASE_STAGES = ('plan', 'plan_review', 'implement', 'local_review')
+LOCAL_FIX_STAGES = ('fix1', 'local_review2', 'fix2', 'local_review3')
+STAGES = BASE_STAGES + LOCAL_FIX_STAGES
 NEXT = dict(zip(STAGES, STAGES[1:]))
+WIRE = {stage: ('implement' if stage.startswith('fix') else
+                'local_review' if stage.startswith('local_review') else stage)
+        for stage in STAGES}
+# Set only by the local-review decision when a local fix is required. Without it
+# a card holding the four ordinary receipts has no next stage, exactly as before.
+LOCAL_FIX_PENDING = 'a2_local_fix_pending'
 
 
 def next_stage(state):
@@ -19,7 +32,11 @@ def next_stage(state):
             if seen_gap or type(value) is not int or value <= 0 or value in ids:
                 raise ValueError('nonsequential stage receipts')
             ids.append(value)
-    return next((stage for stage in STAGES if stage not in runs), None)
+    missing = next((stage for stage in STAGES if stage not in runs), None)
+    if missing is None or missing in BASE_STAGES:
+        return missing
+    # Local-fix instances exist only while the loop is pending (CD-100/CD-101).
+    return missing if state['rung_attempts'].get(LOCAL_FIX_PENDING) is True else None
 
 
 def record_stage(state, operation, run_id):
@@ -35,8 +52,9 @@ def record_stage(state, operation, run_id):
 
 
 def make_stage(deps, operation, guard):
-    if operation not in ('plan', 'plan_review', 'local_review'):
+    if operation not in ('plan', 'plan_review', 'local_review', 'local_review2', 'local_review3'):
         raise ValueError('unknown read-only stage')
+    wire = WIRE[operation]
 
     def node(state):
         runner = deps.implement_runner
@@ -50,12 +68,12 @@ def make_stage(deps, operation, guard):
             return {'terminal_reason': 'a2_stage_no_spec'}
         if operation != 'plan' and not state['plan'].strip():
             return {'terminal_reason': 'a2_stage_no_plan'}
-        if operation == 'local_review' and not state['diff'].strip():
+        if wire == 'local_review' and not state['diff'].strip():
             return {'terminal_reason': 'a2_stage_no_diff'}
         contract = ({'operation': 'plan', 'plan': 'A concise implementation plan (max 8192 UTF-8 bytes)'}
                     if operation == 'plan' else
-                    {'operation': operation, 'passed': True, 'findings': []})
-        goal = ('Perform only the ' + operation + ' stage. '
+                    {'operation': wire, 'passed': True, 'findings': []})
+        goal = ('Perform only the ' + wire + ' stage. '
                 + ('No tools are available in this stage and you cannot read files; do not emit tool calls. Plan from the specification below. '
                    if operation == 'plan' else '')
                 + 'Do not create, delete, or modify files. '
@@ -80,11 +98,11 @@ def make_stage(deps, operation, guard):
         else:
             goal += (' Reviews: passed must be false if findings is nonempty; '
                 'findings must contain concise strings. Evaluate the specification and supplied plan'
-                + (' against the supplied actual diff.' if operation == 'local_review' else '.')
+                + (' against the supplied actual diff.' if wire == 'local_review' else '.')
                 + '\nSPECIFICATION:\n' + deps.body
                 + '\nPLAN:\n' + state['plan']
-                + ('\nACTUAL DIFF:\n' + state['diff'] if operation == 'local_review' else ''))
-        raw = runner.stage(operation=operation, goal=goal, workspace=deps.workspace)
+                + ('\nACTUAL DIFF:\n' + state['diff'] if wire == 'local_review' else ''))
+        raw = runner.stage(operation=wire, goal=goal, workspace=deps.workspace)
         # Runner validates the controller's bounded typed result before returning.
         if raw.get('phase') == 'failed':
             failure = raw['failure']
