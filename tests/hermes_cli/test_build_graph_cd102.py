@@ -124,8 +124,10 @@ class Rung102(RungFixture):
         model, _, _ = self.run_rung("rung1", fix_reply([{"path": "m.py", "content": ORIGINAL + "x = 1\n"}]))
         self.assertIn(ORIGINAL, model.call_args.kwargs["prompt"])
 
-    def test_content_refusal_parks_without_cd103(self):
-        _, update, merged = self.run_rung("rung1", fix_reply([{"path": "m.py", "content": REFUSAL}]))
+    def test_content_refusal_parks_when_no_rung_is_left(self):
+        # CD-103 escalates a content refusal while a higher rung remains; with none left it parks.
+        _, update, merged = self.run_rung("rung1", fix_reply([{"path": "m.py", "content": REFUSAL}]),
+                                          rung_attempts={"rung2": 1, "rung3": 1})
         self.assertEqual(update["terminal_reason"], "fix_content_invalid_python")
         self.assertEqual(bg.route_after_fix(merged), "human")
 

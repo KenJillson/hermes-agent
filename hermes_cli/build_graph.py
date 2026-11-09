@@ -1350,6 +1350,33 @@ def render_current_files(workspace, paths):
         return "", "fix_context_unreadable"
 
 
+# CD-103 / F-L2 (2026-11-09): output-compliance refusals -- the rung answered,
+# but not with a usable repair, and a different model may not repeat it. Every
+# other apply_fix reason is about scope, safety or the system (an unsafe or
+# out-of-work-product path, a read/write failure) and every rung would share it,
+# so it still parks. Closed set: a new apply_fix reason parks until named here.
+FIX_COMPLIANCE_REFUSALS = frozenset({
+    "fix_unparseable", "fix_no_files", "fix_empty_files", "fix_no_change",
+    "fix_bad_item", "fix_bad_path", "fix_content_not_text", "fix_duplicate_path",
+    "fix_content_invalid_python", "fix_content_shrunk"})
+
+
+def escalation_after_refusal(state, rung):
+    """CD-103: the next rung strictly above `rung` after a compliance refusal, or None.
+
+    Upward only, from the rung that refused, and each rung still bound by its
+    own attempt cap. Honours the AC-1 edge exactly as route_after_gate does: an
+    approach-disputed card (objection_recurred True, no holdout) never takes
+    rung2 by this route either.
+    """
+    skip = {"rung2"} if (state.get("objection_recurred") is True
+                         and not state.get("holdout")) else set()
+    for r in LADDER[LADDER.index(rung) + 1:]:
+        if r not in skip and rung_available(state, r):
+            return r
+    return None
+
+
 def _content_refusal(rel, before, content):
     """CD-102: a closed reason if `content` must not replace `before`, else None."""
     if rel.endswith(".py"):
@@ -1582,6 +1609,8 @@ def make_fix(deps: Deps, *, rung: str, activity: str, model=None, prompt_builder
         res = out.get("result") or {}
         update = {"rung": rung, "rung_attempts": bump_rung(state, rung),
                   "implementer_model": res.get("model")}
+        # CD-103: an escalation marker is consumed by the rung it named.
+        update["rung_attempts"].pop("fix_refused_next", None)
         if out["klass"] != "ok":
             update["terminal_reason"] = "model_call_%s:%s" % (out["klass"], activity)
             return guard(update, state)
@@ -1594,6 +1623,21 @@ def make_fix(deps: Deps, *, rung: str, activity: str, model=None, prompt_builder
         # the rung. An attempt that is not recorded is an attempt that repeats.
         written, reason = apply_fix(deps.workspace, res.get("text"),
                                     deps.changed_files)
+        if reason in FIX_COMPLIANCE_REFUSALS:
+            # CD-103 / F-L2: record it and go straight up the ladder -- the gate
+            # would only re-run unchanged code. A rung that wrote nothing is not
+            # the author, so authorship stays with whoever last wrote. Park as
+            # before when no rung above is left.
+            attempts = update["rung_attempts"]
+            attempts["fix_refusals"] = list(
+                state["rung_attempts"].get("fix_refusals") or []) + ["%s:%s" % (rung, reason)]
+            update["implementer_model"] = state["implementer_model"]
+            nxt = escalation_after_refusal(dict(state, rung_attempts=attempts), rung)
+            if nxt is None:
+                update["terminal_reason"] = reason
+            else:
+                attempts["fix_refused_next"] = nxt
+            return guard(update, state)
         if reason:
             update["terminal_reason"] = reason
             return guard(update, state)
@@ -2052,9 +2096,13 @@ def route_after_plan_review(state):
 
 
 def route_after_fix(state):
-    """Post-fix verification, or `human` when the ladder is spent."""
+    """Post-fix verification, the next rung after a compliance refusal (CD-103),
+    or `human` when the ladder is spent."""
     if state.get("terminal_reason"):
         return "human"
+    nxt = (state.get("rung_attempts") or {}).get("fix_refused_next")
+    if nxt in LADDER:
+        return "fix_%s" % nxt
     return "cheap_gate"
 
 
@@ -2171,7 +2219,8 @@ def build(deps: Deps, *, checkpointer=None):
     for fix in ("fix_rung1", "fix_rung2", "fix_rung3"):
         _cond(
             fix, route_after_fix,
-            {"cheap_gate": "cheap_gate", "human": "human"})
+            {"cheap_gate": "cheap_gate", "human": "human",
+             "fix_rung2": "fix_rung2", "fix_rung3": "fix_rung3"})
 
     g.add_edge("assemble", END)
     g.add_edge("human", END)
