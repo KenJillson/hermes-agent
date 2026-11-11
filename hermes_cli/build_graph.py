@@ -788,6 +788,44 @@ def make_implement(deps: Deps):
     return _node
 
 
+# CD-105 (F-T14g-1): a protected local repair round that FAILED (nothing was
+# imported, so the workspace is still the product the last gate and review saw)
+# hands the card to the cloud ladder when the failure is the local model's own:
+# it ran out of time, did not finish normally, or broke tool accounting. Those
+# are exactly the cases the stronger rungs exist for. Infrastructure, input,
+# collection, transport and stage-result failures still park -- a cloud call
+# cannot repair them and must not be paid for them.
+LOCAL_FIX_ESCALATE_STAGES = frozenset({
+    "conversation", "completion_result", "completion_flags", "completion_stop",
+    "completion_identity", "completion_calls", "completion_response",
+    "tool_accounting"})
+
+
+def local_fix_escalation(state, attempts, instance, raw):
+    """Return the escalation update for a failed local fix round, or None to park."""
+    reason = a2_failure_reason(instance, raw)
+    if reason is None or raw["failure"]["stage"] not in LOCAL_FIX_ESCALATE_STAGES:
+        return None
+    if attempts.get("rung1", 0) >= RUNG_ATTEMPT_CAP:
+        return None
+    from hermes_cli.build_graph_stages import LOCAL_FIX_PENDING
+    out = dict(attempts)
+    out[LOCAL_FIX_PENDING] = False
+    out["local_fix_escalated"] = instance
+    out["local_fix_failures"] = list(attempts.get("local_fix_failures") or []) + [reason]
+    return {"rung_attempts": out}
+
+
+def route_after_local_fix(state):
+    """CD-105: a local fix that failed into escalation goes to rung 1; else the gate."""
+    if state.get("terminal_reason"):
+        return "human"
+    attempts = state.get("rung_attempts") or {}
+    if attempts.get("local_fix_escalated"):
+        return "fix_rung1" if rung_available(state, "rung1") else "human"
+    return "cheap_gate"
+
+
 def make_local_fix(deps: Deps, instance: str):
     """CD-101: one protected local repair round (fix1 / fix2).
 
@@ -867,6 +905,9 @@ def make_local_fix(deps: Deps, instance: str):
             return _park("local_fix_unknown_status")
         if status != IMPLEMENT_OK:
             if status == "failed":
+                escalated = local_fix_escalation(state, attempts, instance, raw)
+                if escalated is not None:
+                    return escalated
                 reason = a2_failure_reason(instance, raw)
                 if reason is not None:
                     return _park(reason)
@@ -2172,7 +2213,8 @@ def build(deps: Deps, *, checkpointer=None):
                'cloud_review': 'cloud_review', 'fix_rung1': 'fix_rung1'})
     for name in ("fix1", "fix2"):
         _add(name, make_local_fix(deps, name))
-        _cond(name, route_after_implement, {"cheap_gate": "cheap_gate", "human": "human"})
+        _cond(name, route_after_local_fix,
+              {"cheap_gate": "cheap_gate", "human": "human", "fix_rung1": "fix_rung1"})
     _add("a2_handoff", node_a2_handoff)
     g.add_edge("a2_handoff", "human")
 
