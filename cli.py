@@ -17915,6 +17915,7 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
     task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
         return None
+    review_findings = None  # CD-106
 
     from hermes_cli import kanban_db as _kb
 
@@ -18070,6 +18071,12 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
                             return 1
                     return 0
                 reason = "graph_terminal:%s" % terminal
+                try:
+                    # CD-106: guarded on its own so it can never change this reason.
+                    from hermes_cli import build_graph_findings as _bgf
+                    review_findings = _bgf.payload(terminal, state)
+                except Exception:
+                    review_findings = None
             except a2_failure_type:
                 # The controller may still own a payload/inhibit. Do not call
                 # block_task, complete_task or retry. The existing dispatcher
@@ -18102,6 +18109,13 @@ def _run_build_graph_q(cli: "HermesCLI") -> "int | None":
         )
         return 1
 
+    if review_findings is not None:
+        try:
+            # CD-106: after the park stands; record() never raises.
+            from hermes_cli import build_graph_findings as _bgf
+            _bgf.record(_kb, task_id, task.current_run_id, review_findings, logger)
+        except Exception:
+            pass
     logger.info("build-graph card %s parked: %s", task_id, reason)
     return 0
 
